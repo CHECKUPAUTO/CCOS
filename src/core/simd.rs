@@ -1,7 +1,7 @@
 use std::arch::*;
 
 /// Trait defining primitive SIMD operations for vector math.
-pub trait SimdOps {
+pub trait SimdOps: Send + Sync {
     fn dot_product(&self, a: &[f32], b: &[f32]) -> f32;
     fn subtract(&self, a: &[f32], b: &[f32], out: &mut [f32]);
 }
@@ -175,7 +175,7 @@ impl SimdOps for NeonOps {
 pub struct SimdDispatcher;
 
 impl SimdDispatcher {
-    pub fn get_backend() -> Box<dyn SimdOps> {
+    pub fn get_backend() -> Box<dyn SimdOps + Send + Sync> {
         #[cfg(target_arch = "x86_64")]
         unsafe {
             if is_x86_feature_detected!("avx512f") {
@@ -195,3 +195,61 @@ impl SimdDispatcher {
         Box::new(ScalarOps)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_near(a: f32, b: f32, epsilon: f32) {
+        let diff = (a - b).abs();
+        let rel_diff = diff / a.abs().max(b.abs()).max(1.0);
+        assert!(diff < epsilon || rel_diff < epsilon, "Values {} and {} are not close enough (diff: {}, rel_diff: {})", a, b, diff, rel_diff);
+    }
+
+    fn generate_random_vec(len: usize) -> Vec<f32> {
+        // Use a simple deterministic pseudo-random sequence for repeatability
+        (0..len).map(|i| (i as f32 * 0.12345).sin()).collect()
+    }
+
+    #[test]
+    fn test_simd_correctness() {
+        let backend = SimdDispatcher::get_backend();
+        let scalar = ScalarOps;
+        let sizes = [0, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 1024];
+
+        for &size in &sizes {
+            // Test dot_product
+            let a = generate_random_vec(size);
+            let b = generate_random_vec(size);
+
+            let scalar_res = scalar.dot_product(&a, &b);
+            let simd_res = backend.dot_product(&a, &b);
+
+            assert_near(scalar_res, simd_res, 1e-4);
+
+            // Test subtract
+            let mut out_scalar = vec![0.0; size];
+            let mut out_simd = vec![0.0; size];
+
+            scalar.subtract(&a, &b, &mut out_scalar);
+            backend.subtract(&a, &b, &mut out_simd);
+
+            for i in 0..size {
+                assert_near(out_scalar[i], out_simd[i], 1e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn test_scalar_correctness() {
+        let scalar = ScalarOps;
+        let a = vec![1.0, 2.0, 3.0];
+        let b = vec![4.0, 5.0, 6.0];
+        assert_eq!(scalar.dot_product(&a, &b), 4.0 + 10.0 + 18.0);
+
+        let mut out = vec![0.0; 3];
+        scalar.subtract(&a, &b, &mut out);
+        assert_eq!(out, vec![-3.0, -3.0, -3.0]);
+    }
+}
+
