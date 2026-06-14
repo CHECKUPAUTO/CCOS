@@ -306,6 +306,75 @@ impl MemoryGraph {
         self.edges.len()
     }
 
+    /// Detect directed dependency cycles via an iterative (stack-safe) DFS.
+    /// Each returned vector lists the nodes forming one cycle, in order.
+    pub fn find_cycles(&self) -> Vec<Vec<NodeId>> {
+        use std::collections::BTreeMap;
+        let mut adj: BTreeMap<NodeId, Vec<NodeId>> = BTreeMap::new();
+        for id in self.nodes.keys() {
+            adj.entry(id.clone()).or_default();
+        }
+        for e in &self.edges {
+            if self.nodes.contains_key(&e.source) && self.nodes.contains_key(&e.target) {
+                adj.get_mut(&e.source).unwrap().push(e.target.clone());
+            }
+        }
+        for v in adj.values_mut() {
+            v.sort();
+            v.dedup();
+        }
+
+        // color: 0 = unvisited, 1 = on the current DFS path, 2 = done
+        let mut color: HashMap<NodeId, u8> = HashMap::new();
+        let mut cycles: Vec<Vec<NodeId>> = Vec::new();
+
+        for start in adj.keys() {
+            if *color.get(start).unwrap_or(&0) != 0 {
+                continue;
+            }
+            let mut stack: Vec<(NodeId, usize)> = vec![(start.clone(), 0)];
+            let mut path: Vec<NodeId> = vec![start.clone()];
+            color.insert(start.clone(), 1);
+            while let Some((node, idx)) = stack.last().cloned() {
+                let children = &adj[&node];
+                if idx < children.len() {
+                    stack.last_mut().unwrap().1 += 1;
+                    let child = children[idx].clone();
+                    match *color.get(&child).unwrap_or(&0) {
+                        0 => {
+                            color.insert(child.clone(), 1);
+                            stack.push((child.clone(), 0));
+                            path.push(child);
+                        }
+                        1 => {
+                            // Back edge: a cycle spans path[pos..].
+                            if let Some(pos) = path.iter().position(|n| n == &child) {
+                                cycles.push(path[pos..].to_vec());
+                            }
+                        }
+                        _ => {}
+                    }
+                } else {
+                    color.insert(node.clone(), 2);
+                    stack.pop();
+                    path.pop();
+                }
+            }
+        }
+        cycles
+    }
+
+    /// Count nodes by type, sorted by descending frequency (then name).
+    pub fn node_type_counts(&self) -> Vec<(String, usize)> {
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for node in self.nodes.values() {
+            *counts.entry(format!("{:?}", node.node_type)).or_insert(0) += 1;
+        }
+        let mut out: Vec<(String, usize)> = counts.into_iter().collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        out
+    }
+
     pub fn get_node_scores(&self) -> Vec<(NodeId, f64)> {
         let mut scores: Vec<(NodeId, f64)> = self
             .nodes
@@ -376,6 +445,34 @@ mod tests {
             );
         }
         assert!(graph.node_count() <= 5);
+    }
+
+    #[test]
+    fn test_find_cycles_detects_loop() {
+        let mut graph = MemoryGraph::default();
+        for id in ["a", "b", "c", "d"] {
+            graph.upsert_node(id.into(), id.into(), "".into(), NodeType::Module);
+        }
+        // a -> b -> c -> a is a cycle; d is acyclic.
+        graph.add_edge("a".into(), "b".into(), 1.0, EdgeType::DependsOn);
+        graph.add_edge("b".into(), "c".into(), 1.0, EdgeType::DependsOn);
+        graph.add_edge("c".into(), "a".into(), 1.0, EdgeType::DependsOn);
+        graph.add_edge("c".into(), "d".into(), 1.0, EdgeType::DependsOn);
+
+        let cycles = graph.find_cycles();
+        assert!(!cycles.is_empty(), "must detect the a->b->c->a cycle");
+        assert!(cycles[0].len() >= 3);
+    }
+
+    #[test]
+    fn test_find_cycles_none_when_acyclic() {
+        let mut graph = MemoryGraph::default();
+        for id in ["a", "b", "c"] {
+            graph.upsert_node(id.into(), id.into(), "".into(), NodeType::Module);
+        }
+        graph.add_edge("a".into(), "b".into(), 1.0, EdgeType::DependsOn);
+        graph.add_edge("b".into(), "c".into(), 1.0, EdgeType::DependsOn);
+        assert!(graph.find_cycles().is_empty(), "DAG must have no cycles");
     }
 
     #[test]

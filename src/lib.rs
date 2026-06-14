@@ -26,6 +26,8 @@
 //! - [`consensus`] — majority and confidence-weighted multi-model voting.
 //! - [`adversarial`] — fault injector (JSON corruption, hallucination, prompt
 //!   injection, timeouts) used to harden the guard and the graph.
+//! - [`persist`] — save/load a full [`persist::KernelSnapshot`] (graph + both
+//!   logs) to JSON for cross-session replay and verification.
 //!
 //! ## Invariants
 //!
@@ -44,3 +46,4 @@ pub mod incremental;
 pub mod llm;
 pub mod memory;
 pub mod parser;
+pub mod persist;

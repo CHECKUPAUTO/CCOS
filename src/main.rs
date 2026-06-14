@@ -1,9 +1,13 @@
-use ccos::event_log::{EventLog, EventPayload, EventType};
+use ccos::adversarial::{AdversarialEngine, AdversarialMode};
+use ccos::consensus::ConsensusEngine;
+use ccos::distributed_event_log::DistributedEventLog;
+use ccos::event_log::{EventLog, EventPayload, EventReplayer, EventType};
 use ccos::guard::{GuardConfig, GuardLayer};
 use ccos::incremental::IncrementalGraphEngine;
 use ccos::llm::{LlmClient, LlmConfig};
 use ccos::memory::{MemoryGraph, NodeId};
 use ccos::parser::ASTParser;
+use ccos::persist::KernelSnapshot;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -12,23 +16,32 @@ use uuid::Uuid;
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
     let command = args.get(1).map(String::as_str).unwrap_or("demo");
+    let rest = &args[args.len().min(2)..];
 
-    match command {
-        "-h" | "--help" | "help" => print_help(),
+    let code = match command {
+        "-h" | "--help" | "help" => {
+            print_help();
+            0
+        }
         "-V" | "--version" | "version" => {
             println!("ccos {}", env!("CARGO_PKG_VERSION"));
+            0
         }
-        "demo" => run_demo().await,
-        "analyze" => {
-            let path = args.get(2).map(String::as_str).unwrap_or(".");
-            std::process::exit(run_analyze(path));
+        "demo" => {
+            run_demo().await;
+            0
         }
+        "analyze" => run_analyze(&AnalyzeOpts::parse(rest)),
+        "verify" => run_verify(rest.first().map(String::as_str)),
+        "replay" => run_replay(rest.first().map(String::as_str)),
+        "chaos" => run_chaos(&ChaosOpts::parse(rest)),
         other => {
             eprintln!("ccos: unknown command '{other}'\n");
             print_help();
-            std::process::exit(2);
+            2
         }
-    }
+    };
+    std::process::exit(code);
 }
 
 /// Built-in end-to-end demonstration of every kernel subsystem on a small
@@ -56,6 +69,8 @@ async fn run_demo() {
         ..Default::default()
     };
     let llm_client = LlmClient::new(llm_config.clone());
+    let mut dist_log = DistributedEventLog::new();
+    dist_log.append("kernel_initialized".into(), "kernel".into());
 
     // ── Event Sourcing: Log initialization ────────────────────────
     event_log.append(
@@ -303,9 +318,33 @@ Top modules: Analyze the dependency structure and identify potential issues."#,
         validated.is_fallback
     );
     println!("  [LLM] Output: {:.120}...", validated.sanitized_output);
+    dist_log.append(
+        format!("llm_guard:{}", validated.guard_passed),
+        "llm".into(),
+    );
+
+    // Multi-model consensus (illustrative — offline models all fall back, so
+    // they agree on the deterministic fallback output).
+    let consensus_models = ["codellama", "mistral"];
+    let votes = llm_client
+        .query_models(&prompt, Some("Respond with valid JSON only."), &consensus_models)
+        .await;
+    let consensus = ConsensusEngine::with_threshold(0.5).resolve_weighted(&votes);
+    println!(
+        "  [CONSENSUS] {} models, agreement {:.2} → reached: {} (models: {:?})",
+        consensus.total_votes,
+        consensus.agreement_ratio,
+        consensus.consensus_reached,
+        consensus.models_in_agreement,
+    );
+    dist_log.append(
+        format!("consensus_reached:{}", consensus.consensus_reached),
+        "consensus".into(),
+    );
 
     // ── Phase 3: Incremental Update Simulation ────────────────────
     println!("\n─── PHASE 3: Incremental Graph Update (O(Δ)) ───\n");
+    memory_graph.tick(); // advance the recency clock between cycles
 
     // Simulate a code change: modify api.rs
     let modified_api = r#"use crate::AppState;
@@ -493,6 +532,17 @@ pub async fn handle_request(state: &AppState, path: &str, body: &str) -> Result<
         },
     );
 
+    // ── Phase 8: Tamper-evident Distributed Log ───────────────────
+    println!("\n─── PHASE 8: Hash-Chained Log Integrity ───\n");
+    dist_log.append("cycle_complete".into(), "kernel".into());
+    let integrity = dist_log.verify_integrity();
+    println!(
+        "  [CHAIN] {} links | valid: {} | errors: {}",
+        integrity.verified_events,
+        integrity.valid,
+        integrity.errors.len()
+    );
+
     // ── Summary ──────────────────────────────────────────────────
     println!("\n╔══════════════════════════════════════════════╗");
     println!("║  CCOS CYCLE COMPLETE                         ║");
@@ -519,19 +569,56 @@ pub async fn handle_request(state: &AppState, path: &str, body: &str) -> Result<
 
 }
 
-/// `ccos analyze <path>` — ingest every `.rs` file under `path` into the
-/// causal memory graph and print a structural report. Returns a process exit
-/// code (0 on success, non-zero on failure).
-fn run_analyze(path: &str) -> i32 {
-    let root = Path::new(path);
+/// Options for `ccos analyze`.
+struct AnalyzeOpts {
+    path: String,
+    json: bool,
+    cycles: bool,
+    out: Option<String>,
+}
+
+impl AnalyzeOpts {
+    fn parse(args: &[String]) -> Self {
+        let mut opts = Self {
+            path: ".".to_string(),
+            json: false,
+            cycles: false,
+            out: None,
+        };
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--json" => opts.json = true,
+                "--cycles" => opts.cycles = true,
+                "--out" => {
+                    i += 1;
+                    opts.out = args.get(i).cloned();
+                }
+                s if !s.starts_with("--") => opts.path = s.to_string(),
+                other => eprintln!("ccos: ignoring unknown flag '{other}'"),
+            }
+            i += 1;
+        }
+        opts
+    }
+}
+
+/// `ccos analyze <path> [--json] [--cycles] [--out FILE]` — ingest every `.rs`
+/// file under `path` into the causal memory graph and print (or export) a
+/// structural report. Returns a process exit code (0 on success).
+fn run_analyze(opts: &AnalyzeOpts) -> i32 {
+    let root = Path::new(&opts.path);
     if !root.exists() {
-        eprintln!("ccos: path '{path}' does not exist");
+        eprintln!("ccos: path '{}' does not exist", opts.path);
         return 1;
     }
 
-    println!("╔══════════════════════════════════════════════╗");
-    println!("║  CCOS analyze — {:<29}║", truncate(path, 29));
-    println!("╚══════════════════════════════════════════════╝\n");
+    let human = !opts.json;
+    if human {
+        println!("╔══════════════════════════════════════════════╗");
+        println!("║  CCOS analyze — {:<29}║", truncate(&opts.path, 29));
+        println!("╚══════════════════════════════════════════════╝\n");
+    }
 
     let mut files: Vec<PathBuf> = Vec::new();
     if root.is_dir() {
@@ -542,13 +629,14 @@ fn run_analyze(path: &str) -> i32 {
     files.sort();
 
     if files.is_empty() {
-        eprintln!("ccos: no .rs files found under '{path}'");
+        eprintln!("ccos: no .rs files found under '{}'", opts.path);
         return 1;
     }
 
     let mut graph = MemoryGraph::new(0.2, 5000);
     let mut engine = IncrementalGraphEngine::new();
     let mut event_log = EventLog::new(Uuid::new_v4().to_string());
+    let mut dist_log = DistributedEventLog::new();
 
     let mut read_errors = 0usize;
     for file in &files {
@@ -561,58 +649,274 @@ fn run_analyze(path: &str) -> i32 {
             }
         };
         let path_str = file.to_string_lossy().to_string();
+        let file_hash = compute_file_hash(&source);
         let delta = engine.process_delta(&path_str, None, &source, &mut graph);
+        let (m, u, s) = engine
+            .get_state(&path_str)
+            .map(|st| (st.modules_count, st.uses_count, st.symbols_count))
+            .unwrap_or((0, 0, 0));
         event_log.append(
             EventType::Parsing,
             EventPayload::Parsing {
                 file_path: path_str.clone(),
-                file_hash: compute_file_hash(&source),
-                modules_found: 0,
-                uses_found: 0,
-                symbols_found: 0,
+                file_hash: file_hash.clone(),
+                modules_found: m,
+                uses_found: u,
+                symbols_found: s,
             },
         );
-        println!(
-            "  [PARSE] {:<40} Δnodes:+{:<4} Δedges:+{}",
-            truncate(&path_str, 40),
-            delta.nodes_added,
-            delta.edges_added
-        );
+        dist_log.append(file_hash, "parser".into());
+        if human {
+            println!(
+                "  [PARSE] {:<40} Δnodes:+{:<4} Δedges:+{}",
+                truncate(&path_str, 40),
+                delta.nodes_added,
+                delta.edges_added
+            );
+        }
     }
 
     // Integrity: the graph must never hold edges to evicted/absent nodes.
     let dangling = graph.prune_dangling_edges();
+    let cycles = if opts.cycles || opts.json {
+        graph.find_cycles()
+    } else {
+        Vec::new()
+    };
 
-    println!("\n─── Graph Summary ───");
-    println!("  Files ingested:  {}", files.len() - read_errors);
-    println!("  Graph nodes:     {}", graph.node_count());
-    println!("  Graph edges:     {}", graph.edge_count());
-    println!("  Mutations:       {}", engine.total_mutations());
-    println!("  Events logged:   {}", event_log.event_count());
-    println!("  Dangling edges:  {dangling} (must be 0)");
+    if opts.json {
+        let top: Vec<_> = graph
+            .get_node_scores()
+            .iter()
+            .take(15)
+            .map(|(id, s)| serde_json::json!({ "id": id.0, "score": s }))
+            .collect();
+        let types: Vec<_> = graph
+            .node_type_counts()
+            .into_iter()
+            .map(|(t, c)| serde_json::json!({ "type": t, "count": c }))
+            .collect();
+        let report = serde_json::json!({
+            "path": opts.path,
+            "files_ingested": files.len() - read_errors,
+            "nodes": graph.node_count(),
+            "edges": graph.edge_count(),
+            "dangling_edges": dangling,
+            "dependency_cycles": cycles.len(),
+            "node_types": types,
+            "top_nodes": top,
+        });
+        println!("{}", serde_json::to_string_pretty(&report).unwrap());
+    } else {
+        println!("\n─── Graph Summary ───");
+        println!("  Files ingested:  {}", files.len() - read_errors);
+        println!("  Graph nodes:     {}", graph.node_count());
+        println!("  Graph edges:     {}", graph.edge_count());
+        println!("  Mutations:       {}", engine.total_mutations());
+        println!("  Events logged:   {}", event_log.event_count());
+        println!("  Dangling edges:  {dangling} (must be 0)");
 
-    println!("\n─── Top 10 nodes by causal score ───");
-    for (id, score) in graph.get_node_scores().iter().take(10) {
-        println!("    {:<46} {:.4}", truncate(&id.0, 46), score);
+        println!("\n─── Node types ───");
+        for (ty, count) in graph.node_type_counts() {
+            println!("    {ty:<16} {count}");
+        }
+
+        if opts.cycles {
+            println!("\n─── Dependency cycles ({}) ───", cycles.len());
+            for cycle in cycles.iter().take(5) {
+                let path: Vec<&str> = cycle.iter().map(|n| n.0.as_str()).collect();
+                println!("    {} → {}", path.join(" → "), path.first().unwrap_or(&""));
+            }
+        }
+
+        println!("\n─── Top 10 nodes by causal score ───");
+        for (id, score) in graph.get_node_scores().iter().take(10) {
+            println!("    {:<46} {:.4}", truncate(&id.0, 46), score);
+        }
+
+        let context = graph.select_context_window(2048);
+        println!(
+            "\n─── Context window (2048 tokens → {} nodes) ───",
+            context.len()
+        );
+        for node in context.iter().take(10) {
+            println!("    {:<40} ({:?})", truncate(&node.label, 40), node.node_type);
+        }
     }
 
-    let context = graph.select_context_window(2048);
-    println!(
-        "\n─── Context window (2048 tokens → {} nodes) ───",
-        context.len()
-    );
-    for node in context.iter().take(10) {
-        println!(
-            "    {:<40} ({:?})",
-            truncate(&node.label, 40),
-            node.node_type
-        );
+    if let Some(out) = &opts.out {
+        let snapshot = KernelSnapshot::new(graph, event_log, dist_log);
+        match snapshot.save(out) {
+            Ok(()) => eprintln!("\n[SAVE] snapshot written to {out}"),
+            Err(e) => {
+                eprintln!("ccos: failed to save snapshot to {out}: {e}");
+                return 1;
+            }
+        }
     }
 
     if dangling != 0 {
         return 1;
     }
     0
+}
+
+/// `ccos verify <snapshot.json>` — re-check a saved snapshot's integrity: the
+/// hash chain must validate and the graph must hold no dangling edges.
+fn run_verify(file: Option<&str>) -> i32 {
+    let Some(file) = file else {
+        eprintln!("usage: ccos verify <snapshot.json>");
+        return 2;
+    };
+    let snapshot = match KernelSnapshot::load(file) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("ccos: cannot load '{file}': {e}");
+            return 1;
+        }
+    };
+
+    let integrity = snapshot.dist_log.verify_integrity();
+    let mut graph = snapshot.graph.clone();
+    let dangling = graph.prune_dangling_edges();
+
+    println!("╔══════════════════════════════════════════════╗");
+    println!("║  CCOS verify — {:<30}║", truncate(file, 30));
+    println!("╚══════════════════════════════════════════════╝\n");
+    println!("  Snapshot version:  {}", snapshot.version);
+    println!(
+        "  Graph nodes/edges: {}/{}",
+        snapshot.graph.node_count(),
+        snapshot.graph.edge_count()
+    );
+    println!("  Dangling edges:    {dangling} (must be 0)");
+    println!("  Event-log events:  {}", snapshot.event_log.event_count());
+    println!(
+        "  Hash-chain links:  {} | valid: {}",
+        integrity.verified_events, integrity.valid
+    );
+    for err in integrity.errors.iter().take(10) {
+        println!("    ! {err}");
+    }
+
+    if integrity.valid && dangling == 0 {
+        println!("\n  ✓ snapshot verified");
+        0
+    } else {
+        println!("\n  ✗ verification FAILED");
+        1
+    }
+}
+
+/// `ccos replay <snapshot.json>` — deterministically replay a saved event log
+/// and print the reconstructed statistics, then re-verify the hash chain.
+fn run_replay(file: Option<&str>) -> i32 {
+    let Some(file) = file else {
+        eprintln!("usage: ccos replay <snapshot.json>");
+        return 2;
+    };
+    let snapshot = match KernelSnapshot::load(file) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("ccos: cannot load '{file}': {e}");
+            return 1;
+        }
+    };
+
+    println!("╔══════════════════════════════════════════════╗");
+    println!("║  CCOS replay — {:<30}║", truncate(file, 30));
+    println!("╚══════════════════════════════════════════════╝\n");
+
+    let mut replayer = EventReplayer::new();
+    match snapshot.event_log.replay_deterministic(&mut replayer) {
+        Ok(n) => {
+            let s = &replayer.statistics;
+            println!("  Replayed {n} events");
+            println!(
+                "  Stats: {} llm · {} parse · {} graph · {} guard · {} failures · {} cycles",
+                s.llm_calls, s.parsing_events, s.graph_mutations, s.guard_checks, s.failures, s.cycles
+            );
+        }
+        Err(e) => {
+            eprintln!("ccos: replay error: {e}");
+            return 1;
+        }
+    }
+
+    let integrity = snapshot.dist_log.verify_integrity();
+    println!("  Hash-chain valid: {}", integrity.valid);
+    if integrity.valid {
+        0
+    } else {
+        1
+    }
+}
+
+/// Options for `ccos chaos`.
+struct ChaosOpts {
+    iters: usize,
+}
+
+impl ChaosOpts {
+    fn parse(args: &[String]) -> Self {
+        let mut iters = 1000usize;
+        let mut i = 0;
+        while i < args.len() {
+            if args[i] == "--iters" {
+                i += 1;
+                if let Some(n) = args.get(i).and_then(|v| v.parse().ok()) {
+                    iters = n;
+                }
+            }
+            i += 1;
+        }
+        Self { iters }
+    }
+}
+
+/// `ccos chaos [--iters N]` — drive adversarial payloads (JSON corruption,
+/// hallucination, prompt injection, timeouts) through the guard and assert its
+/// core invariant: the guard must *never* emit non-JSON output.
+fn run_chaos(opts: &ChaosOpts) -> i32 {
+    println!("╔══════════════════════════════════════════════╗");
+    println!("║  CCOS chaos — {:>5} iterations                ║", opts.iters);
+    println!("╚══════════════════════════════════════════════╝\n");
+
+    let guard = GuardLayer::new(GuardConfig::default());
+    let modes = [
+        AdversarialMode::JsonCorruption,
+        AdversarialMode::Hallucination,
+        AdversarialMode::PromptInjection,
+        AdversarialMode::TimeoutSimulation,
+    ];
+
+    let (mut passed, mut blocked, mut invalid_outputs) = (0u64, 0u64, 0u64);
+    for i in 0..opts.iters {
+        let mut engine = AdversarialEngine::with_corruption_rate(modes[i % modes.len()].clone(), 0.9);
+        let corrupted = engine.corrupt("{\"action\": \"analyze\", \"ok\": true}");
+        let result = guard.validate_and_sanitize(&corrupted);
+        if result.passed {
+            passed += 1;
+        } else {
+            blocked += 1;
+        }
+        if serde_json::from_str::<serde_json::Value>(&result.sanitized_output).is_err() {
+            invalid_outputs += 1;
+        }
+    }
+
+    println!("  Iterations:            {}", opts.iters);
+    println!("  Guard passed:          {passed}");
+    println!("  Guard blocked:         {blocked}");
+    println!("  Invalid guard outputs: {invalid_outputs} (must be 0)");
+
+    if invalid_outputs == 0 {
+        println!("\n  ✓ guard never emitted invalid JSON under chaos");
+        0
+    } else {
+        println!("\n  ✗ guard emitted invalid JSON — safety invariant violated");
+        1
+    }
 }
 
 /// Recursively collect `.rs` files, skipping `target/`, VCS and hidden dirs.
@@ -650,13 +954,23 @@ fn print_help() {
 USAGE:\n\
     ccos [COMMAND]\n\n\
 COMMANDS:\n\
-    demo             Run the built-in end-to-end kernel demo (default)\n\
-    analyze <path>   Ingest all .rs files under <path> and print a graph report\n\
-    help, --help     Show this help\n\
-    version          Show the version\n\n\
+    demo                       Run the built-in end-to-end kernel demo (default)\n\
+    analyze <path> [flags]     Ingest all .rs files under <path> and report\n\
+        --json                 Emit the report as JSON instead of text\n\
+        --cycles               Detect and list dependency cycles\n\
+        --out <file>           Save a full kernel snapshot (graph + logs) to <file>\n\
+    verify <snapshot.json>     Re-check a saved snapshot's hash chain & integrity\n\
+    replay <snapshot.json>     Deterministically replay a saved event log\n\
+    chaos [--iters N]          Fuzz the guard with adversarial payloads\n\
+    help, --help               Show this help\n\
+    version, --version         Show the version\n\n\
 ENVIRONMENT (demo only):\n\
-    OLLAMA_ENDPOINT  LLM endpoint (default http://localhost:11434)\n\
-    OLLAMA_MODEL     Model name (default codellama)\n",
+    OLLAMA_ENDPOINT            LLM endpoint (default http://localhost:11434)\n\
+    OLLAMA_MODEL               Model name (default codellama)\n\n\
+EXAMPLES:\n\
+    ccos analyze src --cycles\n\
+    ccos analyze src --out run.json && ccos verify run.json && ccos replay run.json\n\
+    ccos chaos --iters 5000\n",
         env!("CARGO_PKG_VERSION")
     );
 }

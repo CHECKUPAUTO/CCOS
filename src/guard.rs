@@ -82,15 +82,33 @@ impl GuardLayer {
             warnings.push("output is not valid JSON".into());
         }
 
+        // Enforce the configured nesting bound: deeply nested JSON is a common
+        // denial-of-service / stack-exhaustion vector for downstream consumers.
+        let depth = Self::json_nesting_depth(&sanitized);
+        let depth_ok = depth <= self.config.max_nesting_depth;
+        if !depth_ok {
+            warnings.push(format!(
+                "nesting depth {} exceeds limit {}",
+                depth, self.config.max_nesting_depth
+            ));
+        }
+
         let reliability = self.compute_reliability_score(&sanitized, json_valid);
 
-        let passed = reliability >= self.config.reliability_threshold && json_valid;
+        let passed = reliability >= self.config.reliability_threshold && json_valid && depth_ok;
 
         let blocked_reason = if !passed {
-            Some(format!(
-                "reliability {:.2} below threshold {:.2}",
-                reliability, self.config.reliability_threshold
-            ))
+            Some(if !depth_ok {
+                format!(
+                    "nesting depth {} exceeds limit {}",
+                    depth, self.config.max_nesting_depth
+                )
+            } else {
+                format!(
+                    "reliability {:.2} below threshold {:.2}",
+                    reliability, self.config.reliability_threshold
+                )
+            })
         } else {
             None
         };
@@ -128,6 +146,32 @@ impl GuardLayer {
         // the guard. Requiring whole-string validity closes that hole and is
         // also O(n) instead of the old O(n^2) prefix scan.
         serde_json::from_str::<Value>(trimmed).is_ok()
+    }
+
+    /// Maximum nesting depth of `{`/`[` brackets, ignoring brackets that appear
+    /// inside JSON string literals.
+    fn json_nesting_depth(input: &str) -> usize {
+        let mut depth = 0usize;
+        let mut max = 0usize;
+        let mut in_string = false;
+        let mut escaped = false;
+        for ch in input.chars() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' if in_string => escaped = true,
+                '"' => in_string = !in_string,
+                '{' | '[' if !in_string => {
+                    depth += 1;
+                    max = max.max(depth);
+                }
+                '}' | ']' if !in_string => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        max
     }
 
     fn compute_reliability_score(&self, output: &str, is_json: bool) -> f64 {
@@ -219,5 +263,26 @@ mod tests {
     fn test_fallback_response_is_valid_json() {
         let fallback = GuardLayer::fallback_response();
         assert!(serde_json::from_str::<Value>(&fallback).is_ok());
+    }
+
+    #[test]
+    fn test_nesting_depth_counted() {
+        assert_eq!(GuardLayer::json_nesting_depth("{}"), 1);
+        assert_eq!(GuardLayer::json_nesting_depth(r#"{"a":{"b":[1]}}"#), 3);
+        // Brackets inside strings must not count.
+        assert_eq!(GuardLayer::json_nesting_depth(r#"{"a":"{{{["}"#), 1);
+    }
+
+    #[test]
+    fn test_deep_nesting_blocked() {
+        let config = GuardConfig {
+            max_nesting_depth: 4,
+            ..GuardConfig::default()
+        };
+        let guard = GuardLayer::new(config);
+        let deep = format!("{}true{}", "[".repeat(10), "]".repeat(10));
+        let result = guard.validate_and_sanitize(&deep);
+        assert!(!result.passed, "nesting beyond the limit must be blocked");
+        assert!(serde_json::from_str::<Value>(&result.sanitized_output).is_ok());
     }
 }

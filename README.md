@@ -62,18 +62,25 @@ cargo build --release
 ccos [COMMAND]
 
 COMMANDS:
-    demo             Run the built-in end-to-end kernel demo (default)
-    analyze <path>   Ingest all .rs files under <path> and print a graph report
-    help, --help     Show this help
-    version          Show the version
+    demo                       Run the built-in end-to-end kernel demo (default)
+    analyze <path> [flags]     Ingest all .rs files under <path> and report
+        --json                 Emit the report as JSON instead of text
+        --cycles               Detect and list dependency cycles
+        --out <file>           Save a full kernel snapshot (graph + logs) to <file>
+    verify <snapshot.json>     Re-check a saved snapshot's hash chain & integrity
+    replay <snapshot.json>     Deterministically replay a saved event log
+    chaos [--iters N]          Fuzz the guard with adversarial payloads
+    help, --help               Show this help
+    version, --version         Show the version
 ```
 
 ### `ccos demo`
 
 Runs all subsystems on a small synthetic workspace: parsing → LLM + guard →
-incremental delta → failure propagation → context selection → deterministic
-replay → paging. The LLM call targets an [Ollama](https://ollama.com)-style
-endpoint and falls back to a deterministic stub when none is reachable:
+multi-model consensus → incremental delta → failure propagation → context
+selection → deterministic replay → paging → hash-chain integrity. The LLM call
+targets an [Ollama](https://ollama.com)-style endpoint and falls back to a
+deterministic stub when none is reachable:
 
 ```bash
 OLLAMA_ENDPOINT=http://localhost:11434 OLLAMA_MODEL=codellama cargo run -- demo
@@ -82,24 +89,32 @@ OLLAMA_ENDPOINT=http://localhost:11434 OLLAMA_MODEL=codellama cargo run -- demo
 ### `ccos analyze <path>`
 
 Ingests real `.rs` files into the causal graph and prints a structural report
-(node/edge counts, top nodes by causal score, the selected context window).
-CCOS can analyze its own source tree:
+(node/edge counts, node-type histogram, optional dependency cycles, top nodes by
+causal score, the selected context window). CCOS can analyze its own source tree:
 
 ```bash
-cargo run -- analyze src
+cargo run -- analyze src --cycles          # human-readable report + cycles
+cargo run -- analyze src --json            # machine-readable JSON
 ```
 
-```
-─── Graph Summary ───
-  Files ingested:  11
-  Graph nodes:     308
-  Graph edges:     338
-  Dangling edges:  0 (must be 0)
+### Save → verify → replay
 
-─── Top 10 nodes by causal score ───
-    dep:std                                        0.5104
-    dep:serde                                      0.4790
-    ...
+`analyze --out` persists a full snapshot (graph + event log + hash chain) that
+the other commands consume:
+
+```bash
+cargo run -- analyze src --out run.json
+cargo run -- verify run.json     # hash chain valid? dangling edges? → exit 0/1
+cargo run -- replay run.json     # deterministic event-log replay + stats
+```
+
+### `ccos chaos`
+
+Drives adversarial payloads (corruption, hallucination, injection, timeouts)
+through the guard and asserts it **never** emits invalid JSON:
+
+```bash
+cargo run -- chaos --iters 5000
 ```
 
 ## Testing
@@ -126,16 +141,27 @@ Heavier stress/chaos harnesses live in [`scripts/`](scripts/) (multi-day chaos,
 - **Tamper-evidence**: the hash-chained log detects any mutation
   (`src/distributed_event_log.rs`).
 
+## Design paper
+
+A full write-up of the architecture, algorithms (causal scoring, failure
+propagation, deterministic paging, hash-chained log, consensus) and the
+audit-driven evaluation is in [`docs/PAPER.md`](docs/PAPER.md).
+
 ## Status & limitations
 
 This is a prototype. Known gaps (tracked in [`ROADMAP.md`](ROADMAP.md)):
 
 - The parser is a **line-based heuristic**, not a real Rust AST (no `syn`); it
-  misses multi-line declarations and nested-module bodies.
-- `consensus`, `adversarial`, and `distributed_event_log` are implemented and
-  tested but **not yet wired into the kernel runtime** (`main.rs`).
-- `GuardConfig::max_nesting_depth` is defined but not enforced.
-- No persistence: graph/log state lives only in memory for the run.
+  misses multi-line declarations and nested-module bodies. *(top future-work item)*
+- Replay reconstructs **statistics**, not yet full graph state (snapshots persist
+  state directly via `--out`).
+- The multi-model `consensus` path only does real work against a live
+  Ollama-style endpoint; offline runs fall back deterministically.
+
+Recently addressed (see `ROADMAP.md` → *Done*): unbounded edge leak, guard
+prefix-bypass, non-deterministic eviction, `max_nesting_depth` enforcement,
+persistence (`save`/`verify`/`replay`), and wiring `consensus` /
+`distributed_event_log` / `adversarial` into the CLI.
 
 ## License
 

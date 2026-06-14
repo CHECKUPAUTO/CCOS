@@ -88,31 +88,47 @@ pub struct LlmClient {
 }
 
 impl LlmClient {
-    pub fn new(config: LlmConfig) -> Self {
+    /// Fallible constructor — fails if the HTTP client cannot be built.
+    pub fn try_new(config: LlmConfig) -> Result<Self, String> {
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(config.timeout_secs))
             .build()
-            .expect("Failed to build HTTP client");
+            .map_err(|e| format!("failed to build HTTP client: {e}"))?;
 
         let guard = GuardLayer::new(config.guard_config.clone());
 
-        Self {
+        Ok(Self {
             config,
             client,
             guard,
-        }
+        })
     }
 
-    pub async fn query(
+    /// Convenience constructor that panics on HTTP-client build failure.
+    /// Prefer [`LlmClient::try_new`] in fallible contexts.
+    pub fn new(config: LlmConfig) -> Self {
+        Self::try_new(config).expect("failed to build HTTP client")
+    }
+
+    pub async fn query(&self, prompt: &str, system: Option<&str>) -> ValidatedResponse {
+        let model = self.config.model.clone();
+        self.query_as(prompt, system, &model).await
+    }
+
+    /// Query a specific `model` on the configured endpoint. This is the core
+    /// request path; [`LlmClient::query`] delegates to it with the default
+    /// model, and [`LlmClient::query_models`] fans out across several.
+    pub async fn query_as(
         &self,
         prompt: &str,
         system: Option<&str>,
+        model: &str,
     ) -> ValidatedResponse {
         let prompt_hash = compute_hash(prompt);
         let start = std::time::Instant::now();
 
         let request = LlmRequest {
-            model: self.config.model.clone(),
+            model: model.to_string(),
             prompt: prompt.to_string(),
             system: system.map(|s| s.to_string()),
             stream: false,
@@ -148,7 +164,7 @@ impl LlmClient {
                                 guard_passed: guard_result.passed,
                                 reliability_score: guard_result.reliability_score,
                                 guard_warnings: guard_result.warnings,
-                                model: self.config.model.clone(),
+                                model: model.to_string(),
                                 prompt_hash,
                                 response_hash,
                                 latency_ms: latency,
@@ -181,12 +197,34 @@ impl LlmClient {
             guard_passed: false,
             reliability_score: 0.0,
             guard_warnings: guard_result.warnings,
-            model: self.config.model.clone(),
+            model: model.to_string(),
             prompt_hash,
             response_hash,
             latency_ms: latency,
             is_fallback: true,
         }
+    }
+
+    /// Fan out the same prompt across several models and collect their guarded
+    /// outputs as consensus votes (confidence = reliability score). Used by the
+    /// multi-model consensus path; unreachable models contribute a low-
+    /// confidence fallback vote rather than failing the whole batch.
+    pub async fn query_models(
+        &self,
+        prompt: &str,
+        system: Option<&str>,
+        models: &[&str],
+    ) -> Vec<crate::consensus::LlmVote> {
+        let mut votes = Vec::with_capacity(models.len());
+        for model in models {
+            let resp = self.query_as(prompt, system, model).await;
+            votes.push(crate::consensus::LlmVote {
+                model: resp.model.clone(),
+                output: resp.sanitized_output.clone(),
+                confidence: resp.reliability_score,
+            });
+        }
+        votes
     }
 
     pub async fn query_deterministic(
