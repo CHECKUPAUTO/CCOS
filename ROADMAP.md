@@ -45,6 +45,24 @@ Prioritized roadmap from the audit. Effort: S/M/L.
   Closes the event-sourcing loop. *(was P0.3 / P0.2)*
 - **Graphviz export** (`analyze --dot`) and **orphan-node** reporting.
 
+## ✅ Done — v0.3 (Autonomous Context Runtime)
+
+- **Context scheduler** (`scheduler.rs`) — HOT/WARM/COLD paging by token budget
+  and priority; `allocate`/`evict`/`optimize`, no node lost.
+- **Real workspace scanner** (`workspace.rs`) — async `tokio::fs` scan with
+  add/modify/remove delta detection feeding only Δ to the engine.
+- **Multi-agent layer** (`agents.rs`) — Coder/Reviewer/Security agents, guarded
+  + logged + deterministic.
+- **Persistent runtime** (`persistence.rs`) — directory-based save/load/restore
+  with verify-on-restore.
+- **Benchmark framework** (`benchmark.rs`) — cycle benchmark → JSON report
+  (100k stress in CI; 1M opt-in).
+- **CLI** — `scan`, `agents`, `benchmark`, `runtime` (capstone).
+- **Quality** — `main.rs` split into `commands_demo`/`commands_runtime`
+  (1206 → 679 lines); `util::sha256_hex` DRY consolidation; dead code removed;
+  config flags (`--max-nodes`, `--budget`); property tests; criterion benches.
+  *(was P2.4, P2.5, P3.8)*
+
 ---
 
 ## Remaining

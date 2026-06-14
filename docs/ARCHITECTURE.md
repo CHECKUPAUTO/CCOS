@@ -16,8 +16,14 @@ A practical map of the codebase for contributors. For the conceptual write-up se
 | `guard`                     | Validate/sanitize model output | `GuardLayer`, `GuardConfig`, `GuardResult` |
 | `consensus`                 | Majority / confidence-weighted voting | `ConsensusEngine`, `LlmVote`, `ConsensusResult` |
 | `adversarial`               | Fault injection for hardening | `AdversarialEngine`, `AdversarialMode` |
-| `persist`                   | Save/load full kernel state | `KernelSnapshot` |
-| `main` (bin)                | CLI dispatch + the demo | — |
+| `persist`                   | Save/load a kernel snapshot (one file) | `KernelSnapshot` |
+| `util`                      | Shared helpers (`sha256_hex`) | `sha256_hex` |
+| **`scheduler`** (v0.3)      | HOT/WARM/COLD context paging by token budget | `ContextScheduler`, `MemoryZone` |
+| **`workspace`** (v0.3)      | Async real-FS scanner; add/modify/remove delta | `WorkspaceScanner`, `WorkspaceDelta` |
+| **`agents`** (v0.3)         | Multi-agent execution behind a trait | `Agent`, `AgentExecutor`, `CoderAgent`, `ReviewerAgent`, `SecurityAgent` |
+| **`persistence`** (v0.3)    | Durable runtime state (directory) + verify | `PersistentRuntime`, `RuntimeState` |
+| **`benchmark`** (v0.3)      | Cycle benchmark → JSON report | `BenchmarkHarness`, `BenchmarkReport` |
+| `main` (bin)                | Thin entry → `commands_demo` / `commands_runtime` + inline commands | — |
 
 ## Core data structures
 
@@ -88,7 +94,7 @@ hash-chain integrity.
 
 ```bash
 cargo build --all-targets
-cargo test                    # 118 unit + integration tests
+cargo test                    # 156 unit + integration tests
 cargo clippy --all-targets    # warning-clean (CI denies warnings)
 cargo doc --open              # rendered module docs
 ```

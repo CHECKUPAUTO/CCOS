@@ -21,7 +21,7 @@ architecture, the core algorithms, and an audit-driven hardening pass that
 eliminated an unbounded edge-leak (reducing a 10,000-cycle workload from 9,036
 edges and an 11× slowdown to ~30 edges and a 1.08× slowdown), closed a guard
 bypass, and made eviction deterministic. The prototype is 6 KLoC of Rust, passes
-117 tests with zero linter warnings, and can analyze its own source tree.
+156 tests with zero linter warnings, and can analyze its own source tree.
 
 ---
 
@@ -285,7 +285,7 @@ is fully derivable from the event stream (`GraphReconstructor`).
 
 ### 6.7 Test posture
 
-118 unit + integration tests pass; `cargo clippy --all-targets` is warning-clean.
+156 unit + integration tests pass; `cargo clippy --all-targets` is warning-clean.
 Stress harnesses (10k-cycle stability, snapshot differential, replay
 consistency, adversarial suite) run in CI-friendly time.
 
@@ -333,7 +333,7 @@ substrate for further research on causal context management.
 ### Reproducibility
 
 ```bash
-cargo test                     # 117 tests
+cargo test                     # 156 tests
 cargo run -- analyze src --cycles
 cargo run -- analyze src --out run.json
 cargo run -- verify run.json && cargo run -- replay run.json

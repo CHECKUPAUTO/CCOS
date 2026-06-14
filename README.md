@@ -73,6 +73,13 @@ COMMANDS:
     diff <a.json> <b.json>     Structural diff between two snapshots (+ score drift)
     failure <snap> <node-id>   Inject a fault at a node and propagate it (--depth N)
     chaos [--iters N]          Fuzz the guard with adversarial payloads
+
+  CCOS v0.3 — Autonomous Context Runtime:
+    scan <path>                Scan a real workspace and ingest the delta
+    agents <path>              Run Coder/Reviewer/Security agents over a workspace
+    benchmark [--cycles N]     Run the cycle benchmark → benchmark_report.json
+    runtime <path> [--state D] Scan → schedule → agents → persist (capstone)
+
     help, --help               Show this help
     version, --version         Show the version
 ```
@@ -135,11 +142,27 @@ through the guard and asserts it **never** emits invalid JSON:
 cargo run -- chaos --iters 5000
 ```
 
+### CCOS v0.3 — Autonomous Context Runtime
+
+v0.3 scans a real workspace, pages its context (HOT/WARM/COLD), runs specialized
+agents, and persists the runtime so it resumes after a restart. The `runtime`
+command wires all of it together:
+
+```bash
+cargo run -- scan src                      # async FS scan → causal graph
+cargo run -- agents src                    # Coder/Reviewer/Security over the code
+cargo run -- benchmark --cycles 100000     # → benchmark_report.json
+cargo run -- runtime src --state data      # scan → schedule → agents → persist
+```
+
+See [`CCOS_v0.3_REPORT.md`](CCOS_v0.3_REPORT.md) for the full v0.3 report.
+
 ## Testing
 
 ```bash
-cargo test          # 117 unit + integration tests
+cargo test          # 156 unit + integration tests
 cargo clippy --all-targets   # lint-clean
+cargo test -- --ignored      # opt-in: 1,000,000-cycle long-stability run
 ```
 
 Heavier stress/chaos harnesses live in [`scripts/`](scripts/) (multi-day chaos,
@@ -166,6 +189,8 @@ Heavier stress/chaos harnesses live in [`scripts/`](scripts/) (multi-day chaos,
   consensus) and the audit-driven evaluation.
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — developer guide: module map,
   data structures, invariants, control flow, and how to extend the kernel.
+- [`CCOS_v0.3_REPORT.md`](CCOS_v0.3_REPORT.md) — v0.3 Autonomous Context Runtime
+  report: new modules, tests, performance, and limitations.
 - `cargo doc --open` — rendered API docs (every module has rustdoc).
 
 ## Status & limitations
