@@ -39,6 +39,11 @@ Prioritized roadmap from the audit. Effort: S/M/L.
 - **Fallible `LlmClient::try_new`** alongside the panicking `new`. *(was P3.12)*
 - **CI** — `.github/workflows/ci.yml` runs `build`, `clippy -D warnings`,
   `test`, and a CLI smoke test (`analyze → verify → replay → chaos`).
+- **Full graph reconstruction from the event log** — `EventLog::record_graph`
+  emits `NodeUpserted`/`EdgeAdded` events; `GraphReconstructor` rebuilds an
+  identical graph from the log alone (`replay` reports `matches snapshot: true`).
+  Closes the event-sourcing loop. *(was P0.3 / P0.2)*
+- **Graphviz export** (`analyze --dot`) and **orphan-node** reporting.
 
 ---
 
@@ -49,26 +54,23 @@ Prioritized roadmap from the audit. Effort: S/M/L.
 1. **`syn`-based AST parser.** (L) The line-based parser misses multi-line
    signatures, nested-module bodies, grouped `use` and macros. Put it behind a
    feature flag with the heuristic parser as a zero-dep fallback. *(top item)*
-2. **Full graph reconstruction from the event log.** (M) Replay currently folds
-   the log into statistics only; make `GraphMutation`/`Parsing` events carry
-   enough to rebuild a graph byte-identical to the live one, and assert it.
 
 ### P1 — Depth
 
-3. **Canonical hash-chained log.** (M) Fold tamper-evidence into the primary
+2. **Canonical hash-chained log.** (M) Fold tamper-evidence into the primary
    `EventLog` (or mirror every kernel event), so integrity covers *all* runs, not
    just snapshots.
-4. **Semantic edges.** (L) Call-graph and data-flow edges, not just
+3. **Semantic edges.** (L) Call-graph and data-flow edges, not just
    containment/dependency — richer causal propagation.
 
 ### P2 — Ergonomics
 
-5. **Configurable scoring/paging/guard** via CLI flags or a config file instead
+4. **Configurable scoring/paging/guard** via CLI flags or a config file instead
    of magic constants. (S)
-6. **Benchmarks.** (S) `criterion` benches for `process_delta` to guard the
+5. **Benchmarks.** (S) `criterion` benches for `process_delta` to guard the
    `O(Δ)` claim against regressions.
-7. **`analyze` extras.** (S) dead-symbol detection, per-file failure simulation,
-   DOT/GraphML export for visualization.
+6. **`analyze` extras.** (S) dead-symbol detection, per-file failure simulation,
+   GraphML export to complement the existing Graphviz/DOT output.
 
 ### P3 — Hygiene
 
@@ -81,6 +83,6 @@ Prioritized roadmap from the audit. Effort: S/M/L.
 
 ### Suggested order
 
-`P0.1 (syn)` → `P0.2 (replay reconstruction)` → `P1.3 (canonical log)` →
-`P2.6 (benches)` → `P1.4 (semantic edges)` → polish. P2.5 and P3.8 are quick wins
+`P0.1 (syn)` → `P1.2 (canonical log)` → `P2.5 (benches)` →
+`P1.3 (semantic edges)` → polish. P2.4 and P3.7 are quick wins
 that can land anytime.

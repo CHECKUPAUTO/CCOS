@@ -159,8 +159,7 @@ This is a prototype. Known gaps (tracked in [`ROADMAP.md`](ROADMAP.md)):
 
 - The parser is a **line-based heuristic**, not a real Rust AST (no `syn`); it
   misses multi-line declarations and nested-module bodies. *(top future-work item)*
-- Replay reconstructs **statistics**, not yet full graph state (snapshots persist
-  state directly via `--out`).
+- Edges capture containment/dependency, **not** call graphs or data flow.
 - The multi-model `consensus` path only does real work against a live
   Ollama-style endpoint; offline runs fall back deterministically.
 

@@ -162,10 +162,13 @@ that empirically stresses the invariant.
 ### 4.6 Event sourcing and deterministic replay
 
 State is derived from an append-only log of typed events
-(`Parsing`, `GraphMutation`, `LlmCall`, `GuardCheck`, `FailureDetection`,
-`FailurePropagation`, `Snapshot`, `CycleEvent`, …). A `ReplayHandler` folds the
-log into statistics (and, as future work, a full graph reconstruction). Because
-all kernel ordering is total (P3), replay is reproducible.
+(`Parsing`, `GraphMutation`, `NodeUpserted`, `EdgeAdded`, `LlmCall`,
+`GuardCheck`, `FailureDetection`, `FailurePropagation`, `Snapshot`,
+`CycleEvent`, …). A `ReplayHandler` either folds the log into summary statistics
+(`EventReplayer`) or — via `record_graph` + `GraphReconstructor` — **rebuilds the
+graph itself**, faithfully, from `NodeUpserted`/`EdgeAdded` events. Because all
+kernel ordering is total (P3), replay is reproducible. This closes the
+event-sourcing loop: state is fully derivable from the log.
 
 ### 4.7 Tamper-evident distributed log
 
@@ -266,14 +269,21 @@ exposes this for saved snapshots.
 
 ### 6.5 Self-hosting
 
-`ccos analyze src` ingests CCOS's own 12-file source tree into a 344-node /
-385-edge graph with **zero dangling edges**, ranking `dep:std`, `dep:serde`,
-`dep:ccos` as the highest-scored (most-referenced) nodes — a sanity check that
-the causal scoring surfaces genuine hubs.
+`ccos analyze src` ingests CCOS's own source tree into a ~350-node / ~400-edge
+graph with **zero dangling edges**, ranking `dep:std`, `dep:serde`, `dep:ccos`
+as the highest-scored (most-referenced) nodes — a sanity check that the causal
+scoring surfaces genuine hubs.
 
-### 6.6 Test posture
+### 6.6 Event-sourcing round-trip
 
-117 unit + integration tests pass; `cargo clippy --all-targets` is warning-clean.
+`ccos analyze src --out run.json` records the graph as `NodeUpserted`/`EdgeAdded`
+events; `ccos replay run.json` then **rebuilds the graph from the log alone** and
+reports `matches snapshot: true` — an identical node/edge set — confirming state
+is fully derivable from the event stream (`GraphReconstructor`).
+
+### 6.7 Test posture
+
+118 unit + integration tests pass; `cargo clippy --all-targets` is warning-clean.
 Stress harnesses (10k-cycle stability, snapshot differential, replay
 consistency, adversarial suite) run in CI-friendly time.
 
@@ -284,8 +294,6 @@ consistency, adversarial suite) run in CI-friendly time.
   AST is the top future-work item.
 - **No semantic edges.** Edges capture containment/dependency, not call graphs or
   data flow.
-- **Replay reconstructs statistics, not full state.** Snapshots persist state
-  directly; deriving the graph *purely* from the event log is future work.
 - **Consensus/adversarial/distributed-log** are wired into the CLI but the LLM
   path is only exercised against an Ollama-style endpoint; offline runs fall back
   deterministically.
@@ -303,11 +311,10 @@ deterministic and auditable end-to-end.
 ## 9. Future work
 
 In priority order (tracked in `ROADMAP.md`): (1) `syn`-based AST parsing;
-(2) full graph reconstruction from the event log; (3) call-graph / data-flow
-edges; (4) live integration of consensus and the hash-chained log into the
-runtime; (5) on-disk persistence and cross-session incremental re-analysis;
-(6) configurable scoring weights and benchmarking of the O(Δ) claim with
-`criterion`.
+(2) call-graph / data-flow (semantic) edges; (3) folding tamper-evidence into the
+primary log so every run is auditable; (4) configurable scoring weights and
+benchmarking of the O(Δ) claim with `criterion`; (5) property-based testing of
+the graph invariants under random edit sequences.
 
 ## 10. Conclusion
 

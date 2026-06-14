@@ -10,7 +10,7 @@ A practical map of the codebase for contributors. For the conceptual write-up se
 | `parser`                    | Line-based extraction of modules / `use` / symbols from Rust source | `ASTParser`, `ParseResult`, `Symbol`, `SymbolKind` |
 | `memory`                    | The causal graph: scoring, paging, failure propagation, analytics | `MemoryGraph`, `GraphNode`, `GraphEdge`, `NodeId`, `NodeType`, `EdgeType` |
 | `incremental`               | `O(Δ)` graph maintenance on file edits | `IncrementalGraphEngine`, `DeltaMutation`, `MutationOp`, `FileState` |
-| `event_log`                 | Append-only event log + deterministic replay | `EventLog`, `TraceEvent`, `EventType`, `EventPayload`, `EventReplayer` |
+| `event_log`                 | Append-only event log, deterministic replay & graph reconstruction | `EventLog`, `TraceEvent`, `EventType`, `EventPayload`, `EventReplayer`, `GraphReconstructor` |
 | `distributed_event_log`     | Tamper-evident hash-chained log | `DistributedEventLog`, `HashChainLink`, `IntegrityReport` |
 | `llm`                       | Async Ollama-style client + retries + fallback | `LlmClient`, `LlmConfig`, `ValidatedResponse` |
 | `guard`                     | Validate/sanitize model output | `GuardLayer`, `GuardConfig`, `GuardResult` |
@@ -88,7 +88,7 @@ hash-chain integrity.
 
 ```bash
 cargo build --all-targets
-cargo test                    # 117 unit + integration tests
+cargo test                    # 118 unit + integration tests
 cargo clippy --all-targets    # warning-clean (CI denies warnings)
 cargo doc --open              # rendered module docs
 ```

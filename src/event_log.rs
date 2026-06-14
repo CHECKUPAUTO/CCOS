@@ -1,3 +1,4 @@
+use crate::memory::{EdgeType, MemoryGraph, NodeId, NodeType};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -92,6 +93,21 @@ pub enum EventPayload {
         nodes_count: usize,
         edges_count: usize,
         total_events: usize,
+    },
+    /// A graph node creation/update, recorded with enough detail to rebuild the
+    /// graph by replay (see [`EventLog::record_graph`] / [`GraphReconstructor`]).
+    NodeUpserted {
+        id: String,
+        label: String,
+        content: String,
+        node_type: NodeType,
+    },
+    /// A graph edge addition, recorded for replay-based reconstruction.
+    EdgeAdded {
+        source: String,
+        target: String,
+        weight: f64,
+        edge_type: EdgeType,
     },
     Custom {
         key: String,
@@ -195,6 +211,39 @@ impl EventLog {
         }
         Ok(processed)
     }
+
+    /// Append `NodeUpserted` + `EdgeAdded` events that fully describe `graph`,
+    /// so its structure can be rebuilt purely by replaying the log (see
+    /// [`GraphReconstructor`]). Emission order is deterministic.
+    pub fn record_graph(&mut self, graph: &MemoryGraph) {
+        let mut node_ids: Vec<&NodeId> = graph.nodes.keys().collect();
+        node_ids.sort();
+        for id in node_ids {
+            let node = &graph.nodes[id];
+            self.append(
+                EventType::GraphMutation,
+                EventPayload::NodeUpserted {
+                    id: id.0.clone(),
+                    label: node.label.clone(),
+                    content: node.content.clone(),
+                    node_type: node.node_type.clone(),
+                },
+            );
+        }
+        let mut edges: Vec<&crate::memory::GraphEdge> = graph.edges.iter().collect();
+        edges.sort_by(|a, b| a.source.cmp(&b.source).then_with(|| a.target.cmp(&b.target)));
+        for e in edges {
+            self.append(
+                EventType::GraphMutation,
+                EventPayload::EdgeAdded {
+                    source: e.source.0.clone(),
+                    target: e.target.0.clone(),
+                    weight: e.weight,
+                    edge_type: e.edge_type.clone(),
+                },
+            );
+        }
+    }
 }
 
 pub trait ReplayHandler {
@@ -225,6 +274,9 @@ impl ReplayHandler for EventReplayer {
             EventPayload::LlmCallResponse { .. } => self.statistics.llm_calls += 1,
             EventPayload::Parsing { .. } => self.statistics.parsing_events += 1,
             EventPayload::GraphMutation { .. } => self.statistics.graph_mutations += 1,
+            EventPayload::NodeUpserted { .. } | EventPayload::EdgeAdded { .. } => {
+                self.statistics.graph_mutations += 1
+            }
             EventPayload::FailureDetection { .. } => self.statistics.failures += 1,
             EventPayload::FailurePropagation { .. } => self.statistics.failures += 1,
             EventPayload::GuardCheck { .. } => self.statistics.guard_checks += 1,
@@ -246,6 +298,73 @@ impl EventReplayer {
 impl Default for EventReplayer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// A [`ReplayHandler`] that rebuilds a [`MemoryGraph`] from the `NodeUpserted` /
+/// `EdgeAdded` events emitted by [`EventLog::record_graph`]. This closes the
+/// event-sourcing loop: state is fully derivable from the log, not just the
+/// summary statistics produced by [`EventReplayer`].
+#[derive(Debug)]
+pub struct GraphReconstructor {
+    pub graph: MemoryGraph,
+    pub nodes_built: usize,
+    pub edges_built: usize,
+}
+
+impl GraphReconstructor {
+    pub fn new() -> Self {
+        // Disable paging during reconstruction so a faithful copy is rebuilt
+        // regardless of the original graph's size.
+        Self {
+            graph: MemoryGraph::new(0.0, usize::MAX),
+            nodes_built: 0,
+            edges_built: 0,
+        }
+    }
+}
+
+impl Default for GraphReconstructor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ReplayHandler for GraphReconstructor {
+    fn handle_event(&mut self, event: &TraceEvent) -> Result<(), String> {
+        match &event.payload {
+            EventPayload::NodeUpserted {
+                id,
+                label,
+                content,
+                node_type,
+            } => {
+                self.graph.upsert_node(
+                    NodeId(id.clone()),
+                    label.clone(),
+                    content.clone(),
+                    node_type.clone(),
+                );
+                self.nodes_built += 1;
+            }
+            EventPayload::EdgeAdded {
+                source,
+                target,
+                weight,
+                edge_type,
+            } => {
+                if self.graph.add_edge(
+                    NodeId(source.clone()),
+                    NodeId(target.clone()),
+                    *weight,
+                    edge_type.clone(),
+                ) {
+                    self.edges_built += 1;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 }
 
@@ -326,6 +445,48 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 1);
         assert_eq!(replayer.statistics.parsing_events, 1);
+    }
+
+    #[test]
+    fn test_record_and_reconstruct_graph() {
+        use crate::memory::{EdgeType, MemoryGraph, NodeType};
+        let mut graph = MemoryGraph::new(0.0, usize::MAX);
+        for i in 0..50 {
+            graph.upsert_node(
+                NodeId(format!("n{i}")),
+                format!("label{i}"),
+                format!("content{i}"),
+                if i % 2 == 0 {
+                    NodeType::Module
+                } else {
+                    NodeType::Symbol
+                },
+            );
+        }
+        for i in 0..49 {
+            graph.add_edge(
+                NodeId(format!("n{i}")),
+                NodeId(format!("n{}", i + 1)),
+                0.5,
+                EdgeType::DependsOn,
+            );
+        }
+
+        let mut log = EventLog::new("recon".into());
+        log.record_graph(&graph);
+
+        let mut recon = GraphReconstructor::new();
+        log.replay_deterministic(&mut recon).unwrap();
+
+        assert_eq!(recon.graph.node_count(), graph.node_count());
+        assert_eq!(recon.graph.edge_count(), graph.edge_count());
+        // Structural fidelity: same ids, labels, contents, types.
+        for (id, node) in &graph.nodes {
+            let r = recon.graph.nodes.get(id).expect("reconstructed node present");
+            assert_eq!(r.label, node.label);
+            assert_eq!(r.content, node.content);
+            assert_eq!(r.node_type, node.node_type);
+        }
     }
 
     #[test]

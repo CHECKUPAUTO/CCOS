@@ -1,7 +1,7 @@
 use ccos::adversarial::{AdversarialEngine, AdversarialMode};
 use ccos::consensus::ConsensusEngine;
 use ccos::distributed_event_log::DistributedEventLog;
-use ccos::event_log::{EventLog, EventPayload, EventReplayer, EventType};
+use ccos::event_log::{EventLog, EventPayload, EventReplayer, EventType, GraphReconstructor};
 use ccos::guard::{GuardConfig, GuardLayer};
 use ccos::incremental::IncrementalGraphEngine;
 use ccos::llm::{LlmClient, LlmConfig};
@@ -761,6 +761,9 @@ fn run_analyze(opts: &AnalyzeOpts) -> i32 {
     }
 
     if let Some(out) = &opts.out {
+        // Record the graph as replayable events so `ccos replay` can rebuild it
+        // from the log alone (event-sourcing round-trip), then snapshot.
+        event_log.record_graph(&graph);
         let snapshot = KernelSnapshot::new(graph, event_log, dist_log);
         match snapshot.save(out) {
             Ok(()) => eprintln!("\n[SAVE] snapshot written to {out}"),
@@ -857,6 +860,20 @@ fn run_replay(file: Option<&str>) -> i32 {
             eprintln!("ccos: replay error: {e}");
             return 1;
         }
+    }
+
+    // Rebuild the graph purely from the log and check it matches the snapshot.
+    let mut recon = GraphReconstructor::new();
+    let _ = snapshot.event_log.replay_deterministic(&mut recon);
+    if recon.nodes_built > 0 {
+        let matches = recon.graph.node_count() == snapshot.graph.node_count()
+            && recon.graph.edge_count() == snapshot.graph.edge_count();
+        println!(
+            "  Reconstructed graph: {} nodes / {} edges (matches snapshot: {})",
+            recon.graph.node_count(),
+            recon.graph.edge_count(),
+            matches
+        );
     }
 
     let integrity = snapshot.dist_log.verify_integrity();
