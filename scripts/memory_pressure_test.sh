@@ -124,8 +124,8 @@ rustc /tmp/ccos_memory_pressure.rs -o /tmp/ccos_memory_pressure \
     exit 0
 } || {
     echo "  (using cargo test fallback)"
-    cargo test phase9_memory_paging --test integration_ccos --release 2>&1
-    cargo test long_term_stability_10k_cycles --test long_term_stability --release 2>&1 | tail -5
+    cargo test phase9_memory_paging --test integration_ccos 2>&1
+    cargo test long_term_stability_10k_cycles --test long_term_stability 2>&1 | tail -5
     rm -f /tmp/ccos_memory_pressure /tmp/ccos_memory_pressure.rs
     echo "  MEMORY PRESSURE: ✓ (via integration tests)"
     exit 0

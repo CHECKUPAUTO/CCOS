@@ -1,3 +1,6 @@
+pub mod adversarial;
+pub mod consensus;
+pub mod distributed_event_log;
 pub mod event_log;
 pub mod guard;
 pub mod incremental;
