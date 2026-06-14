@@ -575,6 +575,7 @@ struct AnalyzeOpts {
     json: bool,
     cycles: bool,
     out: Option<String>,
+    dot: Option<String>,
 }
 
 impl AnalyzeOpts {
@@ -584,6 +585,7 @@ impl AnalyzeOpts {
             json: false,
             cycles: false,
             out: None,
+            dot: None,
         };
         let mut i = 0;
         while i < args.len() {
@@ -593,6 +595,10 @@ impl AnalyzeOpts {
                 "--out" => {
                     i += 1;
                     opts.out = args.get(i).cloned();
+                }
+                "--dot" => {
+                    i += 1;
+                    opts.dot = args.get(i).cloned();
                 }
                 s if !s.starts_with("--") => opts.path = s.to_string(),
                 other => eprintln!("ccos: ignoring unknown flag '{other}'"),
@@ -683,6 +689,14 @@ fn run_analyze(opts: &AnalyzeOpts) -> i32 {
     } else {
         Vec::new()
     };
+    let orphans = graph.orphan_nodes().len();
+
+    if let Some(dot_path) = &opts.dot {
+        match std::fs::write(dot_path, graph.to_dot()) {
+            Ok(()) => eprintln!("[DOT] graph written to {dot_path}"),
+            Err(e) => eprintln!("ccos: failed to write DOT to {dot_path}: {e}"),
+        }
+    }
 
     if opts.json {
         let top: Vec<_> = graph
@@ -702,6 +716,7 @@ fn run_analyze(opts: &AnalyzeOpts) -> i32 {
             "nodes": graph.node_count(),
             "edges": graph.edge_count(),
             "dangling_edges": dangling,
+            "orphan_nodes": orphans,
             "dependency_cycles": cycles.len(),
             "node_types": types,
             "top_nodes": top,
@@ -715,6 +730,7 @@ fn run_analyze(opts: &AnalyzeOpts) -> i32 {
         println!("  Mutations:       {}", engine.total_mutations());
         println!("  Events logged:   {}", event_log.event_count());
         println!("  Dangling edges:  {dangling} (must be 0)");
+        println!("  Orphan nodes:    {orphans}");
 
         println!("\n─── Node types ───");
         for (ty, count) in graph.node_type_counts() {
@@ -958,6 +974,7 @@ COMMANDS:\n\
     analyze <path> [flags]     Ingest all .rs files under <path> and report\n\
         --json                 Emit the report as JSON instead of text\n\
         --cycles               Detect and list dependency cycles\n\
+        --dot <file>           Export the causal graph as Graphviz DOT\n\
         --out <file>           Save a full kernel snapshot (graph + logs) to <file>\n\
     verify <snapshot.json>     Re-check a saved snapshot's hash chain & integrity\n\
     replay <snapshot.json>     Deterministically replay a saved event log\n\

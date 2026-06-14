@@ -375,6 +375,71 @@ impl MemoryGraph {
         out
     }
 
+    /// Nodes with no incident edges (neither incoming nor outgoing) — isolated
+    /// fragments that no other part of the graph references.
+    pub fn orphan_nodes(&self) -> Vec<&NodeId> {
+        use std::collections::HashSet;
+        let mut connected: HashSet<&NodeId> = HashSet::new();
+        for e in &self.edges {
+            connected.insert(&e.source);
+            connected.insert(&e.target);
+        }
+        let mut orphans: Vec<&NodeId> =
+            self.nodes.keys().filter(|id| !connected.contains(id)).collect();
+        orphans.sort();
+        orphans
+    }
+
+    /// Render the graph as Graphviz DOT (deterministic node/edge order, colored
+    /// by type) for visualization: `ccos analyze <path> --dot graph.dot`.
+    pub fn to_dot(&self) -> String {
+        fn esc(s: &str) -> String {
+            s.replace('\\', "\\\\").replace('"', "\\\"")
+        }
+        let color = |t: &NodeType| match t {
+            NodeType::Module => "#cfe2ff",
+            NodeType::Symbol => "#d1e7dd",
+            NodeType::ContextBlock => "#fff3cd",
+            NodeType::AnalysisResult => "#f8d7da",
+            NodeType::CodeRegion => "#e2e3e5",
+            NodeType::Unknown => "#ffffff",
+        };
+
+        let mut out = String::from(
+            "digraph ccos {\n  rankdir=LR;\n  node [shape=box, style=\"rounded,filled\", fontname=monospace];\n",
+        );
+
+        let mut ids: Vec<&NodeId> = self.nodes.keys().collect();
+        ids.sort();
+        for id in &ids {
+            let n = &self.nodes[*id];
+            out.push_str(&format!(
+                "  \"{}\" [label=\"{}\", fillcolor=\"{}\"];\n",
+                esc(&id.0),
+                esc(&n.label),
+                color(&n.node_type),
+            ));
+        }
+
+        let mut edges: Vec<&GraphEdge> = self.edges.iter().collect();
+        edges.sort_by(|a, b| {
+            a.source
+                .cmp(&b.source)
+                .then_with(|| a.target.cmp(&b.target))
+                .then_with(|| format!("{:?}", a.edge_type).cmp(&format!("{:?}", b.edge_type)))
+        });
+        for e in &edges {
+            out.push_str(&format!(
+                "  \"{}\" -> \"{}\" [label=\"{:?}\"];\n",
+                esc(&e.source.0),
+                esc(&e.target.0),
+                e.edge_type,
+            ));
+        }
+        out.push_str("}\n");
+        out
+    }
+
     pub fn get_node_scores(&self) -> Vec<(NodeId, f64)> {
         let mut scores: Vec<(NodeId, f64)> = self
             .nodes
@@ -462,6 +527,23 @@ mod tests {
         let cycles = graph.find_cycles();
         assert!(!cycles.is_empty(), "must detect the a->b->c->a cycle");
         assert!(cycles[0].len() >= 3);
+    }
+
+    #[test]
+    fn test_to_dot_and_orphans() {
+        let mut graph = MemoryGraph::default();
+        graph.upsert_node("a".into(), "A".into(), "".into(), NodeType::Module);
+        graph.upsert_node("b".into(), "B".into(), "".into(), NodeType::Symbol);
+        graph.upsert_node("lonely".into(), "L".into(), "".into(), NodeType::Unknown);
+        graph.add_edge("a".into(), "b".into(), 1.0, EdgeType::Contains);
+
+        let dot = graph.to_dot();
+        assert!(dot.starts_with("digraph ccos {"));
+        assert!(dot.contains("\"a\" -> \"b\""));
+
+        let orphans = graph.orphan_nodes();
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].0, "lonely");
     }
 
     #[test]

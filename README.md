@@ -66,6 +66,7 @@ COMMANDS:
     analyze <path> [flags]     Ingest all .rs files under <path> and report
         --json                 Emit the report as JSON instead of text
         --cycles               Detect and list dependency cycles
+        --dot <file>           Export the causal graph as Graphviz DOT
         --out <file>           Save a full kernel snapshot (graph + logs) to <file>
     verify <snapshot.json>     Re-check a saved snapshot's hash chain & integrity
     replay <snapshot.json>     Deterministically replay a saved event log
@@ -95,6 +96,8 @@ causal score, the selected context window). CCOS can analyze its own source tree
 ```bash
 cargo run -- analyze src --cycles          # human-readable report + cycles
 cargo run -- analyze src --json            # machine-readable JSON
+cargo run -- analyze src --dot ccos.dot    # Graphviz export → render with:
+dot -Tsvg ccos.dot -o ccos.svg             #   (requires graphviz)
 ```
 
 ### Save → verify → replay
@@ -120,7 +123,7 @@ cargo run -- chaos --iters 5000
 ## Testing
 
 ```bash
-cargo test          # 111 unit + integration tests
+cargo test          # 117 unit + integration tests
 cargo clippy --all-targets   # lint-clean
 ```
 
@@ -141,11 +144,14 @@ Heavier stress/chaos harnesses live in [`scripts/`](scripts/) (multi-day chaos,
 - **Tamper-evidence**: the hash-chained log detects any mutation
   (`src/distributed_event_log.rs`).
 
-## Design paper
+## Documentation
 
-A full write-up of the architecture, algorithms (causal scoring, failure
-propagation, deterministic paging, hash-chained log, consensus) and the
-audit-driven evaluation is in [`docs/PAPER.md`](docs/PAPER.md).
+- [`docs/PAPER.md`](docs/PAPER.md) — design paper: architecture, algorithms
+  (causal scoring, failure propagation, deterministic paging, hash-chained log,
+  consensus) and the audit-driven evaluation.
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — developer guide: module map,
+  data structures, invariants, control flow, and how to extend the kernel.
+- `cargo doc --open` — rendered API docs (every module has rustdoc).
 
 ## Status & limitations
 
