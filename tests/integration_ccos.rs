@@ -325,7 +325,7 @@ fn phase7_guard_layer_resilience() {
 // ── Phase 8: AST Parser Robustness ────────────────────────────────
 #[test]
 fn phase8_ast_parser_robustness() {
-    let mut parser = ASTParser::new();
+    let parser = ASTParser::new();
 
     // Normal code
     let result = parser.parse_source("test.rs", "mod foo;\nuse std::io;\nfn main() {}");

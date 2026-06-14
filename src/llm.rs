@@ -1,7 +1,7 @@
 use crate::guard::{GuardConfig, GuardLayer};
+use crate::util::sha256_hex as compute_hash;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone)]
 pub struct LlmConfig {
@@ -262,15 +262,6 @@ impl LlmClient {
         }
     }
 
-    pub fn guard_layer(&self) -> &GuardLayer {
-        &self.guard
-    }
-}
-
-fn compute_hash(input: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(input.as_bytes());
-    format!("{:x}", hasher.finalize())
 }
 
 #[cfg(test)]

@@ -143,10 +143,6 @@ impl DistributedEventLog {
         self.events.is_empty()
     }
 
-    pub fn last_hash(&self) -> Option<String> {
-        self.hash_chain.last().map(|l| l.hash.clone())
-    }
-
     fn compute_link_hash(id: u64, payload: &str, timestamp: u64, previous_hash: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(id.to_le_bytes());

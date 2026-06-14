@@ -1,13 +1,11 @@
 use crate::memory::{EdgeType, MemoryGraph, NodeId, NodeType};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventLog {
     pub session_id: String,
     pub events: Vec<TraceEvent>,
-    pub snapshot_index: HashMap<u64, usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,6 +31,7 @@ pub enum EventType {
     ReplayStart,
     ReplayEnd,
     Snapshot,
+    AgentAction,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,7 +119,6 @@ impl EventLog {
         Self {
             session_id,
             events: Vec::new(),
-            snapshot_index: HashMap::new(),
         }
     }
 
@@ -136,12 +134,6 @@ impl EventLog {
         };
         self.events.push(event);
         id
-    }
-
-    pub fn take_snapshot(&mut self) -> usize {
-        let idx = self.events.len();
-        self.snapshot_index.insert(self.events.len() as u64, idx);
-        idx
     }
 
     pub fn replay_events(
@@ -171,17 +163,12 @@ impl EventLog {
             .collect()
     }
 
-    pub fn last_event(&self) -> Option<&TraceEvent> {
-        self.events.last()
-    }
-
     pub fn is_empty(&self) -> bool {
         self.events.is_empty()
     }
 
     pub fn clear(&mut self) {
         self.events.clear();
-        self.snapshot_index.clear();
     }
 
     pub fn to_json(&self) -> String {

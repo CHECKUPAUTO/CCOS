@@ -1,7 +1,7 @@
 use crate::memory::{MemoryGraph, NodeId};
 use crate::parser::{ASTParser, ParseResult};
+use crate::util::sha256_hex as compute_hash;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -207,12 +207,6 @@ impl IncrementalGraphEngine {
             .unwrap_or_default()
             .as_secs()
     }
-}
-
-fn compute_hash(source: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(source.as_bytes());
-    format!("{:x}", hasher.finalize())
 }
 
 impl Default for IncrementalGraphEngine {

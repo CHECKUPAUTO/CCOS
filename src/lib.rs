@@ -47,3 +47,11 @@ pub mod llm;
 pub mod memory;
 pub mod parser;
 pub mod persist;
+pub mod util;
+
+// ── CCOS v0.3 — Autonomous Context Runtime ──────────────────────────
+pub mod agents;
+pub mod benchmark;
+pub mod persistence;
+pub mod scheduler;
+pub mod workspace;
