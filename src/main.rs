@@ -578,6 +578,8 @@ struct AnalyzeOpts {
     cycles: bool,
     out: Option<String>,
     dot: Option<String>,
+    max_nodes: usize,
+    budget: usize,
 }
 
 impl AnalyzeOpts {
@@ -588,6 +590,8 @@ impl AnalyzeOpts {
             cycles: false,
             out: None,
             dot: None,
+            max_nodes: 5000,
+            budget: 2048,
         };
         let mut i = 0;
         while i < args.len() {
@@ -601,6 +605,18 @@ impl AnalyzeOpts {
                 "--dot" => {
                     i += 1;
                     opts.dot = args.get(i).cloned();
+                }
+                "--max-nodes" => {
+                    i += 1;
+                    if let Some(n) = args.get(i).and_then(|v| v.parse().ok()) {
+                        opts.max_nodes = n;
+                    }
+                }
+                "--budget" => {
+                    i += 1;
+                    if let Some(n) = args.get(i).and_then(|v| v.parse().ok()) {
+                        opts.budget = n;
+                    }
                 }
                 s if !s.starts_with("--") => opts.path = s.to_string(),
                 other => eprintln!("ccos: ignoring unknown flag '{other}'"),
@@ -641,7 +657,7 @@ fn run_analyze(opts: &AnalyzeOpts) -> i32 {
         return 1;
     }
 
-    let mut graph = MemoryGraph::new(0.2, 5000);
+    let mut graph = MemoryGraph::new(0.2, opts.max_nodes);
     let mut engine = IncrementalGraphEngine::new();
     let mut event_log = EventLog::new(Uuid::new_v4().to_string());
     let mut dist_log = DistributedEventLog::new();
@@ -752,9 +768,10 @@ fn run_analyze(opts: &AnalyzeOpts) -> i32 {
             println!("    {:<46} {:.4}", truncate(&id.0, 46), score);
         }
 
-        let context = graph.select_context_window(2048);
+        let context = graph.select_context_window(opts.budget);
         println!(
-            "\n─── Context window (2048 tokens → {} nodes) ───",
+            "\n─── Context window ({} tokens → {} nodes) ───",
+            opts.budget,
             context.len()
         );
         for node in context.iter().take(10) {
@@ -1160,6 +1177,8 @@ COMMANDS:\n\
         --cycles               Detect and list dependency cycles\n\
         --dot <file>           Export the causal graph as Graphviz DOT\n\
         --out <file>           Save a full kernel snapshot (graph + logs) to <file>\n\
+        --max-nodes <N>        Paging cap (default 5000)\n\
+        --budget <N>           Context-window token budget (default 2048)\n\
     verify <snapshot.json>     Re-check a saved snapshot's hash chain & integrity\n\
     replay <snapshot.json>     Deterministically replay a saved event log\n\
     diff <a.json> <b.json>     Structural diff between two snapshots (+ score drift)\n\
