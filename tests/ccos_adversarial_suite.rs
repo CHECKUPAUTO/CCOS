@@ -5,14 +5,26 @@ fn make_guard() -> GuardLayer {
     GuardLayer::new(GuardConfig::default())
 }
 
+/// The guard's core safety guarantee: whatever it emits is always parseable
+/// JSON (either validated input or the deterministic fallback).
+fn is_valid_json(s: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(s).is_ok()
+}
+
 #[test]
 fn adversarial_json_corruption_does_not_crash() {
+    let guard = make_guard();
     let mut engine = AdversarialEngine::with_corruption_rate(AdversarialMode::JsonCorruption, 1.0);
     for _ in 0..100 {
         let corrupted = engine.corrupt("{\"valid\": true, \"key\": \"value\"}");
-        // Must not panic
-        assert!(!corrupted.is_empty() || corrupted.is_empty(),
-            "system must handle any corruption output without panic");
+        // However the input is mangled, the guard must yield a valid-JSON,
+        // non-empty result without panicking.
+        let result = guard.validate_and_sanitize(&corrupted);
+        assert!(
+            is_valid_json(&result.sanitized_output),
+            "guard output must always be valid JSON, got: {}",
+            &result.sanitized_output[..result.sanitized_output.len().min(80)]
+        );
     }
 }
 
@@ -25,14 +37,17 @@ fn prompt_injection_is_neutralized_by_guard() {
         let corrupted = engine.corrupt("RUN TASK: parse dependencies");
         let guard_result = guard.validate_and_sanitize(&corrupted);
 
-        // Guard must catch corrupted prompt injection output
-        // (it won't be valid JSON so guard should block it)
+        // Injected prompts are plain text, never valid JSON, so the guard must
+        // block them and fall back to a safe, valid-JSON response.
         if !corrupted.is_empty() {
-            // The corrupted output contains injection markers — must not pass
             assert!(
-                !guard_result.passed || guard_result.passed,
-                "Guard must process all outputs. sanitized: {}",
-                &guard_result.sanitized_output[..guard_result.sanitized_output.len().min(80)]
+                !guard_result.passed,
+                "prompt injection must be blocked, but guard passed: {}",
+                &corrupted[..corrupted.len().min(80)]
+            );
+            assert!(
+                is_valid_json(&guard_result.sanitized_output),
+                "blocked output must still be valid-JSON fallback"
             );
         }
     }
@@ -47,12 +62,19 @@ fn hallucination_output_is_sanitized() {
         let corrupted = engine.corrupt("{\"status\": \"ok\"}");
         let guard_result = guard.validate_and_sanitize(&corrupted);
 
-        // Hallucinated content appended to valid JSON makes it invalid
-        // Guard should either block it or sanitize it properly
+        // Hallucinated content appended to valid JSON makes the whole payload
+        // invalid, so the guard must reject it; either way its emitted output
+        // is always valid JSON.
+        if corrupted != "{\"status\": \"ok\"}" {
+            assert!(
+                !guard_result.passed,
+                "hallucinated (valid-prefix + trailing text) output must be blocked: {}",
+                &corrupted[..corrupted.len().min(100)]
+            );
+        }
         assert!(
-            guard_result.passed || !guard_result.passed,
-            "Guard must handle hallucinated output: {}",
-            &corrupted[..corrupted.len().min(100)]
+            is_valid_json(&guard_result.sanitized_output),
+            "guard output must always be valid JSON"
         );
     }
 }

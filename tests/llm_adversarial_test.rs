@@ -163,8 +163,12 @@ fn adversarial_deep_nesting_handled() {
     }
 
     let result = guard.validate_and_sanitize(&deep);
-    // May pass or fail depending on implementation, but must not panic
-    assert!(result.passed || !result.passed, "deep nesting must not panic");
+    // Whether or not it passes, the guard must terminate without panicking and
+    // emit valid JSON (the nested payload or the fallback).
+    assert!(
+        serde_json::from_str::<Value>(&result.sanitized_output).is_ok(),
+        "guard output must always be valid JSON"
+    );
 }
 
 // ── Test 8: Unicode homoglyph attacks ─────────────────────────
@@ -183,8 +187,10 @@ fn adversarial_unicode_homoglyphs() {
 // ── Test 9: Very large input ──────────────────────────────────
 #[test]
 fn adversarial_large_input_truncated() {
-    let mut guard_config = GuardConfig::default();
-    guard_config.max_output_length = 1024;
+    let guard_config = GuardConfig {
+        max_output_length: 1024,
+        ..GuardConfig::default()
+    };
     let guard = GuardLayer::new(guard_config);
 
     let large = "x".repeat(100_000);
@@ -215,7 +221,7 @@ fn adversarial_fallback_always_valid() {
 fn adversarial_bom_prefix_handled() {
     let guard = make_guard();
 
-    let with_bom = format!("\u{FEFF}{{}}\"key\": \"value\"}}");
+    let with_bom = "\u{FEFF}{}\"key\": \"value\"}".to_string();
     let result = guard.validate_and_sanitize(&with_bom);
     // BOM + invalid JSON should still be handled (rejected or sanitized)
     assert!(!result.passed, "BOM-prefixed garbage must be rejected");

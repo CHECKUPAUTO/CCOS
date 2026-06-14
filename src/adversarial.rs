@@ -97,14 +97,6 @@ impl AdversarialEngine {
         }
     }
 
-    pub fn corrupt_batch(&mut self, inputs: &[&str]) -> Vec<String> {
-        inputs.iter().map(|i| self.corrupt(i)).collect()
-    }
-
-    pub fn reset_counter(&mut self) {
-        self.counter = 0;
-    }
-
     pub fn set_mode(&mut self, mode: AdversarialMode) {
         self.mode = mode;
     }

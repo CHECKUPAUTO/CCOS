@@ -1,7 +1,7 @@
 use crate::memory::{EdgeType, MemoryGraph, NodeId, NodeType};
+use crate::util::sha256_hex;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParseResult {
@@ -52,21 +52,15 @@ pub enum SymbolKind {
 }
 
 #[derive(Debug, Clone)]
-pub struct ASTParser {
-    file_hashes: HashMap<String, String>,
-}
+pub struct ASTParser;
 
 impl ASTParser {
     pub fn new() -> Self {
-        Self {
-            file_hashes: HashMap::new(),
-        }
+        Self
     }
 
-    pub fn parse_source(&mut self, file_path: &str, source_code: &str) -> ParseResult {
+    pub fn parse_source(&self, file_path: &str, source_code: &str) -> ParseResult {
         let hash = Self::compute_hash(source_code);
-        self.file_hashes
-            .insert(file_path.to_string(), hash.clone());
 
         let modules = Self::extract_modules(source_code);
         let use_statements = Self::extract_uses(source_code);
@@ -178,21 +172,7 @@ impl ASTParser {
     }
 
     fn compute_hash(source: &str) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(source.as_bytes());
-        format!("{:x}", hasher.finalize())
-    }
-
-    pub fn get_file_hash(&self, file_path: &str) -> Option<&String> {
-        self.file_hashes.get(file_path)
-    }
-
-    pub fn is_file_changed(&self, file_path: &str, new_source: &str) -> bool {
-        let new_hash = Self::compute_hash(new_source);
-        match self.get_file_hash(file_path) {
-            Some(old_hash) => old_hash != &new_hash,
-            None => true,
-        }
+        sha256_hex(source)
     }
 
     fn extract_modules(source: &str) -> Vec<ModuleDecl> {
@@ -297,7 +277,7 @@ impl ASTParser {
                     .strip_prefix("fn ")
                     .and_then(|rest| {
                         let name = rest
-                            .split(|c: char| c == '(' || c == '<' || c == '{' || c == ';')
+                            .split(['(', '<', '{', ';'])
                             .next()
                             .unwrap_or("")
                             .trim()
@@ -313,7 +293,7 @@ impl ASTParser {
                     .strip_prefix("pub fn ")
                     .and_then(|rest| {
                         let name = rest
-                            .split(|c: char| c == '(' || c == '<' || c == '{' || c == ';')
+                            .split(['(', '<', '{', ';'])
                             .next()
                             .unwrap_or("")
                             .trim()
@@ -329,7 +309,7 @@ impl ASTParser {
                     .strip_prefix("struct ")
                     .and_then(|rest| {
                         let name = rest
-                            .split(|c: char| c == '<' || c == '{' || c == '(' || c == ';')
+                            .split(['<', '{', '(', ';'])
                             .next()
                             .unwrap_or("")
                             .trim()
@@ -345,7 +325,7 @@ impl ASTParser {
                     .strip_prefix("pub struct ")
                     .and_then(|rest| {
                         let name = rest
-                            .split(|c: char| c == '<' || c == '{' || c == '(' || c == ';')
+                            .split(['<', '{', '(', ';'])
                             .next()
                             .unwrap_or("")
                             .trim()
@@ -361,7 +341,7 @@ impl ASTParser {
                     .strip_prefix("enum ")
                     .and_then(|rest| {
                         let name = rest
-                            .split(|c: char| c == '<' || c == '{' || c == ';')
+                            .split(['<', '{', ';'])
                             .next()
                             .unwrap_or("")
                             .trim()
@@ -377,7 +357,7 @@ impl ASTParser {
                     .strip_prefix("pub enum ")
                     .and_then(|rest| {
                         let name = rest
-                            .split(|c: char| c == '<' || c == '{' || c == ';')
+                            .split(['<', '{', ';'])
                             .next()
                             .unwrap_or("")
                             .trim()
@@ -391,7 +371,7 @@ impl ASTParser {
             } else if stripped.starts_with("trait ") {
                 stripped.strip_prefix("trait ").and_then(|rest| {
                     let name = rest
-                        .split(|c: char| c == '<' || c == '{' || c == ';')
+                        .split(['<', '{', ';'])
                         .next()
                         .unwrap_or("")
                         .trim()
@@ -405,7 +385,7 @@ impl ASTParser {
             } else if stripped.starts_with("pub trait ") {
                 stripped.strip_prefix("pub trait ").and_then(|rest| {
                     let name = rest
-                        .split(|c: char| c == '<' || c == '{' || c == ';')
+                        .split(['<', '{', ';'])
                         .next()
                         .unwrap_or("")
                         .trim()
@@ -419,7 +399,7 @@ impl ASTParser {
             } else if stripped.starts_with("impl ") {
                 stripped.strip_prefix("impl ").and_then(|rest| {
                     let name = rest
-                        .split(|c: char| c == '<' || c == '{' || c == ' ' || c == ';')
+                        .split(['<', '{', ' ', ';'])
                         .next()
                         .unwrap_or("")
                         .trim()
@@ -433,7 +413,7 @@ impl ASTParser {
             } else if stripped.starts_with("const ") {
                 stripped.strip_prefix("const ").and_then(|rest| {
                     let name = rest
-                        .split(|c: char| c == ':' || c == '=' || c == ';')
+                        .split([':', '=', ';'])
                         .next()
                         .unwrap_or("")
                         .trim()
@@ -447,7 +427,7 @@ impl ASTParser {
             } else if stripped.starts_with("pub const ") {
                 stripped.strip_prefix("pub const ").and_then(|rest| {
                     let name = rest
-                        .split(|c: char| c == ':' || c == '=' || c == ';')
+                        .split([':', '=', ';'])
                         .next()
                         .unwrap_or("")
                         .trim()
@@ -461,7 +441,7 @@ impl ASTParser {
             } else if stripped.starts_with("static ") {
                 stripped.strip_prefix("static ").and_then(|rest| {
                     let name = rest
-                        .split(|c: char| c == ':' || c == '=' || c == ';')
+                        .split([':', '=', ';'])
                         .next()
                         .unwrap_or("")
                         .trim()
@@ -475,7 +455,7 @@ impl ASTParser {
             } else if stripped.starts_with("type ") {
                 stripped.strip_prefix("type ").and_then(|rest| {
                     let name = rest
-                        .split(|c: char| c == '=' || c == ';' || c == '<')
+                        .split(['=', ';', '<'])
                         .next()
                         .unwrap_or("")
                         .trim()
@@ -490,7 +470,7 @@ impl ASTParser {
                 stripped.strip_prefix("macro_rules!").and_then(|rest| {
                     let name = rest
                         .trim()
-                        .split(|c: char| c == '{' || c == '(' || c == ' ')
+                        .split(['{', '(', ' '])
                         .next()
                         .unwrap_or("")
                         .trim()
@@ -600,7 +580,7 @@ mod tests {
     #[test]
     fn test_graph_update_from_parse() {
         let source = "mod foo;\nuse std::io;\nfn main() {}";
-        let mut parser = ASTParser::new();
+        let parser = ASTParser::new();
         let result = parser.parse_source("test.rs", source);
         let mut graph = MemoryGraph::default();
         parser.update_memory_graph(&result, &mut graph);
