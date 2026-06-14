@@ -290,4 +290,17 @@ fn snapshot_event_log_coherence() {
     // Verify snapshot data matches reality
     assert_eq!(graph.node_count(), 2);
     assert_eq!(event_log.event_count(), 3);
+
+    // Event-log hashing is deterministic for a fixed log and survives a
+    // serialize -> deserialize round-trip unchanged.
+    let h1 = event_log_hash(&event_log);
+    let h2 = event_log_hash(&event_log);
+    assert_eq!(h1, h2, "event log hash must be deterministic");
+
+    let restored = EventLog::from_json(&event_log.to_json()).expect("round-trip");
+    assert_eq!(
+        event_log_hash(&restored),
+        h1,
+        "event log hash must survive serialization round-trip"
+    );
 }

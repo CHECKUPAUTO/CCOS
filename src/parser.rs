@@ -297,7 +297,7 @@ impl ASTParser {
                     .strip_prefix("fn ")
                     .and_then(|rest| {
                         let name = rest
-                            .split(|c: char| c == '(' || c == '<' || c == '{' || c == ';')
+                            .split(['(', '<', '{', ';'])
                             .next()
                             .unwrap_or("")
                             .trim()
@@ -313,7 +313,7 @@ impl ASTParser {
                     .strip_prefix("pub fn ")
                     .and_then(|rest| {
                         let name = rest
-                            .split(|c: char| c == '(' || c == '<' || c == '{' || c == ';')
+                            .split(['(', '<', '{', ';'])
                             .next()
                             .unwrap_or("")
                             .trim()
@@ -329,7 +329,7 @@ impl ASTParser {
                     .strip_prefix("struct ")
                     .and_then(|rest| {
                         let name = rest
-                            .split(|c: char| c == '<' || c == '{' || c == '(' || c == ';')
+                            .split(['<', '{', '(', ';'])
                             .next()
                             .unwrap_or("")
                             .trim()
@@ -345,7 +345,7 @@ impl ASTParser {
                     .strip_prefix("pub struct ")
                     .and_then(|rest| {
                         let name = rest
-                            .split(|c: char| c == '<' || c == '{' || c == '(' || c == ';')
+                            .split(['<', '{', '(', ';'])
                             .next()
                             .unwrap_or("")
                             .trim()
@@ -361,7 +361,7 @@ impl ASTParser {
                     .strip_prefix("enum ")
                     .and_then(|rest| {
                         let name = rest
-                            .split(|c: char| c == '<' || c == '{' || c == ';')
+                            .split(['<', '{', ';'])
                             .next()
                             .unwrap_or("")
                             .trim()
@@ -377,7 +377,7 @@ impl ASTParser {
                     .strip_prefix("pub enum ")
                     .and_then(|rest| {
                         let name = rest
-                            .split(|c: char| c == '<' || c == '{' || c == ';')
+                            .split(['<', '{', ';'])
                             .next()
                             .unwrap_or("")
                             .trim()
@@ -391,7 +391,7 @@ impl ASTParser {
             } else if stripped.starts_with("trait ") {
                 stripped.strip_prefix("trait ").and_then(|rest| {
                     let name = rest
-                        .split(|c: char| c == '<' || c == '{' || c == ';')
+                        .split(['<', '{', ';'])
                         .next()
                         .unwrap_or("")
                         .trim()
@@ -405,7 +405,7 @@ impl ASTParser {
             } else if stripped.starts_with("pub trait ") {
                 stripped.strip_prefix("pub trait ").and_then(|rest| {
                     let name = rest
-                        .split(|c: char| c == '<' || c == '{' || c == ';')
+                        .split(['<', '{', ';'])
                         .next()
                         .unwrap_or("")
                         .trim()
@@ -419,7 +419,7 @@ impl ASTParser {
             } else if stripped.starts_with("impl ") {
                 stripped.strip_prefix("impl ").and_then(|rest| {
                     let name = rest
-                        .split(|c: char| c == '<' || c == '{' || c == ' ' || c == ';')
+                        .split(['<', '{', ' ', ';'])
                         .next()
                         .unwrap_or("")
                         .trim()
@@ -433,7 +433,7 @@ impl ASTParser {
             } else if stripped.starts_with("const ") {
                 stripped.strip_prefix("const ").and_then(|rest| {
                     let name = rest
-                        .split(|c: char| c == ':' || c == '=' || c == ';')
+                        .split([':', '=', ';'])
                         .next()
                         .unwrap_or("")
                         .trim()
@@ -447,7 +447,7 @@ impl ASTParser {
             } else if stripped.starts_with("pub const ") {
                 stripped.strip_prefix("pub const ").and_then(|rest| {
                     let name = rest
-                        .split(|c: char| c == ':' || c == '=' || c == ';')
+                        .split([':', '=', ';'])
                         .next()
                         .unwrap_or("")
                         .trim()
@@ -461,7 +461,7 @@ impl ASTParser {
             } else if stripped.starts_with("static ") {
                 stripped.strip_prefix("static ").and_then(|rest| {
                     let name = rest
-                        .split(|c: char| c == ':' || c == '=' || c == ';')
+                        .split([':', '=', ';'])
                         .next()
                         .unwrap_or("")
                         .trim()
@@ -475,7 +475,7 @@ impl ASTParser {
             } else if stripped.starts_with("type ") {
                 stripped.strip_prefix("type ").and_then(|rest| {
                     let name = rest
-                        .split(|c: char| c == '=' || c == ';' || c == '<')
+                        .split(['=', ';', '<'])
                         .next()
                         .unwrap_or("")
                         .trim()
@@ -490,7 +490,7 @@ impl ASTParser {
                 stripped.strip_prefix("macro_rules!").and_then(|rest| {
                     let name = rest
                         .trim()
-                        .split(|c: char| c == '{' || c == '(' || c == ' ')
+                        .split(['{', '(', ' '])
                         .next()
                         .unwrap_or("")
                         .trim()

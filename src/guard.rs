@@ -118,29 +118,16 @@ impl GuardLayer {
     }
 
     fn is_valid_json(input: &str) -> bool {
-        if input.trim().is_empty() {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
             return false;
         }
-        // Try parsing as a JSON value; also accept JSON objects/arrays.
-        match serde_json::from_str::<Value>(input.trim()) {
-            Ok(_) => true,
-            Err(e) => {
-                // Accept incomplete JSON if it starts with { or [
-                let trimmed = input.trim();
-                if trimmed.starts_with('{') || trimmed.starts_with('[') {
-                    // Try to find a valid prefix
-                    if let Some(idx) = (0..trimmed.len()).rev().find(|&i| {
-                        let prefix = &trimmed[..=i];
-                        serde_json::from_str::<Value>(prefix).is_ok()
-                    }) {
-                        return serde_json::from_str::<Value>(&trimmed[..=idx]).is_ok();
-                    }
-                }
-                // Log the error for debugging
-                let _ = e;
-                false
-            }
-        }
+        // The entire payload must parse as a single JSON value. A previous
+        // version accepted any valid *prefix* (e.g. `{"ok":1} <injected text>`),
+        // which let trailing hallucinated or prompt-injected content slip past
+        // the guard. Requiring whole-string validity closes that hole and is
+        // also O(n) instead of the old O(n^2) prefix scan.
+        serde_json::from_str::<Value>(trimmed).is_ok()
     }
 
     fn compute_reliability_score(&self, output: &str, is_json: bool) -> f64 {

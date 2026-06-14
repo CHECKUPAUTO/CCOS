@@ -53,8 +53,10 @@ impl IncrementalGraphEngine {
         let hash = compute_hash(source_code);
         let parse_result = self.parser.parse_source(file_path, source_code);
 
-        // Remove old version of this file from graph (will be handled by apply_file_to_graph)
-        // Just update state tracking
+        // This only records file-level state (hashes, counts); applying the
+        // parse result to the graph is the caller's responsibility (see
+        // `ASTParser::update_memory_graph`). Use `process_delta` for the
+        // combined parse + incremental graph update.
         self.file_states.insert(
             file_path.to_string(),
             FileState {
@@ -81,15 +83,10 @@ impl IncrementalGraphEngine {
         let timestamp = Self::now();
 
         // Determine operation type
-        let op = if old_source.is_none() {
-            MutationOp::FileAdded
-        } else {
-            let old_hash = compute_hash(old_source.unwrap());
-            if old_hash == new_hash {
-                MutationOp::NoChange
-            } else {
-                MutationOp::FileModified
-            }
+        let op = match old_source {
+            None => MutationOp::FileAdded,
+            Some(old) if compute_hash(old) == new_hash => MutationOp::NoChange,
+            Some(_) => MutationOp::FileModified,
         };
 
         let nodes_before = graph.node_count();

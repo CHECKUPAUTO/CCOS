@@ -5,13 +5,39 @@ use ccos::llm::{LlmClient, LlmConfig};
 use ccos::memory::{MemoryGraph, NodeId};
 use ccos::parser::ASTParser;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 #[tokio::main]
 async fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let command = args.get(1).map(String::as_str).unwrap_or("demo");
+
+    match command {
+        "-h" | "--help" | "help" => print_help(),
+        "-V" | "--version" | "version" => {
+            println!("ccos {}", env!("CARGO_PKG_VERSION"));
+        }
+        "demo" => run_demo().await,
+        "analyze" => {
+            let path = args.get(2).map(String::as_str).unwrap_or(".");
+            std::process::exit(run_analyze(path));
+        }
+        other => {
+            eprintln!("ccos: unknown command '{other}'\n");
+            print_help();
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Built-in end-to-end demonstration of every kernel subsystem on a small
+/// synthetic workspace (parsing, LLM + guard, incremental delta, failure
+/// propagation, context selection, deterministic replay, paging).
+async fn run_demo() {
     println!("╔══════════════════════════════════════════════╗");
     println!("║  CCOS — Causal Context Operating System     ║");
-    println!("║  Kernel v0.1.0 | Rust 2021 | Debian 12     ║");
+    println!("║  Kernel v{} | Rust 2021                   ║", env!("CARGO_PKG_VERSION"));
     println!("╚══════════════════════════════════════════════╝\n");
 
     // ── Initialization ─────────────────────────────────────────────
@@ -491,8 +517,148 @@ pub async fn handle_request(state: &AppState, path: &str, body: &str) -> Result<
     println!("║  Guard Status: {:<30}║", guard_status);
     println!("╚══════════════════════════════════════════════╝");
 
-    // ── Deterministic exit ────────────────────────────────────────
-    std::process::exit(0);
+}
+
+/// `ccos analyze <path>` — ingest every `.rs` file under `path` into the
+/// causal memory graph and print a structural report. Returns a process exit
+/// code (0 on success, non-zero on failure).
+fn run_analyze(path: &str) -> i32 {
+    let root = Path::new(path);
+    if !root.exists() {
+        eprintln!("ccos: path '{path}' does not exist");
+        return 1;
+    }
+
+    println!("╔══════════════════════════════════════════════╗");
+    println!("║  CCOS analyze — {:<29}║", truncate(path, 29));
+    println!("╚══════════════════════════════════════════════╝\n");
+
+    let mut files: Vec<PathBuf> = Vec::new();
+    if root.is_dir() {
+        collect_rs_files(root, &mut files);
+    } else if root.extension().and_then(|e| e.to_str()) == Some("rs") {
+        files.push(root.to_path_buf());
+    }
+    files.sort();
+
+    if files.is_empty() {
+        eprintln!("ccos: no .rs files found under '{path}'");
+        return 1;
+    }
+
+    let mut graph = MemoryGraph::new(0.2, 5000);
+    let mut engine = IncrementalGraphEngine::new();
+    let mut event_log = EventLog::new(Uuid::new_v4().to_string());
+
+    let mut read_errors = 0usize;
+    for file in &files {
+        let source = match std::fs::read_to_string(file) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("  [SKIP] {}: {}", file.display(), e);
+                read_errors += 1;
+                continue;
+            }
+        };
+        let path_str = file.to_string_lossy().to_string();
+        let delta = engine.process_delta(&path_str, None, &source, &mut graph);
+        event_log.append(
+            EventType::Parsing,
+            EventPayload::Parsing {
+                file_path: path_str.clone(),
+                file_hash: compute_file_hash(&source),
+                modules_found: 0,
+                uses_found: 0,
+                symbols_found: 0,
+            },
+        );
+        println!(
+            "  [PARSE] {:<40} Δnodes:+{:<4} Δedges:+{}",
+            truncate(&path_str, 40),
+            delta.nodes_added,
+            delta.edges_added
+        );
+    }
+
+    // Integrity: the graph must never hold edges to evicted/absent nodes.
+    let dangling = graph.prune_dangling_edges();
+
+    println!("\n─── Graph Summary ───");
+    println!("  Files ingested:  {}", files.len() - read_errors);
+    println!("  Graph nodes:     {}", graph.node_count());
+    println!("  Graph edges:     {}", graph.edge_count());
+    println!("  Mutations:       {}", engine.total_mutations());
+    println!("  Events logged:   {}", event_log.event_count());
+    println!("  Dangling edges:  {dangling} (must be 0)");
+
+    println!("\n─── Top 10 nodes by causal score ───");
+    for (id, score) in graph.get_node_scores().iter().take(10) {
+        println!("    {:<46} {:.4}", truncate(&id.0, 46), score);
+    }
+
+    let context = graph.select_context_window(2048);
+    println!(
+        "\n─── Context window (2048 tokens → {} nodes) ───",
+        context.len()
+    );
+    for node in context.iter().take(10) {
+        println!(
+            "    {:<40} ({:?})",
+            truncate(&node.label, 40),
+            node.node_type
+        );
+    }
+
+    if dangling != 0 {
+        return 1;
+    }
+    0
+}
+
+/// Recursively collect `.rs` files, skipping `target/`, VCS and hidden dirs.
+fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if path.is_dir() {
+            if name == "target" || name == ".git" || name.starts_with('.') {
+                continue;
+            }
+            collect_rs_files(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+            out.push(path);
+        }
+    }
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("…{}", &s[s.len().saturating_sub(max - 1)..])
+    }
+}
+
+fn print_help() {
+    println!(
+        "CCOS — Causal Context Operating System (v{})\n\n\
+USAGE:\n\
+    ccos [COMMAND]\n\n\
+COMMANDS:\n\
+    demo             Run the built-in end-to-end kernel demo (default)\n\
+    analyze <path>   Ingest all .rs files under <path> and print a graph report\n\
+    help, --help     Show this help\n\
+    version          Show the version\n\n\
+ENVIRONMENT (demo only):\n\
+    OLLAMA_ENDPOINT  LLM endpoint (default http://localhost:11434)\n\
+    OLLAMA_MODEL     Model name (default codellama)\n",
+        env!("CARGO_PKG_VERSION")
+    );
 }
 
 fn compute_file_hash(content: &str) -> String {

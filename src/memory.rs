@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BinaryHeap, HashMap};
 use std::cmp::Ordering;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeId(pub String);
 
 impl From<&str> for NodeId {
@@ -128,21 +128,31 @@ impl MemoryGraph {
         self.enforce_paging();
     }
 
-    pub fn add_edge(&mut self, source: NodeId, target: NodeId, weight: f64, edge_type: EdgeType) {
+    pub fn add_edge(&mut self, source: NodeId, target: NodeId, weight: f64, edge_type: EdgeType) -> bool {
+        // Refuse to create dangling edges: both endpoints must already exist as
+        // nodes. This preserves the invariant `edges ⊆ nodes × nodes`, which
+        // bounds the edge set and keeps the graph consistent when paging evicts
+        // a node mid-construction (otherwise edges to evicted nodes accumulate
+        // forever and are never reclaimed by `retain`).
+        if !self.nodes.contains_key(&source) || !self.nodes.contains_key(&target) {
+            return false;
+        }
         let now = self.clock;
         // Avoid duplicate edges
         let already_exists = self.edges.iter().any(|e| {
             e.source == source && e.target == target && e.edge_type == edge_type
         });
-        if !already_exists {
-            self.edges.push(GraphEdge {
-                source,
-                target,
-                weight,
-                edge_type,
-                created_at: now,
-            });
+        if already_exists {
+            return false;
         }
+        self.edges.push(GraphEdge {
+            source,
+            target,
+            weight,
+            edge_type,
+            created_at: now,
+        });
+        true
     }
 
     pub fn remove_node(&mut self, id: &NodeId) {
@@ -162,7 +172,7 @@ impl MemoryGraph {
         let base = node.base_importance * 0.15;
         let failure = node.failure_relevance * 0.50;
         let recency = node.recency * 0.30;
-        let access = (node.access_count as f64).ln() * 0.05;
+        let access = (node.access_count.max(1) as f64).ln() * 0.05;
         (base + failure + recency + access).clamp(0.0, 1.0)
     }
 
@@ -182,12 +192,17 @@ impl MemoryGraph {
         impl<'a> Eq for ScoredRef<'a> {}
         impl<'a> PartialOrd for ScoredRef<'a> {
             fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-                self.score.partial_cmp(&other.score)
+                Some(self.cmp(other))
             }
         }
         impl<'a> Ord for ScoredRef<'a> {
             fn cmp(&self, other: &Self) -> Ordering {
-                self.partial_cmp(other).unwrap_or(Ordering::Equal)
+                // Order by score, breaking ties on node id so the heap pops a
+                // deterministic node when scores are equal.
+                self.score
+                    .partial_cmp(&other.score)
+                    .unwrap_or(Ordering::Equal)
+                    .then_with(|| self.node.id.cmp(&other.node.id))
             }
         }
 
@@ -217,7 +232,14 @@ impl MemoryGraph {
                 .iter()
                 .map(|(id, node)| (id, self.compute_node_score(node)))
                 .collect();
-            entries.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+            // Deterministic eviction: lowest score first, ties broken by node id
+            // so replay and snapshot hashes are reproducible regardless of the
+            // (randomized) HashMap iteration order.
+            entries.sort_by(|a, b| {
+                a.1.partial_cmp(&b.1)
+                    .unwrap_or(Ordering::Equal)
+                    .then_with(|| a.0.cmp(b.0))
+            });
             let remove_count = self.nodes.len() - self.max_in_memory_nodes;
             entries
                 .iter()
@@ -229,6 +251,20 @@ impl MemoryGraph {
             self.nodes.remove(id);
             self.edges.retain(|e| &e.source != id && &e.target != id);
         }
+        // Defensive: guarantee no edge survives pointing at an evicted node.
+        self.prune_dangling_edges();
+    }
+
+    /// Remove any edge whose endpoints are no longer present in the graph and
+    /// return how many were pruned. With `add_edge` rejecting dangling edges
+    /// this is normally a no-op, but it enforces the `edges ⊆ nodes × nodes`
+    /// invariant after bulk or out-of-band mutations.
+    pub fn prune_dangling_edges(&mut self) -> usize {
+        let before = self.edges.len();
+        let nodes = &self.nodes;
+        self.edges
+            .retain(|e| nodes.contains_key(&e.source) && nodes.contains_key(&e.target));
+        before - self.edges.len()
     }
 
     pub fn propagate_failure(&mut self, origin_id: &NodeId, depth: u32, max_depth: u32) {
@@ -276,7 +312,11 @@ impl MemoryGraph {
             .iter()
             .map(|(id, node)| (id.clone(), self.compute_node_score(node)))
             .collect();
-        scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+        scores.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
         scores
     }
 }

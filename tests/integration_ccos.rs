@@ -329,9 +329,9 @@ fn phase8_ast_parser_robustness() {
 
     // Normal code
     let result = parser.parse_source("test.rs", "mod foo;\nuse std::io;\nfn main() {}");
-    assert!(result.modules.len() >= 1);
-    assert!(result.use_statements.len() >= 1);
-    assert!(result.symbols.len() >= 1);
+    assert!(!result.modules.is_empty());
+    assert!(!result.use_statements.is_empty());
+    assert!(!result.symbols.is_empty());
 
     // Empty file
     let result = parser.parse_source("empty.rs", "");
@@ -524,7 +524,7 @@ fn phase13_incremental_no_full_rebuild() {
     let original = "mod mod_5;\nuse dep_5::lib;\nfn func_5() {}";
     let delta = engine.process_delta(
         "file_5.rs",
-        Some(&original),
+        Some(original),
         modified,
         &mut graph,
     );
