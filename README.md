@@ -70,6 +70,8 @@ COMMANDS:
         --out <file>           Save a full kernel snapshot (graph + logs) to <file>
     verify <snapshot.json>     Re-check a saved snapshot's hash chain & integrity
     replay <snapshot.json>     Deterministically replay a saved event log
+    diff <a.json> <b.json>     Structural diff between two snapshots (+ score drift)
+    failure <snap> <node-id>   Inject a fault at a node and propagate it (--depth N)
     chaos [--iters N]          Fuzz the guard with adversarial payloads
     help, --help               Show this help
     version, --version         Show the version
@@ -109,6 +111,19 @@ the other commands consume:
 cargo run -- analyze src --out run.json
 cargo run -- verify run.json     # hash chain valid? dangling edges? → exit 0/1
 cargo run -- replay run.json     # deterministic event-log replay + stats
+```
+
+### `ccos diff` & `ccos failure`
+
+Inspect how a codebase evolves and how faults ripple through it:
+
+```bash
+cargo run -- analyze src   --out a.json
+cargo run -- analyze tests --out b.json
+cargo run -- diff a.json b.json          # nodes/edges added·removed + score movers
+
+# Inject a fault at a node and watch it propagate across causal edges:
+cargo run -- failure a.json file:src/memory.rs --depth 2
 ```
 
 ### `ccos chaos`

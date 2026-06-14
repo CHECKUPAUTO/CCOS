@@ -364,6 +364,36 @@ impl MemoryGraph {
         cycles
     }
 
+    /// Structural difference against another graph (added/removed nodes & edges).
+    pub fn diff(&self, other: &MemoryGraph) -> GraphDiff {
+        use std::collections::HashSet;
+        let a: HashSet<&NodeId> = self.nodes.keys().collect();
+        let b: HashSet<&NodeId> = other.nodes.keys().collect();
+
+        let mut nodes_added: Vec<NodeId> = b.difference(&a).map(|n| (*n).clone()).collect();
+        let mut nodes_removed: Vec<NodeId> = a.difference(&b).map(|n| (*n).clone()).collect();
+        nodes_added.sort();
+        nodes_removed.sort();
+
+        let edge_key = |e: &GraphEdge| {
+            (
+                e.source.0.clone(),
+                e.target.0.clone(),
+                format!("{:?}", e.edge_type),
+            )
+        };
+        let ea: HashSet<_> = self.edges.iter().map(edge_key).collect();
+        let eb: HashSet<_> = other.edges.iter().map(edge_key).collect();
+
+        GraphDiff {
+            nodes_added,
+            nodes_removed,
+            edges_added: eb.difference(&ea).count(),
+            edges_removed: ea.difference(&eb).count(),
+            common_nodes: a.intersection(&b).count(),
+        }
+    }
+
     /// Count nodes by type, sorted by descending frequency (then name).
     pub fn node_type_counts(&self) -> Vec<(String, usize)> {
         let mut counts: HashMap<String, usize> = HashMap::new();
@@ -461,6 +491,16 @@ impl Default for MemoryGraph {
     }
 }
 
+/// Structural difference between two graphs, produced by [`MemoryGraph::diff`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphDiff {
+    pub nodes_added: Vec<NodeId>,
+    pub nodes_removed: Vec<NodeId>,
+    pub edges_added: usize,
+    pub edges_removed: usize,
+    pub common_nodes: usize,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -527,6 +567,28 @@ mod tests {
         let cycles = graph.find_cycles();
         assert!(!cycles.is_empty(), "must detect the a->b->c->a cycle");
         assert!(cycles[0].len() >= 3);
+    }
+
+    #[test]
+    fn test_graph_diff() {
+        let mut a = MemoryGraph::default();
+        for id in ["x", "y", "z"] {
+            a.upsert_node(id.into(), id.into(), "".into(), NodeType::Module);
+        }
+        a.add_edge("x".into(), "y".into(), 1.0, EdgeType::DependsOn);
+
+        let mut b = MemoryGraph::default();
+        for id in ["y", "z", "w"] {
+            b.upsert_node(id.into(), id.into(), "".into(), NodeType::Module);
+        }
+        b.add_edge("y".into(), "z".into(), 1.0, EdgeType::DependsOn);
+
+        let d = a.diff(&b);
+        assert_eq!(d.nodes_added, vec![NodeId("w".into())]);
+        assert_eq!(d.nodes_removed, vec![NodeId("x".into())]);
+        assert_eq!(d.common_nodes, 2); // y, z
+        assert_eq!(d.edges_added, 1); // y->z
+        assert_eq!(d.edges_removed, 1); // x->y
     }
 
     #[test]

@@ -211,9 +211,11 @@ for zero parse-dependencies, at the cost of missing multi-line declarations
 
 ```
 ccos demo                                  end-to-end subsystem demo
-ccos analyze <path> [--json|--cycles|--out FILE]   ingest real .rs files
+ccos analyze <path> [--json|--cycles|--dot FILE|--out FILE]   ingest real .rs files
 ccos verify  <snapshot.json>               re-check hash chain + integrity
-ccos replay  <snapshot.json>               deterministic event-log replay
+ccos replay  <snapshot.json>               deterministic event-log replay + reconstruction
+ccos diff    <a.json> <b.json>             structural diff + causal-score drift
+ccos failure <snapshot.json> <node-id>     inject a fault and propagate it
 ccos chaos   [--iters N]                   fuzz the guard adversarially
 ```
 

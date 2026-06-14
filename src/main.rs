@@ -34,6 +34,8 @@ async fn main() {
         "analyze" => run_analyze(&AnalyzeOpts::parse(rest)),
         "verify" => run_verify(rest.first().map(String::as_str)),
         "replay" => run_replay(rest.first().map(String::as_str)),
+        "diff" => run_diff(rest.first().map(String::as_str), rest.get(1).map(String::as_str)),
+        "failure" => run_failure(&FailureOpts::parse(rest)),
         "chaos" => run_chaos(&ChaosOpts::parse(rest)),
         other => {
             eprintln!("ccos: unknown command '{other}'\n");
@@ -885,6 +887,171 @@ fn run_replay(file: Option<&str>) -> i32 {
     }
 }
 
+/// `ccos diff <a.json> <b.json>` — structural difference between two saved
+/// snapshots: nodes/edges added & removed, plus the biggest causal-score movers.
+fn run_diff(a: Option<&str>, b: Option<&str>) -> i32 {
+    let (Some(a_path), Some(b_path)) = (a, b) else {
+        eprintln!("usage: ccos diff <old-snapshot.json> <new-snapshot.json>");
+        return 2;
+    };
+    let load = |p: &str| KernelSnapshot::load(p).map_err(|e| format!("cannot load '{p}': {e}"));
+    let (snap_a, snap_b) = match (load(a_path), load(b_path)) {
+        (Ok(a), Ok(b)) => (a, b),
+        (Err(e), _) | (_, Err(e)) => {
+            eprintln!("ccos: {e}");
+            return 1;
+        }
+    };
+
+    let d = snap_a.graph.diff(&snap_b.graph);
+
+    println!("╔══════════════════════════════════════════════╗");
+    println!("║  CCOS diff                                   ║");
+    println!("╚══════════════════════════════════════════════╝\n");
+    println!("  {}  →  {}", truncate(a_path, 18), truncate(b_path, 18));
+    println!(
+        "  Nodes:  +{} / -{}  ({} common)",
+        d.nodes_added.len(),
+        d.nodes_removed.len(),
+        d.common_nodes
+    );
+    println!("  Edges:  +{} / -{}", d.edges_added, d.edges_removed);
+
+    if !d.nodes_added.is_empty() {
+        println!("\n  Added nodes:");
+        for id in d.nodes_added.iter().take(10) {
+            println!("    + {}", truncate(&id.0, 50));
+        }
+    }
+    if !d.nodes_removed.is_empty() {
+        println!("\n  Removed nodes:");
+        for id in d.nodes_removed.iter().take(10) {
+            println!("    - {}", truncate(&id.0, 50));
+        }
+    }
+
+    // Causal-score drift among nodes present in both snapshots.
+    let mut movers: Vec<(String, f64)> = Vec::new();
+    for (id, node_b) in &snap_b.graph.nodes {
+        if let Some(node_a) = snap_a.graph.nodes.get(id) {
+            let drift =
+                snap_b.graph.compute_node_score(node_b) - snap_a.graph.compute_node_score(node_a);
+            if drift.abs() > 1e-9 {
+                movers.push((id.0.clone(), drift));
+            }
+        }
+    }
+    movers.sort_by(|x, y| {
+        y.1.abs()
+            .partial_cmp(&x.1.abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| x.0.cmp(&y.0))
+    });
+    if !movers.is_empty() {
+        println!("\n  Top causal-score movers:");
+        for (id, drift) in movers.iter().take(10) {
+            println!("    {:+.4}  {}", drift, truncate(id, 44));
+        }
+    }
+    0
+}
+
+/// Options for `ccos failure`.
+struct FailureOpts {
+    snapshot: Option<String>,
+    node: Option<String>,
+    depth: u32,
+}
+
+impl FailureOpts {
+    fn parse(args: &[String]) -> Self {
+        let (mut snapshot, mut node, mut depth) = (None, None, 3u32);
+        let mut positional = 0;
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--depth" => {
+                    i += 1;
+                    if let Some(n) = args.get(i).and_then(|v| v.parse().ok()) {
+                        depth = n;
+                    }
+                }
+                s if !s.starts_with("--") => {
+                    if positional == 0 {
+                        snapshot = Some(s.to_string());
+                    } else {
+                        node = Some(s.to_string());
+                    }
+                    positional += 1;
+                }
+                other => eprintln!("ccos: ignoring unknown flag '{other}'"),
+            }
+            i += 1;
+        }
+        Self {
+            snapshot,
+            node,
+            depth,
+        }
+    }
+}
+
+/// `ccos failure <snapshot.json> <node-id> [--depth N]` — inject a fault at a
+/// node and propagate it across the causal graph, reporting the affected
+/// neighborhood ranked by resulting failure relevance.
+fn run_failure(opts: &FailureOpts) -> i32 {
+    let (Some(file), Some(node_id)) = (opts.snapshot.as_deref(), opts.node.as_deref()) else {
+        eprintln!("usage: ccos failure <snapshot.json> <node-id> [--depth N]");
+        return 2;
+    };
+    let snapshot = match KernelSnapshot::load(file) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("ccos: cannot load '{file}': {e}");
+            return 1;
+        }
+    };
+    let mut graph = snapshot.graph;
+    let origin = NodeId(node_id.to_string());
+    if !graph.nodes.contains_key(&origin) {
+        eprintln!(
+            "ccos: node '{node_id}' not found ({} nodes). List ids with `ccos analyze <path> --json`.",
+            graph.node_count()
+        );
+        return 1;
+    }
+
+    println!("╔══════════════════════════════════════════════╗");
+    println!("║  CCOS failure propagation                    ║");
+    println!("╚══════════════════════════════════════════════╝\n");
+
+    graph.set_failure_relevance(&origin, 0.95);
+    graph.propagate_failure(&origin, 0, opts.depth);
+
+    let mut affected: Vec<(String, f64)> = graph
+        .nodes
+        .iter()
+        .filter(|(id, n)| **id != origin && n.failure_relevance > 0.0)
+        .map(|(id, n)| (id.0.clone(), n.failure_relevance))
+        .collect();
+    affected.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    println!("  Origin:   {}", truncate(node_id, 40));
+    println!("  Severity: 0.95   depth: {}", opts.depth);
+    println!("  Affected: {} nodes", affected.len());
+    if !affected.is_empty() {
+        println!("\n  Causal neighborhood (by failure relevance):");
+        for (id, fr) in affected.iter().take(15) {
+            println!("    {:.3}  {}", fr, truncate(id, 46));
+        }
+    }
+    0
+}
+
 /// Options for `ccos chaos`.
 struct ChaosOpts {
     iters: usize,
@@ -995,6 +1162,8 @@ COMMANDS:\n\
         --out <file>           Save a full kernel snapshot (graph + logs) to <file>\n\
     verify <snapshot.json>     Re-check a saved snapshot's hash chain & integrity\n\
     replay <snapshot.json>     Deterministically replay a saved event log\n\
+    diff <a.json> <b.json>     Structural diff between two snapshots (+ score drift)\n\
+    failure <snap> <node-id>   Inject a fault at a node and propagate it (--depth N)\n\
     chaos [--iters N]          Fuzz the guard with adversarial payloads\n\
     help, --help               Show this help\n\
     version, --version         Show the version\n\n\
