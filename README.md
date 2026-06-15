@@ -234,10 +234,12 @@ Heavier stress/chaos harnesses live in [`scripts/`](scripts/) (multi-day chaos,
 
 This is a prototype. Known gaps (tracked in [`ROADMAP.md`](ROADMAP.md)):
 
-- The parser is a **line-based heuristic**, not a real Rust AST (no `syn`); it
-  misses multi-line declarations and nested-module bodies. It strips `//` and
-  inline `/* … */` comments, but **multi-line** block comments are not yet
-  tracked across lines. *(top future-work item)*
+- The parser defaults to a **line-based heuristic** (zero dependencies). Build
+  with `--features syn-parser` for a real `syn` AST that resolves nested-module
+  bodies, multi-line signatures, grouped `use` and impl methods; the heuristic
+  stays as the fallback when the feature is off or a file does not parse. The
+  heuristic strips `//` and inline `/* … */` comments but does not track
+  multi-line block comments.
 - Edges capture containment/dependency, **not** call graphs or data flow.
 - The multi-model `consensus` path only does real work against a live
   Ollama-style endpoint; offline runs fall back deterministically.

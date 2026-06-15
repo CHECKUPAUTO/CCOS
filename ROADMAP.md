@@ -69,9 +69,11 @@ Prioritized roadmap from the audit. Effort: S/M/L.
 
 ### P0 — Correctness
 
-1. **`syn`-based AST parser.** (L) The line-based parser misses multi-line
-   signatures, nested-module bodies, grouped `use` and macros. Put it behind a
-   feature flag with the heuristic parser as a zero-dep fallback. *(top item)*
+- ✅ **`syn`-based AST parser** — *done.* Behind the `syn-parser` feature, the
+  parser builds a real Rust AST (nested-module bodies, multi-line signatures,
+  grouped `use`, impl methods), with the zero-dependency line-based heuristic as
+  the fallback (used when the feature is off or a file does not parse as valid
+  Rust). CI lints and tests both paths. See `src/parser.rs::syn_ast`.
 
 ### P1 — Depth
 
@@ -101,6 +103,6 @@ Prioritized roadmap from the audit. Effort: S/M/L.
 
 ### Suggested order
 
-`P0.1 (syn)` → `P1.2 (canonical log)` → `P2.5 (benches)` →
+~~`P0.1 (syn)`~~ ✅ → **`P1.2 (canonical log)`** (next) → `P2.5 (benches)` →
 `P1.3 (semantic edges)` → polish. P2.4 and P3.7 are quick wins
 that can land anytime.

@@ -120,12 +120,14 @@ version = "0.3.0"
 dependencies = [
  "chrono",
  "criterion",
+ "proc-macro2",
  "proptest",
  "rand 0.8.6",
  "reqwest",
  "serde",
  "serde_json",
  "sha2",
+ "syn",
  "tokio",
  "uuid",
 ]
