@@ -5,10 +5,6 @@ on:
     branches: ["**"]
   pull_request:
 
-env:
-  CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-D warnings"
-
 jobs:
   build-test:
     name: build · clippy · test
@@ -16,25 +12,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-
-      - name: Cache cargo registry & target
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      # Rust is pre-installed on ubuntu-latest; use rustup directly so the
+      # workflow needs no third-party actions (which org policy may block).
+      - name: Set up Rust
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup component add clippy
+          rustc --version && cargo --version
 
       - name: Build
         run: cargo build --all-targets --locked
 
       - name: Clippy (deny warnings)
-        run: cargo clippy --all-targets --locked
+        run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Test
         run: cargo test --locked
