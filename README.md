@@ -218,6 +218,9 @@ Heavier stress/chaos harnesses live in [`scripts/`](scripts/) (multi-day chaos,
 - [`docs/PAPER.md`](docs/PAPER.md) — design paper: architecture, algorithms
   (causal scoring, failure propagation, deterministic paging, hash-chained log,
   consensus) and the audit-driven evaluation.
+- [`docs/BIBLIOGRAPHY.md`](docs/BIBLIOGRAPHY.md) — annotated reading list (~60
+  verified papers across 12 themes) mapping the research literature to CCOS's
+  modules.
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — developer guide: module map,
   data structures, invariants, control flow, and how to extend the kernel.
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — local dev setup, the CI jobs, coding

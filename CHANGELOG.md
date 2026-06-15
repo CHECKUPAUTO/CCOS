@@ -21,6 +21,10 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - New docs: [`docs/USAGE.md`](docs/USAGE.md) (full command reference, end-to-end
   walkthrough, troubleshooting FAQ), [`CONTRIBUTING.md`](CONTRIBUTING.md), and
   this changelog.
+- Annotated research **bibliography** ([`docs/BIBLIOGRAPHY.md`](docs/BIBLIOGRAPHY.md))
+  — ~60 web-verified papers across 12 themes, each mapped to a CCOS module
+  (context paging, causal graph, agents, guard/consensus/adversarial, hash-chained
+  log & failure propagation).
 
 ### Changed
 
