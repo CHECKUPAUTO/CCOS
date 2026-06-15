@@ -74,6 +74,11 @@ COMMANDS:
     failure <snap> <node-id>   Inject a fault at a node and propagate it (--depth N)
     chaos [--iters N]          Fuzz the guard with adversarial payloads
 
+  Inspection & export:
+    top <path> [--limit N]     Show the hottest nodes by causal score (--json)
+    blame <snap> <node-id>     Causes (upstream) + blast radius (downstream) (--depth N)
+    export <snap> [--out F]    Export the causal graph as GraphML (default ccos.graphml)
+
   CCOS v0.3 — Autonomous Context Runtime:
     scan <path>                Scan a real workspace and ingest the delta
     agents <path>              Run Coder/Reviewer/Security agents over a workspace
@@ -142,6 +147,29 @@ through the guard and asserts it **never** emits invalid JSON:
 cargo run -- chaos --iters 5000
 ```
 
+### Inspect the causal graph — `top`, `blame`, `export`
+
+Treat the graph like a running system: see what's *hot*, trace cause/impact, and
+export it for external graph tools.
+
+```bash
+# `top` — the hottest nodes by causal score (the working set paged in first):
+cargo run -- top src --limit 15
+cargo run -- top src --json                 # machine-readable
+
+# `blame` — a node's upstream causes and downstream blast radius:
+cargo run -- analyze src --out run.json
+cargo run -- blame run.json file:src/memory.rs --depth 4
+
+# `export` — the causal graph as GraphML (Gephi / yEd / Cytoscape / networkx):
+cargo run -- export run.json --out graph.graphml
+```
+
+`blame` follows the same edge direction as failure propagation: **causes** are
+upstream (`target → source`, what the node rests on) and the **blast radius** is
+downstream (`source → target`, what breaks if the node fails). See
+[`docs/USAGE.md`](docs/USAGE.md) for a full command reference and walkthrough.
+
 ### CCOS v0.3 — Autonomous Context Runtime
 
 v0.3 scans a real workspace, pages its context (HOT/WARM/COLD), runs specialized
@@ -160,7 +188,7 @@ See [`CCOS_v0.3_REPORT.md`](CCOS_v0.3_REPORT.md) for the full v0.3 report.
 ## Testing
 
 ```bash
-cargo test          # 156 unit + integration tests
+cargo test          # 165 unit + integration tests
 cargo clippy --all-targets   # lint-clean
 cargo test -- --ignored      # opt-in: 1,000,000-cycle long-stability run
 ```
@@ -184,11 +212,17 @@ Heavier stress/chaos harnesses live in [`scripts/`](scripts/) (multi-day chaos,
 
 ## Documentation
 
+- [`docs/USAGE.md`](docs/USAGE.md) — **command reference & walkthroughs**: every
+  command with example invocations and output, an end-to-end "analyze a real
+  project" tour, the snapshot/replay workflow, and a troubleshooting FAQ.
 - [`docs/PAPER.md`](docs/PAPER.md) — design paper: architecture, algorithms
   (causal scoring, failure propagation, deterministic paging, hash-chained log,
   consensus) and the audit-driven evaluation.
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — developer guide: module map,
   data structures, invariants, control flow, and how to extend the kernel.
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) — local dev setup, the CI jobs, coding
+  conventions, and how to add a node type / event / CLI command.
+- [`CHANGELOG.md`](CHANGELOG.md) — notable changes per version.
 - [`CCOS_v0.3_REPORT.md`](CCOS_v0.3_REPORT.md) — v0.3 Autonomous Context Runtime
   report: new modules, tests, performance, and limitations.
 - `cargo doc --open` — rendered API docs (every module has rustdoc).
@@ -198,7 +232,9 @@ Heavier stress/chaos harnesses live in [`scripts/`](scripts/) (multi-day chaos,
 This is a prototype. Known gaps (tracked in [`ROADMAP.md`](ROADMAP.md)):
 
 - The parser is a **line-based heuristic**, not a real Rust AST (no `syn`); it
-  misses multi-line declarations and nested-module bodies. *(top future-work item)*
+  misses multi-line declarations and nested-module bodies. It strips `//` and
+  inline `/* … */` comments, but **multi-line** block comments are not yet
+  tracked across lines. *(top future-work item)*
 - Edges capture containment/dependency, **not** call graphs or data flow.
 - The multi-model `consensus` path only does real work against a live
   Ollama-style endpoint; offline runs fall back deterministically.

@@ -17,6 +17,7 @@ A practical map of the codebase for contributors. For the conceptual write-up se
 | `consensus`                 | Majority / confidence-weighted voting | `ConsensusEngine`, `LlmVote`, `ConsensusResult` |
 | `adversarial`               | Fault injection for hardening | `AdversarialEngine`, `AdversarialMode` |
 | `persist`                   | Save/load a kernel snapshot (one file) | `KernelSnapshot` |
+| `query`                     | Read-only causal queries: impact/cause walks, hot set, GraphML export | `Reached`, `Direction`, `impact_set`, `source_set`, `hot_set`, `to_graphml` |
 | `util`                      | Shared helpers (`sha256_hex`) | `sha256_hex` |
 | **`scheduler`** (v0.3)      | HOT/WARM/COLD context paging by token budget | `ContextScheduler`, `MemoryZone` |
 | **`workspace`** (v0.3)      | Async real-FS scanner; add/modify/remove delta | `WorkspaceScanner`, `WorkspaceDelta` |
@@ -78,6 +79,17 @@ A scripted single cycle touching every subsystem: parse → LLM+guard → consen
 → incremental delta → failure propagation → context selection → replay → paging →
 hash-chain integrity.
 
+### `ccos top` / `blame` / `export`
+
+Read-only queries (module `query`) over a graph built fresh from a path (`top`)
+or loaded from a snapshot (`blame`, `export`):
+
+- `top`    → `query::hot_set` — top-N nodes by causal score (the working set).
+- `blame`  → `query::source_set` (upstream **causes**, walking `target → source`)
+  plus `query::impact_set` (downstream **blast radius**, walking `source →
+  target`); both are a deterministic BFS bounded by `--depth`.
+- `export` → `query::to_graphml` — deterministic, id-sorted GraphML.
+
 ## How to extend
 
 - **New node/edge type** — add a variant to `NodeType` / `EdgeType` (both are
@@ -94,7 +106,7 @@ hash-chain integrity.
 
 ```bash
 cargo build --all-targets
-cargo test                    # 156 unit + integration tests
+cargo test                    # 165 unit + integration tests
 cargo clippy --all-targets    # warning-clean (CI denies warnings)
 cargo doc --open              # rendered module docs
 ```
