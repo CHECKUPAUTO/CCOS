@@ -102,7 +102,8 @@ fn guard_layer_under_1000_mixed_attacks() {
             passed += 1;
             // Guard may pass if a valid JSON prefix is found within corrupted output
             // but the output should at minimum be parseable or contain valid structure
-            let is_strict_json = serde_json::from_str::<serde_json::Value>(&result.sanitized_output).is_ok();
+            let is_strict_json =
+                serde_json::from_str::<serde_json::Value>(&result.sanitized_output).is_ok();
             let contains_braces = result.sanitized_output.contains('{');
             assert!(
                 is_strict_json || contains_braces,
@@ -113,8 +114,11 @@ fn guard_layer_under_1000_mixed_attacks() {
         } else {
             blocked += 1;
             // If blocked, must have fallback
-            assert!(!result.sanitized_output.is_empty(),
-                "Blocked output must have fallback at cycle {}", i);
+            assert!(
+                !result.sanitized_output.is_empty(),
+                "Blocked output must have fallback at cycle {}",
+                i
+            );
         }
     }
 
@@ -141,22 +145,18 @@ fn full_pipeline_stress_500_cycles() {
             _ => AdversarialMode::None,
         });
 
-        let raw_output = engine.corrupt(&format!(
-            r#"{{"cycle": {}, "analysis": "normal"}}"#,
-            cycle
-        ));
+        let raw_output =
+            engine.corrupt(&format!(r#"{{"cycle": {}, "analysis": "normal"}}"#, cycle));
 
         // Phase: guard validation
         let validated = guard.validate_and_sanitize(&raw_output);
 
         // Phase: consensus simulation
-        let votes = vec![
-            LlmVote {
-                model: "primary".into(),
-                output: validated.sanitized_output.clone(),
-                confidence: validated.reliability_score,
-            },
-        ];
+        let votes = vec![LlmVote {
+            model: "primary".into(),
+            output: validated.sanitized_output.clone(),
+            confidence: validated.reliability_score,
+        }];
         let result = consensus.resolve(&votes);
 
         // Phase: graph update
@@ -176,7 +176,11 @@ fn full_pipeline_stress_500_cycles() {
 
     // Final integrity checks
     let integrity = log.verify_integrity();
-    assert!(integrity.valid, "Log integrity must be maintained: {:?}", integrity.errors);
+    assert!(
+        integrity.valid,
+        "Log integrity must be maintained: {:?}",
+        integrity.errors
+    );
     assert_eq!(log.event_count(), 500);
     assert!(graph.node_count() > 0);
 }

@@ -163,7 +163,12 @@ impl ASTParser {
                 ),
                 NodeType::Module,
             );
-            graph.add_edge(parent_id.clone(), child_id.clone(), 0.85, EdgeType::Contains);
+            graph.add_edge(
+                parent_id.clone(),
+                child_id.clone(),
+                0.85,
+                EdgeType::Contains,
+            );
 
             if !child.children.is_empty() {
                 self.add_module_tree(graph, &child_id, &child.children, file_path);
@@ -273,101 +278,89 @@ impl ASTParser {
             }
 
             let kind_and_name = if stripped.starts_with("fn ") {
-                stripped
-                    .strip_prefix("fn ")
-                    .and_then(|rest| {
-                        let name = rest
-                            .split(['(', '<', '{', ';'])
-                            .next()
-                            .unwrap_or("")
-                            .trim()
-                            .to_string();
-                        if name.is_empty() || name.starts_with("//") {
-                            None
-                        } else {
-                            Some((SymbolKind::Function, name))
-                        }
-                    })
+                stripped.strip_prefix("fn ").and_then(|rest| {
+                    let name = rest
+                        .split(['(', '<', '{', ';'])
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    if name.is_empty() || name.starts_with("//") {
+                        None
+                    } else {
+                        Some((SymbolKind::Function, name))
+                    }
+                })
             } else if stripped.starts_with("pub fn ") {
-                stripped
-                    .strip_prefix("pub fn ")
-                    .and_then(|rest| {
-                        let name = rest
-                            .split(['(', '<', '{', ';'])
-                            .next()
-                            .unwrap_or("")
-                            .trim()
-                            .to_string();
-                        if name.is_empty() {
-                            None
-                        } else {
-                            Some((SymbolKind::Function, name))
-                        }
-                    })
+                stripped.strip_prefix("pub fn ").and_then(|rest| {
+                    let name = rest
+                        .split(['(', '<', '{', ';'])
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    if name.is_empty() {
+                        None
+                    } else {
+                        Some((SymbolKind::Function, name))
+                    }
+                })
             } else if stripped.starts_with("struct ") {
-                stripped
-                    .strip_prefix("struct ")
-                    .and_then(|rest| {
-                        let name = rest
-                            .split(['<', '{', '(', ';'])
-                            .next()
-                            .unwrap_or("")
-                            .trim()
-                            .to_string();
-                        if name.is_empty() {
-                            None
-                        } else {
-                            Some((SymbolKind::Struct, name))
-                        }
-                    })
+                stripped.strip_prefix("struct ").and_then(|rest| {
+                    let name = rest
+                        .split(['<', '{', '(', ';'])
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    if name.is_empty() {
+                        None
+                    } else {
+                        Some((SymbolKind::Struct, name))
+                    }
+                })
             } else if stripped.starts_with("pub struct ") {
-                stripped
-                    .strip_prefix("pub struct ")
-                    .and_then(|rest| {
-                        let name = rest
-                            .split(['<', '{', '(', ';'])
-                            .next()
-                            .unwrap_or("")
-                            .trim()
-                            .to_string();
-                        if name.is_empty() {
-                            None
-                        } else {
-                            Some((SymbolKind::Struct, name))
-                        }
-                    })
+                stripped.strip_prefix("pub struct ").and_then(|rest| {
+                    let name = rest
+                        .split(['<', '{', '(', ';'])
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    if name.is_empty() {
+                        None
+                    } else {
+                        Some((SymbolKind::Struct, name))
+                    }
+                })
             } else if stripped.starts_with("enum ") {
-                stripped
-                    .strip_prefix("enum ")
-                    .and_then(|rest| {
-                        let name = rest
-                            .split(['<', '{', ';'])
-                            .next()
-                            .unwrap_or("")
-                            .trim()
-                            .to_string();
-                        if name.is_empty() {
-                            None
-                        } else {
-                            Some((SymbolKind::Enum, name))
-                        }
-                    })
+                stripped.strip_prefix("enum ").and_then(|rest| {
+                    let name = rest
+                        .split(['<', '{', ';'])
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    if name.is_empty() {
+                        None
+                    } else {
+                        Some((SymbolKind::Enum, name))
+                    }
+                })
             } else if stripped.starts_with("pub enum ") {
-                stripped
-                    .strip_prefix("pub enum ")
-                    .and_then(|rest| {
-                        let name = rest
-                            .split(['<', '{', ';'])
-                            .next()
-                            .unwrap_or("")
-                            .trim()
-                            .to_string();
-                        if name.is_empty() {
-                            None
-                        } else {
-                            Some((SymbolKind::Enum, name))
-                        }
-                    })
+                stripped.strip_prefix("pub enum ").and_then(|rest| {
+                    let name = rest
+                        .split(['<', '{', ';'])
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    if name.is_empty() {
+                        None
+                    } else {
+                        Some((SymbolKind::Enum, name))
+                    }
+                })
             } else if stripped.starts_with("trait ") {
                 stripped.strip_prefix("trait ").and_then(|rest| {
                     let name = rest
@@ -557,7 +550,9 @@ mod tests {
     fn test_extract_symbols_functions() {
         let source = "fn main() {}\nfn helper() {}\npub fn public_fn() {}";
         let symbols = ASTParser::extract_symbols(source);
-        assert!(symbols.iter().any(|s| s.name == "main" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "main" && s.kind == SymbolKind::Function));
         assert!(symbols.iter().any(|s| s.name == "helper"));
         assert!(symbols.iter().any(|s| s.name == "public_fn"));
     }
@@ -565,15 +560,22 @@ mod tests {
     #[test]
     fn test_strip_comments() {
         assert_eq!(strip_comments("use foo; // bar"), "use foo;");
-        assert_eq!(strip_comments("let x = \"//not_a_comment\"; // real"), "let x = \"//not_a_comment\";");
+        assert_eq!(
+            strip_comments("let x = \"//not_a_comment\"; // real"),
+            "let x = \"//not_a_comment\";"
+        );
     }
 
     #[test]
     fn test_extract_structs_and_enums() {
         let source = "struct Foo;\nenum Bar { A, B }\npub struct Baz<T> {}";
         let symbols = ASTParser::extract_symbols(source);
-        assert!(symbols.iter().any(|s| s.name == "Foo" && s.kind == SymbolKind::Struct));
-        assert!(symbols.iter().any(|s| s.name == "Bar" && s.kind == SymbolKind::Enum));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Foo" && s.kind == SymbolKind::Struct));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Bar" && s.kind == SymbolKind::Enum));
         assert!(symbols.iter().any(|s| s.name == "Baz"));
     }
 

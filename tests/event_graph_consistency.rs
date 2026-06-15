@@ -10,25 +10,21 @@ fn rebuild_graph_from_log(event_log: &EventLog) -> MemoryGraph {
     for event in &event_log.events {
         match &event.payload {
             EventPayload::GraphMutation {
-                node_id,
-                operation,
-                ..
-            } => {
-                match operation.as_str() {
-                    "add" | "ingest" | "upsert" => {
-                        graph.upsert_node(
-                            NodeId(node_id.clone()),
-                            format!("_replay_{}", node_id),
-                            format!("replayed: {}", event.id),
-                            NodeType::ContextBlock,
-                        );
-                    }
-                    "remove" => {
-                        graph.remove_node(&NodeId(node_id.clone()));
-                    }
-                    _ => {}
+                node_id, operation, ..
+            } => match operation.as_str() {
+                "add" | "ingest" | "upsert" => {
+                    graph.upsert_node(
+                        NodeId(node_id.clone()),
+                        format!("_replay_{}", node_id),
+                        format!("replayed: {}", event.id),
+                        NodeType::ContextBlock,
+                    );
                 }
-            }
+                "remove" => {
+                    graph.remove_node(&NodeId(node_id.clone()));
+                }
+                _ => {}
+            },
             EventPayload::Parsing { file_path, .. } => {
                 // Parsing events create file nodes
                 graph.upsert_node(
@@ -114,7 +110,10 @@ fn graph_consistency_after_replay() {
     // ── Assertions ──
     // The rebuilt graph should have the same node count
     // (modulo implementation details of how we rebuild)
-    assert!(rebuilt_graph.node_count() > 0, "rebuilt graph must have nodes");
+    assert!(
+        rebuilt_graph.node_count() > 0,
+        "rebuilt graph must have nodes"
+    );
 
     // Event log is strictly append-only
     assert_eq!(event_log.events[0].sequence_number, 0);
@@ -132,7 +131,10 @@ fn detect_missing_events() {
         EventPayload::GraphMutation {
             node_id: "node_a".into(),
             operation: "add".into(),
-            nodes_before: 0, nodes_after: 1, edges_before: 0, edges_after: 0,
+            nodes_before: 0,
+            nodes_after: 1,
+            edges_before: 0,
+            edges_after: 0,
         },
     );
     event_log.append(
@@ -140,7 +142,10 @@ fn detect_missing_events() {
         EventPayload::GraphMutation {
             node_id: "node_b".into(),
             operation: "add".into(),
-            nodes_before: 1, nodes_after: 2, edges_before: 0, edges_after: 0,
+            nodes_before: 1,
+            nodes_after: 2,
+            edges_before: 0,
+            edges_after: 0,
         },
     );
 
@@ -156,11 +161,20 @@ fn detect_missing_events() {
     }
 
     // "node_a" and "node_b" should be present
-    assert!(expected_nodes.contains_key("node_a"), "node_a must be tracked");
-    assert!(expected_nodes.contains_key("node_b"), "node_b must be tracked");
+    assert!(
+        expected_nodes.contains_key("node_a"),
+        "node_a must be tracked"
+    );
+    assert!(
+        expected_nodes.contains_key("node_b"),
+        "node_b must be tracked"
+    );
 
     // "node_c" should NOT be present (missing event)
-    assert!(!expected_nodes.contains_key("node_c"), "node_c must not exist without event");
+    assert!(
+        !expected_nodes.contains_key("node_c"),
+        "node_c must not exist without event"
+    );
 }
 
 #[test]
@@ -170,7 +184,10 @@ fn detect_duplicate_events() {
     let payload = EventPayload::GraphMutation {
         node_id: "node_x".into(),
         operation: "add".into(),
-        nodes_before: 0, nodes_after: 1, edges_before: 0, edges_after: 0,
+        nodes_before: 0,
+        nodes_after: 1,
+        edges_before: 0,
+        edges_after: 0,
     };
 
     let id1 = event_log.append(EventType::GraphMutation, payload.clone());
@@ -186,7 +203,9 @@ fn detect_duplicate_events() {
     assert_eq!(event_log.events[1].sequence_number, 1);
 
     // Count of add operations for node_x
-    let add_count = event_log.events.iter()
+    let add_count = event_log
+        .events
+        .iter()
         .filter(|e| {
             matches!(&e.payload, EventPayload::GraphMutation { node_id, operation, .. }
                 if node_id == "node_x" && operation == "add")
@@ -200,12 +219,20 @@ fn detect_out_of_order_events() {
     let mut event_log = EventLog::new("order_test".into());
 
     // Append events in sequence
-    event_log.append(EventType::CycleStart, EventPayload::CycleEvent {
-        cycle_number: 1, action: "start".into(),
-    });
-    event_log.append(EventType::CycleEnd, EventPayload::CycleEvent {
-        cycle_number: 1, action: "end".into(),
-    });
+    event_log.append(
+        EventType::CycleStart,
+        EventPayload::CycleEvent {
+            cycle_number: 1,
+            action: "start".into(),
+        },
+    );
+    event_log.append(
+        EventType::CycleEnd,
+        EventPayload::CycleEvent {
+            cycle_number: 1,
+            action: "end".into(),
+        },
+    );
 
     // Sequence numbers must be monotonic
     let seqs: Vec<u64> = event_log.events.iter().map(|e| e.sequence_number).collect();
@@ -213,7 +240,10 @@ fn detect_out_of_order_events() {
         assert!(
             seqs[i] > seqs[i - 1],
             "sequence numbers must be strictly monotonic: seq[{}]={} <= seq[{}]={}",
-            i, seqs[i], i - 1, seqs[i - 1]
+            i,
+            seqs[i],
+            i - 1,
+            seqs[i - 1]
         );
     }
 }
@@ -227,22 +257,43 @@ fn rollback_simulation_divergence_detected() {
 
     // Add nodes in sequence
     graph.upsert_node("n1".into(), "N1".into(), "".into(), NodeType::Module);
-    event_log.append(EventType::GraphMutation, EventPayload::GraphMutation {
-        node_id: "n1".into(), operation: "add".into(),
-        nodes_before: 0, nodes_after: 1, edges_before: 0, edges_after: 0,
-    });
+    event_log.append(
+        EventType::GraphMutation,
+        EventPayload::GraphMutation {
+            node_id: "n1".into(),
+            operation: "add".into(),
+            nodes_before: 0,
+            nodes_after: 1,
+            edges_before: 0,
+            edges_after: 0,
+        },
+    );
 
     graph.upsert_node("n2".into(), "N2".into(), "".into(), NodeType::Module);
-    event_log.append(EventType::GraphMutation, EventPayload::GraphMutation {
-        node_id: "n2".into(), operation: "add".into(),
-        nodes_before: 1, nodes_after: 2, edges_before: 0, edges_after: 0,
-    });
+    event_log.append(
+        EventType::GraphMutation,
+        EventPayload::GraphMutation {
+            node_id: "n2".into(),
+            operation: "add".into(),
+            nodes_before: 1,
+            nodes_after: 2,
+            edges_before: 0,
+            edges_after: 0,
+        },
+    );
 
     graph.upsert_node("n3".into(), "N3".into(), "".into(), NodeType::Module);
-    event_log.append(EventType::GraphMutation, EventPayload::GraphMutation {
-        node_id: "n3".into(), operation: "add".into(),
-        nodes_before: 2, nodes_after: 3, edges_before: 0, edges_after: 0,
-    });
+    event_log.append(
+        EventType::GraphMutation,
+        EventPayload::GraphMutation {
+            node_id: "n3".into(),
+            operation: "add".into(),
+            nodes_before: 2,
+            nodes_after: 3,
+            edges_before: 0,
+            edges_after: 0,
+        },
+    );
 
     // Now the graph has 3 nodes
     assert_eq!(graph.node_count(), 3);
@@ -304,15 +355,28 @@ fn replay_consistency_full_cycle() {
     }
 
     // Add edges
-    graph.add_edge("file:src/main.rs".into(), "file:src/lib.rs".into(), 0.8, EdgeType::DependsOn);
-    graph.add_edge("file:src/lib.rs".into(), "file:src/foo.rs".into(), 0.7, EdgeType::Contains);
+    graph.add_edge(
+        "file:src/main.rs".into(),
+        "file:src/lib.rs".into(),
+        0.8,
+        EdgeType::DependsOn,
+    );
+    graph.add_edge(
+        "file:src/lib.rs".into(),
+        "file:src/foo.rs".into(),
+        0.7,
+        EdgeType::Contains,
+    );
 
     event_log.append(
         EventType::GraphMutation,
         EventPayload::GraphMutation {
             node_id: "edge:main->lib".into(),
             operation: "add_edge".into(),
-            nodes_before: 3, nodes_after: 3, edges_before: 0, edges_after: 2,
+            nodes_before: 3,
+            nodes_after: 3,
+            edges_before: 0,
+            edges_after: 2,
         },
     );
 
@@ -328,9 +392,22 @@ fn replay_consistency_full_cycle() {
 
     // Verify snapshot data matches graph
     if let Some(snapshot) = event_log.events.last() {
-        if let EventPayload::Snapshot { nodes_count, edges_count, .. } = &snapshot.payload {
-            assert_eq!(*nodes_count, graph.node_count(), "snapshot nodes must match graph");
-            assert_eq!(*edges_count, graph.edge_count(), "snapshot edges must match graph");
+        if let EventPayload::Snapshot {
+            nodes_count,
+            edges_count,
+            ..
+        } = &snapshot.payload
+        {
+            assert_eq!(
+                *nodes_count,
+                graph.node_count(),
+                "snapshot nodes must match graph"
+            );
+            assert_eq!(
+                *edges_count,
+                graph.edge_count(),
+                "snapshot edges must match graph"
+            );
         }
     }
 

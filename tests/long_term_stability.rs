@@ -130,7 +130,11 @@ fn long_term_stability_10k_cycles() {
     // ═══════════════════════════════════════════════════════════
 
     // 1. No crash — reaching here proves basic stability
-    assert!(graph.node_count() > 0, "graph must have nodes after {} cycles", NUM_CYCLES);
+    assert!(
+        graph.node_count() > 0,
+        "graph must have nodes after {} cycles",
+        NUM_CYCLES
+    );
 
     // 2. Event log grows monotonically (append-only)
     let expected_min = NUM_CYCLES * 2; // guard checks + cycle ends
@@ -153,7 +157,8 @@ fn long_term_stability_10k_cycles() {
     // 4. No exponential slowdown: first 10% vs last 10% cycle times
     let tenth = NUM_CYCLES / 10;
     let first_tenth_avg: f64 = cycle_times[..tenth].iter().sum::<f64>() / tenth as f64;
-    let last_tenth_avg: f64 = cycle_times[(NUM_CYCLES - tenth)..].iter().sum::<f64>() / tenth as f64;
+    let last_tenth_avg: f64 =
+        cycle_times[(NUM_CYCLES - tenth)..].iter().sum::<f64>() / tenth as f64;
     let ratio = last_tenth_avg / first_tenth_avg.max(0.000001);
 
     assert!(
@@ -184,9 +189,15 @@ fn long_term_stability_10k_cycles() {
     );
 
     // Final report
-    eprintln!("\n─── Long Term Stability Report ({} cycles) ───", NUM_CYCLES);
+    eprintln!(
+        "\n─── Long Term Stability Report ({} cycles) ───",
+        NUM_CYCLES
+    );
     eprintln!("  Total time:       {:.2}s", total_time.as_secs_f64());
-    eprintln!("  Avg per cycle:    {:.4}ms", total_time.as_secs_f64() / NUM_CYCLES as f64 * 1000.0);
+    eprintln!(
+        "  Avg per cycle:    {:.4}ms",
+        total_time.as_secs_f64() / NUM_CYCLES as f64 * 1000.0
+    );
     eprintln!("  Final nodes:      {}", graph.node_count());
     eprintln!("  Final edges:      {}", graph.edge_count());
     eprintln!("  Total events:     {}", event_log.event_count());
@@ -239,6 +250,8 @@ fn long_term_graph_coherence_t0_vs_tfinal() {
     assert!(
         drift_ratio < 10.0,
         "node count drift ratio {:.2}x — too high (t0: {} nodes, t_final: {} nodes)",
-        drift_ratio, nodes_t0, nodes_tfinal
+        drift_ratio,
+        nodes_t0,
+        nodes_tfinal
     );
 }

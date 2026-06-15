@@ -45,7 +45,8 @@ fn bench_process_delta(c: &mut Criterion) {
                     // Edit a single hot file repeatedly; cost should be O(Δ),
                     // independent of `background`.
                     version += 1;
-                    let new = format!("mod hot;\npub fn hot_{version}() {{}}\nstruct H{version};\n");
+                    let new =
+                        format!("mod hot;\npub fn hot_{version}() {{}}\nstruct H{version};\n");
                     engine.process_delta("hot/file.rs", Some("fn old() {}"), &new, &mut graph);
                 });
             },

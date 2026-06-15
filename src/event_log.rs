@@ -136,11 +136,7 @@ impl EventLog {
         id
     }
 
-    pub fn replay_events(
-        &self,
-        from_sequence: u64,
-        to_sequence: Option<u64>,
-    ) -> Vec<&TraceEvent> {
+    pub fn replay_events(&self, from_sequence: u64, to_sequence: Option<u64>) -> Vec<&TraceEvent> {
         let end = to_sequence.unwrap_or(self.events.len() as u64);
         self.events
             .iter()
@@ -218,7 +214,11 @@ impl EventLog {
             );
         }
         let mut edges: Vec<&crate::memory::GraphEdge> = graph.edges.iter().collect();
-        edges.sort_by(|a, b| a.source.cmp(&b.source).then_with(|| a.target.cmp(&b.target)));
+        edges.sort_by(|a, b| {
+            a.source
+                .cmp(&b.source)
+                .then_with(|| a.target.cmp(&b.target))
+        });
         for e in edges {
             self.append(
                 EventType::GraphMutation,
@@ -470,7 +470,11 @@ mod tests {
         assert_eq!(recon.graph.edge_count(), graph.edge_count());
         // Structural fidelity: same ids, labels, contents, types.
         for (id, node) in &graph.nodes {
-            let r = recon.graph.nodes.get(id).expect("reconstructed node present");
+            let r = recon
+                .graph
+                .nodes
+                .get(id)
+                .expect("reconstructed node present");
             assert_eq!(r.label, node.label);
             assert_eq!(r.content, node.content);
             assert_eq!(r.node_type, node.node_type);

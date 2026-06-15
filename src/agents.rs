@@ -315,7 +315,11 @@ mod tests {
         let results = executor.execute_all(&mut agents, SAMPLE, &mut log);
         assert_eq!(results.len(), 3);
         for r in &results {
-            assert!(r.guard_passed, "agent JSON must pass the guard: {}", r.output);
+            assert!(
+                r.guard_passed,
+                "agent JSON must pass the guard: {}",
+                r.output
+            );
             assert!(serde_json::from_str::<serde_json::Value>(&r.output).is_ok());
         }
         // Each agent emits a GuardCheck + an AgentAction event.
@@ -329,7 +333,10 @@ mod tests {
         agent.receive_context(SAMPLE.to_string());
         let analysis = agent.analyze();
         let v: serde_json::Value = serde_json::from_str(&analysis.output).unwrap();
-        assert!(v["risk_count"].as_u64().unwrap() >= 2, "must flag /bin/ and Command");
+        assert!(
+            v["risk_count"].as_u64().unwrap() >= 2,
+            "must flag /bin/ and Command"
+        );
         assert_eq!(analysis.confidence, 0.9);
     }
 

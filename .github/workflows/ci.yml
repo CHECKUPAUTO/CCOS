@@ -5,31 +5,50 @@ on:
     branches: ["**"]
   pull_request:
 
+env:
+  CARGO_TERM_COLOR: always
+
+# Only GitHub-authored actions (actions/checkout) + the runner's pre-installed
+# rustup are used, so no third-party action can be blocked by org policy.
 jobs:
-  build-test:
-    name: build · clippy · test
+  format:
+    name: Format
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Set up Rust
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup component add rustfmt
+      - run: cargo fmt --all --check
 
-      # Rust is pre-installed on ubuntu-latest; use rustup directly so the
-      # workflow needs no third-party actions (which org policy may block).
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
       - name: Set up Rust
         run: |
           rustup update stable --no-self-update
           rustup default stable
           rustup component add clippy
-          rustc --version && cargo --version
+      - run: cargo clippy --all-targets --locked -- -D warnings
 
+  test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Rust
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustc --version && cargo --version
       - name: Build
         run: cargo build --all-targets --locked
-
-      - name: Clippy (deny warnings)
-        run: cargo clippy --all-targets --locked -- -D warnings
-
       - name: Test
         run: cargo test --locked
-
       - name: Smoke-test the CLI
         run: |
           cargo run --locked -- version
@@ -37,3 +56,33 @@ jobs:
           cargo run --locked -- verify /tmp/run.json
           cargo run --locked -- replay /tmp/run.json
           cargo run --locked -- chaos --iters 500
+
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Rust
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+      - run: cargo doc --no-deps --locked
+
+  audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    # Informational: a transitive-dependency advisory outside our control should
+    # not block the pipeline. Surfaced as a check, but non-blocking.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Rust
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit
+        run: cargo audit

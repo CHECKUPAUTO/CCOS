@@ -128,7 +128,11 @@ fn json_corruption_produces_varied_output() {
         outputs.insert(corrupted);
     }
     // With 5 corruption types at 100% rate, we should see variety
-    assert!(outputs.len() >= 2, "JsonCorruption must produce varied corruptions, got {}", outputs.len());
+    assert!(
+        outputs.len() >= 2,
+        "JsonCorruption must produce varied corruptions, got {}",
+        outputs.len()
+    );
 }
 
 #[test]

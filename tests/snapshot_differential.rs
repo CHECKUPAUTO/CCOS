@@ -29,7 +29,9 @@ fn graph_hash(graph: &MemoryGraph) -> String {
     // Hash edges deterministically
     let mut edges_sorted: Vec<&ccos::memory::GraphEdge> = graph.edges.iter().collect();
     edges_sorted.sort_by(|a, b| {
-        a.source.0.cmp(&b.source.0)
+        a.source
+            .0
+            .cmp(&b.source.0)
             .then(a.target.0.cmp(&b.target.0))
     });
 
@@ -54,7 +56,14 @@ fn event_log_hash(event_log: &EventLog) -> String {
 
         // Include payload content deterministically
         match &event.payload {
-            EventPayload::GraphMutation { node_id, operation, nodes_before, nodes_after, edges_before, edges_after } => {
+            EventPayload::GraphMutation {
+                node_id,
+                operation,
+                nodes_before,
+                nodes_after,
+                edges_before,
+                edges_after,
+            } => {
                 hasher.update(node_id.as_bytes());
                 hasher.update(operation.as_bytes());
                 hasher.update(nodes_before.to_le_bytes());
@@ -62,28 +71,50 @@ fn event_log_hash(event_log: &EventLog) -> String {
                 hasher.update(edges_before.to_le_bytes());
                 hasher.update(edges_after.to_le_bytes());
             }
-            EventPayload::Parsing { file_path, file_hash, modules_found, uses_found, symbols_found } => {
+            EventPayload::Parsing {
+                file_path,
+                file_hash,
+                modules_found,
+                uses_found,
+                symbols_found,
+            } => {
                 hasher.update(file_path.as_bytes());
                 hasher.update(file_hash.as_bytes());
                 hasher.update(modules_found.to_le_bytes());
                 hasher.update(uses_found.to_le_bytes());
                 hasher.update(symbols_found.to_le_bytes());
             }
-            EventPayload::Snapshot { nodes_count, edges_count, total_events } => {
+            EventPayload::Snapshot {
+                nodes_count,
+                edges_count,
+                total_events,
+            } => {
                 hasher.update(nodes_count.to_le_bytes());
                 hasher.update(edges_count.to_le_bytes());
                 hasher.update(total_events.to_le_bytes());
             }
-            EventPayload::CycleEvent { cycle_number, action } => {
+            EventPayload::CycleEvent {
+                cycle_number,
+                action,
+            } => {
                 hasher.update(cycle_number.to_le_bytes());
                 hasher.update(action.as_bytes());
             }
-            EventPayload::FailureDetection { node_id, failure_type, severity } => {
+            EventPayload::FailureDetection {
+                node_id,
+                failure_type,
+                severity,
+            } => {
                 hasher.update(node_id.as_bytes());
                 hasher.update(failure_type.as_bytes());
                 hasher.update(severity.to_le_bytes());
             }
-            EventPayload::GuardCheck { input_hash, passed, score, .. } => {
+            EventPayload::GuardCheck {
+                input_hash,
+                passed,
+                score,
+                ..
+            } => {
                 hasher.update(input_hash.as_bytes());
                 hasher.update(if *passed { &[1u8] } else { &[0u8] });
                 hasher.update(score.to_le_bytes());
@@ -142,7 +173,10 @@ fn snapshot_consistent_after_build() {
 
     let hash2 = graph_hash(&graph2);
 
-    assert_eq!(hash1, hash2, "identical graph builds must produce identical snapshots");
+    assert_eq!(
+        hash1, hash2,
+        "identical graph builds must produce identical snapshots"
+    );
 }
 
 #[test]
@@ -174,10 +208,7 @@ fn snapshot_temporal_evolution() {
 
     // Evolve and snapshot every 10 steps
     for step in 1..=100 {
-        let source = format!(
-            "mod m{c};\nfn f{c}() {{ let x = {c}; }}\n",
-            c = step
-        );
+        let source = format!("mod m{c};\nfn f{c}() {{ let x = {c}; }}\n", c = step);
 
         let old = if step > 1 {
             Some(format!(
@@ -201,7 +232,10 @@ fn snapshot_temporal_evolution() {
     }
 
     // Verify all snapshots exist
-    assert!(snapshots.len() >= 11, "must have at least 11 snapshots (t0 + 10 intervals)");
+    assert!(
+        snapshots.len() >= 11,
+        "must have at least 11 snapshots (t0 + 10 intervals)"
+    );
 
     // Verify adjacency: consecutive snapshots that represent actual changes differ
     // (or are equal if nothing changed — both valid)
@@ -209,11 +243,18 @@ fn snapshot_temporal_evolution() {
         let (step, hash) = &snapshots[i];
         let (_prev_step, _prev_hash) = &snapshots[i - 1];
 
-        eprintln!("  snapshot @ step {}: {}", step, &hash[..16.min(hash.len())]);
+        eprintln!(
+            "  snapshot @ step {}: {}",
+            step,
+            &hash[..16.min(hash.len())]
+        );
     }
 
     // Final state coherence: graph must be non-empty
-    assert!(graph.node_count() > 0, "graph must have nodes after evolution");
+    assert!(
+        graph.node_count() > 0,
+        "graph must have nodes after evolution"
+    );
 }
 
 #[test]
@@ -262,8 +303,12 @@ fn snapshot_event_log_coherence() {
     event_log.append(
         EventType::GraphMutation,
         EventPayload::GraphMutation {
-            node_id: "x".into(), operation: "add".into(),
-            nodes_before: 0, nodes_after: 1, edges_before: 0, edges_after: 0,
+            node_id: "x".into(),
+            operation: "add".into(),
+            nodes_before: 0,
+            nodes_after: 1,
+            edges_before: 0,
+            edges_after: 0,
         },
     );
 
@@ -271,8 +316,12 @@ fn snapshot_event_log_coherence() {
     event_log.append(
         EventType::GraphMutation,
         EventPayload::GraphMutation {
-            node_id: "y".into(), operation: "add".into(),
-            nodes_before: 1, nodes_after: 2, edges_before: 0, edges_after: 0,
+            node_id: "y".into(),
+            operation: "add".into(),
+            nodes_before: 1,
+            nodes_after: 2,
+            edges_before: 0,
+            edges_after: 0,
         },
     );
 

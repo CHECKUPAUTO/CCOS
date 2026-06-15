@@ -147,7 +147,10 @@ impl IncrementalGraphEngine {
             .keys()
             .filter(|id| {
                 let s = id.0.as_str();
-                s == prefix || s.starts_with(&mod_prefix) || s.starts_with(&use_prefix) || s.starts_with(&sym_prefix)
+                s == prefix
+                    || s.starts_with(&mod_prefix)
+                    || s.starts_with(&use_prefix)
+                    || s.starts_with(&sym_prefix)
             })
             .cloned()
             .collect();
@@ -223,12 +226,7 @@ mod tests {
     fn test_file_added_delta() {
         let mut engine = IncrementalGraphEngine::new();
         let mut graph = MemoryGraph::default();
-        let mutation = engine.process_delta(
-            "test.rs",
-            None,
-            "mod foo;\nfn bar() {}",
-            &mut graph,
-        );
+        let mutation = engine.process_delta("test.rs", None, "mod foo;\nfn bar() {}", &mut graph);
         assert_eq!(mutation.operation, MutationOp::FileAdded);
         assert!(mutation.nodes_added > 0);
     }

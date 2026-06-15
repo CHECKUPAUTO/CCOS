@@ -114,7 +114,8 @@ mod tests {
 
     #[test]
     fn test_json_corruption_differs_from_input() {
-        let mut engine = AdversarialEngine::with_corruption_rate(AdversarialMode::JsonCorruption, 1.0);
+        let mut engine =
+            AdversarialEngine::with_corruption_rate(AdversarialMode::JsonCorruption, 1.0);
         // Run multiple times since corruption is random
         let mut found_corruption = false;
         for _ in 0..20 {
@@ -124,12 +125,16 @@ mod tests {
                 break;
             }
         }
-        assert!(found_corruption, "JsonCorruption must corrupt at least sometimes");
+        assert!(
+            found_corruption,
+            "JsonCorruption must corrupt at least sometimes"
+        );
     }
 
     #[test]
     fn test_prompt_injection_contains_injection_marker() {
-        let mut engine = AdversarialEngine::with_corruption_rate(AdversarialMode::PromptInjection, 1.0);
+        let mut engine =
+            AdversarialEngine::with_corruption_rate(AdversarialMode::PromptInjection, 1.0);
         // Run multiple times since there are 5 injection patterns, some don't have our keywords
         let mut found = false;
         for _ in 0..30 {
@@ -154,7 +159,8 @@ mod tests {
 
     #[test]
     fn test_hallucination_adds_extra_content() {
-        let mut engine = AdversarialEngine::with_corruption_rate(AdversarialMode::Hallucination, 1.0);
+        let mut engine =
+            AdversarialEngine::with_corruption_rate(AdversarialMode::Hallucination, 1.0);
         let output = engine.corrupt("normal output");
         assert!(
             output.len() > "normal output".len(),
@@ -173,7 +179,10 @@ mod tests {
                 break;
             }
         }
-        assert!(found_empty, "TimeoutSimulation must produce empty output sometimes");
+        assert!(
+            found_empty,
+            "TimeoutSimulation must produce empty output sometimes"
+        );
     }
 
     #[test]

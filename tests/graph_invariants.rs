@@ -101,5 +101,8 @@ fn eviction_is_deterministic() {
     let a = build();
     let b = build();
     assert_eq!(a.len(), 25, "paging cap must hold");
-    assert_eq!(a, b, "eviction must be deterministic across identical builds");
+    assert_eq!(
+        a, b,
+        "eviction must be deterministic across identical builds"
+    );
 }

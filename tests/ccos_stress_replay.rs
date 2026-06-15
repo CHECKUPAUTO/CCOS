@@ -22,15 +22,27 @@ fn replay_is_deterministic_under_load() {
     assert_eq!(replay1.len(), 500);
 
     for i in 0..500 {
-        assert_eq!(replay1[i].id, replay2[i].id,
-            "Replay mismatch at index {}: run1 id={}, run2 id={}", i, replay1[i].id, replay2[i].id);
-        assert_eq!(replay1[i].payload, replay2[i].payload,
-            "Replay mismatch at index {}: payload differs", i);
-        assert_eq!(replay1[i].timestamp, replay2[i].timestamp,
-            "Replay mismatch at index {}: timestamp differs", i);
+        assert_eq!(
+            replay1[i].id, replay2[i].id,
+            "Replay mismatch at index {}: run1 id={}, run2 id={}",
+            i, replay1[i].id, replay2[i].id
+        );
+        assert_eq!(
+            replay1[i].payload, replay2[i].payload,
+            "Replay mismatch at index {}: payload differs",
+            i
+        );
+        assert_eq!(
+            replay1[i].timestamp, replay2[i].timestamp,
+            "Replay mismatch at index {}: timestamp differs",
+            i
+        );
 
-        assert_eq!(replay2[i].id, replay3[i].id,
-            "Replay mismatch between run2 and run3 at index {}", i);
+        assert_eq!(
+            replay2[i].id, replay3[i].id,
+            "Replay mismatch between run2 and run3 at index {}",
+            i
+        );
         assert_eq!(replay2[i].payload, replay3[i].payload);
         assert_eq!(replay2[i].timestamp, replay3[i].timestamp);
     }
@@ -45,7 +57,11 @@ fn hash_chain_verifiable() {
     }
 
     let report = log.verify_integrity();
-    assert!(report.valid, "Hash chain must be valid: {:?}", report.errors);
+    assert!(
+        report.valid,
+        "Hash chain must be valid: {:?}",
+        report.errors
+    );
     assert_eq!(report.total_events, 100);
     assert_eq!(report.verified_events, 100);
 }
@@ -60,8 +76,11 @@ fn hash_chain_prevents_mutation() {
 
     let report = log.verify_integrity();
     assert!(!report.valid, "Tampered log must fail integrity check");
-    assert!(report.errors.iter().any(|e| e.contains("Hash mismatch")),
-        "Error must indicate hash mismatch: {:?}", report.errors);
+    assert!(
+        report.errors.iter().any(|e| e.contains("Hash mismatch")),
+        "Error must indicate hash mismatch: {:?}",
+        report.errors
+    );
 }
 
 #[test]
@@ -99,8 +118,11 @@ fn export_and_verify_external() {
         } else {
             exported[i - 1].hash.clone()
         };
-        assert_eq!(link.previous_hash, expected_prev,
-            "Exported chain has broken linkage at {}", link.event_id);
+        assert_eq!(
+            link.previous_hash, expected_prev,
+            "Exported chain has broken linkage at {}",
+            link.event_id
+        );
     }
 }
 

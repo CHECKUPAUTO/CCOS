@@ -17,7 +17,10 @@ use uuid::Uuid;
 pub(crate) async fn run_demo() {
     println!("╔══════════════════════════════════════════════╗");
     println!("║  CCOS — Causal Context Operating System     ║");
-    println!("║  Kernel v{} | Rust 2021                   ║", env!("CARGO_PKG_VERSION"));
+    println!(
+        "║  Kernel v{} | Rust 2021                   ║",
+        env!("CARGO_PKG_VERSION")
+    );
     println!("╚══════════════════════════════════════════════╝\n");
 
     // ── Initialization ─────────────────────────────────────────────
@@ -206,9 +209,13 @@ pub async fn handle_request(state: &AppState, path: &str, body: &str) -> Result<
             EventPayload::GraphMutation {
                 node_id: format!("file:{}", file_path),
                 operation: "ingest".into(),
-                nodes_before: memory_graph.node_count().saturating_sub(parse_result.generated_nodes),
+                nodes_before: memory_graph
+                    .node_count()
+                    .saturating_sub(parse_result.generated_nodes),
                 nodes_after: memory_graph.node_count(),
-                edges_before: memory_graph.edge_count().saturating_sub(parse_result.generated_edges),
+                edges_before: memory_graph
+                    .edge_count()
+                    .saturating_sub(parse_result.generated_edges),
                 edges_after: memory_graph.edge_count(),
             },
         );
@@ -246,7 +253,10 @@ Top modules: Analyze the dependency structure and identify potential issues."#,
     );
 
     let validated = llm_client
-        .query(&prompt, Some("You are a code analysis assistant. Respond with valid JSON only."))
+        .query(
+            &prompt,
+            Some("You are a code analysis assistant. Respond with valid JSON only."),
+        )
         .await;
 
     let _guard_event = event_log.append(
@@ -294,7 +304,11 @@ Top modules: Analyze the dependency structure and identify potential issues."#,
     // they agree on the deterministic fallback output).
     let consensus_models = ["codellama", "mistral"];
     let votes = llm_client
-        .query_models(&prompt, Some("Respond with valid JSON only."), &consensus_models)
+        .query_models(
+            &prompt,
+            Some("Respond with valid JSON only."),
+            &consensus_models,
+        )
         .await;
     let consensus = ConsensusEngine::with_threshold(0.5).resolve_weighted(&votes);
     println!(
@@ -336,12 +350,8 @@ pub async fn handle_request(state: &AppState, path: &str, body: &str) -> Result<
 }"#;
 
     let old_source = workspace.get("src/api.rs").map(|s| s.as_str());
-    let delta = incremental_engine.process_delta(
-        "src/api.rs",
-        old_source,
-        modified_api,
-        &mut memory_graph,
-    );
+    let delta =
+        incremental_engine.process_delta("src/api.rs", old_source, modified_api, &mut memory_graph);
 
     workspace.insert("src/api.rs".into(), modified_api.into());
 
@@ -519,19 +529,12 @@ pub async fn handle_request(state: &AppState, path: &str, body: &str) -> Result<
         &session_id[..30.min(session_id.len())]
     );
     println!("║  Total Events: {:<30}║", event_log.event_count());
-    println!(
-        "║  Graph Nodes:  {:<30}║",
-        memory_graph.node_count()
-    );
-    println!(
-        "║  Graph Edges:  {:<30}║",
-        memory_graph.edge_count()
-    );
+    println!("║  Graph Nodes:  {:<30}║", memory_graph.node_count());
+    println!("║  Graph Edges:  {:<30}║", memory_graph.edge_count());
     println!(
         "║  Mutations:    {:<30}║",
         incremental_engine.total_mutations()
     );
     println!("║  Guard Status: {:<30}║", guard_status);
     println!("╚══════════════════════════════════════════════╝");
-
 }
