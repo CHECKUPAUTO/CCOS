@@ -495,7 +495,7 @@ impl ASTParser {
                 }
             }
         }
-        symbols.sort_by(|a, b| a.line.cmp(&b.line));
+        symbols.sort_by_key(|s| s.line);
         symbols
     }
 }

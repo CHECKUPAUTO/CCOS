@@ -340,12 +340,13 @@ impl ReplayHandler for GraphReconstructor {
                 weight,
                 edge_type,
             } => {
-                if self.graph.add_edge(
+                let added = self.graph.add_edge(
                     NodeId(source.clone()),
                     NodeId(target.clone()),
                     *weight,
                     edge_type.clone(),
-                ) {
+                );
+                if added {
                     self.edges_built += 1;
                 }
             }
