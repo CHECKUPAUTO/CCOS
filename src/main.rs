@@ -34,7 +34,10 @@ async fn main() {
         "analyze" => run_analyze(&AnalyzeOpts::parse(rest)),
         "verify" => run_verify(rest.first().map(String::as_str)),
         "replay" => run_replay(rest.first().map(String::as_str)),
-        "diff" => run_diff(rest.first().map(String::as_str), rest.get(1).map(String::as_str)),
+        "diff" => run_diff(
+            rest.first().map(String::as_str),
+            rest.get(1).map(String::as_str),
+        ),
         "failure" => run_failure(&FailureOpts::parse(rest)),
         "chaos" => run_chaos(&ChaosOpts::parse(rest)),
         // ── CCOS v0.3 — Autonomous Context Runtime ──────────────────
@@ -50,7 +53,6 @@ async fn main() {
     };
     std::process::exit(code);
 }
-
 
 /// Options for `ccos analyze`.
 struct AnalyzeOpts {
@@ -256,7 +258,11 @@ fn run_analyze(opts: &AnalyzeOpts) -> i32 {
             context.len()
         );
         for node in context.iter().take(10) {
-            println!("    {:<40} ({:?})", truncate(&node.label, 40), node.node_type);
+            println!(
+                "    {:<40} ({:?})",
+                truncate(&node.label, 40),
+                node.node_type
+            );
         }
     }
 
@@ -353,7 +359,12 @@ fn run_replay(file: Option<&str>) -> i32 {
             println!("  Replayed {n} events");
             println!(
                 "  Stats: {} llm · {} parse · {} graph · {} guard · {} failures · {} cycles",
-                s.llm_calls, s.parsing_events, s.graph_mutations, s.guard_checks, s.failures, s.cycles
+                s.llm_calls,
+                s.parsing_events,
+                s.graph_mutations,
+                s.guard_checks,
+                s.failures,
+                s.cycles
             );
         }
         Err(e) => {
@@ -577,7 +588,10 @@ impl ChaosOpts {
 /// core invariant: the guard must *never* emit non-JSON output.
 fn run_chaos(opts: &ChaosOpts) -> i32 {
     println!("╔══════════════════════════════════════════════╗");
-    println!("║  CCOS chaos — {:>5} iterations                ║", opts.iters);
+    println!(
+        "║  CCOS chaos — {:>5} iterations                ║",
+        opts.iters
+    );
     println!("╚══════════════════════════════════════════════╝\n");
 
     let guard = GuardLayer::new(GuardConfig::default());
@@ -590,7 +604,8 @@ fn run_chaos(opts: &ChaosOpts) -> i32 {
 
     let (mut passed, mut blocked, mut invalid_outputs) = (0u64, 0u64, 0u64);
     for i in 0..opts.iters {
-        let mut engine = AdversarialEngine::with_corruption_rate(modes[i % modes.len()].clone(), 0.9);
+        let mut engine =
+            AdversarialEngine::with_corruption_rate(modes[i % modes.len()].clone(), 0.9);
         let corrupted = engine.corrupt("{\"action\": \"analyze\", \"ok\": true}");
         let result = guard.validate_and_sanitize(&corrupted);
         if result.passed {

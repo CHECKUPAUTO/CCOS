@@ -15,7 +15,9 @@ use std::path::Path;
 use uuid::Uuid;
 
 fn positional(args: &[String]) -> Option<&str> {
-    args.iter().find(|a| !a.starts_with("--")).map(String::as_str)
+    args.iter()
+        .find(|a| !a.starts_with("--"))
+        .map(String::as_str)
 }
 
 fn flag_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
@@ -61,7 +63,12 @@ pub(crate) async fn run_scan(args: &[String]) -> i32 {
     println!("╔══════════════════════════════════════════════╗");
     println!("║  CCOS scan — {:<32}║", crate::truncate(path, 32));
     println!("╚══════════════════════════════════════════════╝\n");
-    println!("  Added / Modified / Removed: {} / {} / {}", delta.added.len(), delta.modified.len(), delta.removed.len());
+    println!(
+        "  Added / Modified / Removed: {} / {} / {}",
+        delta.added.len(),
+        delta.modified.len(),
+        delta.removed.len()
+    );
     println!("  Graph nodes:    {}", graph.node_count());
     println!("  Graph edges:    {}", graph.edge_count());
     println!("  Dangling edges: {}", graph.prune_dangling_edges());
@@ -123,9 +130,18 @@ pub(crate) fn run_benchmark(args: &[String]) -> i32 {
 
     println!("  Total time:        {:.3}s", report.total_seconds);
     println!("  Avg cycle:         {:.3} µs", report.avg_cycle_us);
-    println!("  Throughput:        {:.0} cycles/s", report.cycles_per_second);
-    println!("  Final nodes/edges: {} / {}", report.final_nodes, report.final_edges);
-    println!("  Peak nodes/edges:  {} / {}", report.peak_nodes, report.peak_edges);
+    println!(
+        "  Throughput:        {:.0} cycles/s",
+        report.cycles_per_second
+    );
+    println!(
+        "  Final nodes/edges: {} / {}",
+        report.final_nodes, report.final_edges
+    );
+    println!(
+        "  Peak nodes/edges:  {} / {}",
+        report.peak_nodes, report.peak_edges
+    );
     println!("  Node drift:        {}", report.node_drift);
     println!("  Dangling edges:    {} (must be 0)", report.dangling_edges);
 
@@ -171,8 +187,15 @@ pub(crate) async fn run_runtime(args: &[String]) -> i32 {
             return 1;
         }
     };
-    dist_log.append(format!("scan:{}", delta.changed_count()), "workspace".into());
-    println!("  [1/4] Scanned {path}: {} nodes, {} edges", graph.node_count(), graph.edge_count());
+    dist_log.append(
+        format!("scan:{}", delta.changed_count()),
+        "workspace".into(),
+    );
+    println!(
+        "  [1/4] Scanned {path}: {} nodes, {} edges",
+        graph.node_count(),
+        graph.edge_count()
+    );
 
     // 2. Page the context with the scheduler.
     let scheduler = ContextScheduler::from_graph(&graph, budget);
@@ -199,7 +222,10 @@ pub(crate) async fn run_runtime(args: &[String]) -> i32 {
     ];
     let results = executor.execute_all(&mut agents, &context, &mut event_log);
     for r in &results {
-        dist_log.append(format!("agent:{}:{:.2}", r.role.as_str(), r.confidence), "agent".into());
+        dist_log.append(
+            format!("agent:{}:{:.2}", r.role.as_str(), r.confidence),
+            "agent".into(),
+        );
     }
     println!("  [3/4] Ran {} agents over the HOT context", results.len());
 
@@ -210,7 +236,9 @@ pub(crate) async fn run_runtime(args: &[String]) -> i32 {
         eprintln!("ccos: failed to persist runtime: {e}");
         return 1;
     }
-    println!("  [4/4] Persisted runtime → {state_dir}/ (graph.snapshot, events.log, memory.snapshot)");
+    println!(
+        "  [4/4] Persisted runtime → {state_dir}/ (graph.snapshot, events.log, memory.snapshot)"
+    );
 
     // Verify the persisted state restores cleanly.
     match runtime.restore_runtime() {

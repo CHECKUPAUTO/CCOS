@@ -150,35 +150,30 @@ impl LlmClient {
             }
 
             match self.client.post(&endpoint).json(&request).send().await {
-                Ok(resp) => {
-                    match resp.json::<LlmResponse>().await {
-                        Ok(llm_resp) => {
-                            let latency = start.elapsed().as_millis() as u64;
-                            let guard_result = self.guard.validate_and_sanitize(&llm_resp.response);
+                Ok(resp) => match resp.json::<LlmResponse>().await {
+                    Ok(llm_resp) => {
+                        let latency = start.elapsed().as_millis() as u64;
+                        let guard_result = self.guard.validate_and_sanitize(&llm_resp.response);
 
-                            let response_hash = compute_hash(&guard_result.sanitized_output);
+                        let response_hash = compute_hash(&guard_result.sanitized_output);
 
-                            return ValidatedResponse {
-                                raw_response: llm_resp.response,
-                                sanitized_output: guard_result.sanitized_output,
-                                guard_passed: guard_result.passed,
-                                reliability_score: guard_result.reliability_score,
-                                guard_warnings: guard_result.warnings,
-                                model: model.to_string(),
-                                prompt_hash,
-                                response_hash,
-                                latency_ms: latency,
-                                is_fallback: false,
-                            };
-                        }
-                        Err(e) => {
-                            last_error = Some(format!(
-                                "Failed to parse response JSON: {}",
-                                e
-                            ));
-                        }
+                        return ValidatedResponse {
+                            raw_response: llm_resp.response,
+                            sanitized_output: guard_result.sanitized_output,
+                            guard_passed: guard_result.passed,
+                            reliability_score: guard_result.reliability_score,
+                            guard_warnings: guard_result.warnings,
+                            model: model.to_string(),
+                            prompt_hash,
+                            response_hash,
+                            latency_ms: latency,
+                            is_fallback: false,
+                        };
                     }
-                }
+                    Err(e) => {
+                        last_error = Some(format!("Failed to parse response JSON: {}", e));
+                    }
+                },
                 Err(e) => {
                     last_error = Some(format!("HTTP request failed: {}", e));
                 }
@@ -261,7 +256,6 @@ impl LlmClient {
             is_fallback: false,
         }
     }
-
 }
 
 #[cfg(test)]

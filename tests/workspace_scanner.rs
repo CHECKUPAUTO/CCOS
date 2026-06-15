@@ -38,7 +38,11 @@ async fn modifying_one_file_reparses_only_that_file() {
     let mutations0 = engine.total_mutations();
 
     // Modify only module.rs.
-    std::fs::write(dir.join("module.rs"), "pub fn a() {}\npub fn b() {}\nstruct M;").unwrap();
+    std::fs::write(
+        dir.join("module.rs"),
+        "pub fn a() {}\npub fn b() {}\nstruct M;",
+    )
+    .unwrap();
     let d1 = scanner.sync(&mut engine, &mut graph).await.unwrap();
 
     assert_eq!(d1.modified.len(), 1);
@@ -68,7 +72,11 @@ async fn chaos_file_deleted_is_handled_gracefully() {
     let d = scanner.sync(&mut engine, &mut graph).await.unwrap();
     assert_eq!(d.removed.len(), 1);
     assert!(graph.node_count() < before);
-    assert_eq!(graph.prune_dangling_edges(), 0, "no dangling edges after deletion");
+    assert_eq!(
+        graph.prune_dangling_edges(),
+        0,
+        "no dangling edges after deletion"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }

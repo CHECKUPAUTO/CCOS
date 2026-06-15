@@ -195,12 +195,13 @@ mod tests {
             report.final_nodes <= 150,
             "nodes must respect the paging cap"
         );
-        assert!(
-            report.peak_nodes <= 150 + 8,
-            "peak nodes must stay bounded"
-        );
+        assert!(report.peak_nodes <= 150 + 8, "peak nodes must stay bounded");
         // Bounded system: node count must not drift significantly.
-        assert!(report.node_drift.abs() <= 32, "node drift {} too large", report.node_drift);
+        assert!(
+            report.node_drift.abs() <= 32,
+            "node drift {} too large",
+            report.node_drift
+        );
         assert!(report.cycles_per_second > 0.0);
     }
 

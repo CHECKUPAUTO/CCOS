@@ -1,5 +1,5 @@
 use ccos::{
-    event_log::{EventLog, EventPayload, EventType, EventReplayer},
+    event_log::{EventLog, EventPayload, EventReplayer, EventType},
     guard::{GuardConfig, GuardLayer},
     incremental::IncrementalGraphEngine,
     memory::{MemoryGraph, NodeId, NodeType},
@@ -110,13 +110,9 @@ fn phase3_mutation_simulation() {
     engine.process_delta("src/sorter.rs", None, old_source, &mut graph);
     let nodes_before = graph.node_count();
 
-    let new_source = "mod utils;\nuse auth::validate;\npub fn sort<T: Ord>(data: &mut [T]) { data.sort(); }";
-    let delta = engine.process_delta(
-        "src/sorter.rs",
-        Some(old_source),
-        new_source,
-        &mut graph,
-    );
+    let new_source =
+        "mod utils;\nuse auth::validate;\npub fn sort<T: Ord>(data: &mut [T]) { data.sort(); }";
+    let delta = engine.process_delta("src/sorter.rs", Some(old_source), new_source, &mut graph);
 
     // O(Δ) assertions
     assert_ne!(
@@ -124,9 +120,13 @@ fn phase3_mutation_simulation() {
         ccos::incremental::MutationOp::NoChange,
         "must detect modification"
     );
-    assert!(delta.nodes_added > 0 || graph.node_count() > nodes_before,
+    assert!(
+        delta.nodes_added > 0 || graph.node_count() > nodes_before,
         "graph must reflect the delta: nodes_before={} nodes_after={} delta_added={}",
-        nodes_before, graph.node_count(), delta.nodes_added);
+        nodes_before,
+        graph.node_count(),
+        delta.nodes_added
+    );
 
     // Verify old nodes evicted before new ones added
     let total_mutations = engine.total_mutations();
@@ -163,10 +163,16 @@ fn phase4_failure_propagation() {
 
     // Assertions
     let sorter = graph.nodes.get(&"src/sorter.rs".into()).unwrap();
-    assert!(sorter.failure_relevance > 0.0, "sorter must have failure relevance");
+    assert!(
+        sorter.failure_relevance > 0.0,
+        "sorter must have failure relevance"
+    );
 
     let logger = graph.nodes.get(&"src/logger.rs".into()).unwrap();
-    assert!(logger.failure_relevance > 0.0, "logger must be impacted by propagation");
+    assert!(
+        logger.failure_relevance > 0.0,
+        "logger must be impacted by propagation"
+    );
 
     // Score decay: sorter should have higher failure relevance than logger
     assert!(
@@ -288,9 +294,18 @@ fn phase6_deterministic_replay() {
     let count2 = result2.unwrap();
 
     assert_eq!(count1, count2, "replay must be deterministic");
-    assert_eq!(replayer1.statistics.total_events, replayer2.statistics.total_events);
-    assert_eq!(replayer1.statistics.parsing_events, replayer2.statistics.parsing_events);
-    assert_eq!(replayer1.statistics.graph_mutations, replayer2.statistics.graph_mutations);
+    assert_eq!(
+        replayer1.statistics.total_events,
+        replayer2.statistics.total_events
+    );
+    assert_eq!(
+        replayer1.statistics.parsing_events,
+        replayer2.statistics.parsing_events
+    );
+    assert_eq!(
+        replayer1.statistics.graph_mutations,
+        replayer2.statistics.graph_mutations
+    );
     assert_eq!(replayer1.statistics.failures, replayer2.statistics.failures);
 }
 
@@ -369,7 +384,10 @@ fn phase9_memory_paging() {
     }
 
     graph.enforce_paging();
-    assert!(graph.node_count() <= 20, "paging must limit nodes to max_in_memory");
+    assert!(
+        graph.node_count() <= 20,
+        "paging must limit nodes to max_in_memory"
+    );
 
     // Insert high-importance nodes that should survive
     for i in 100..110 {
@@ -414,11 +432,14 @@ fn phase10_multicycle_stability() {
             },
         );
 
-        let source = base.replace("{}", &cycle.to_string())
+        let source = base
+            .replace("{}", &cycle.to_string())
             .replace("{}", &cycle.to_string());
         let old = if cycle > 0 {
-            Some(base.replace("{}", &(cycle - 1).to_string())
-                .replace("{}", &(cycle - 1).to_string()))
+            Some(
+                base.replace("{}", &(cycle - 1).to_string())
+                    .replace("{}", &(cycle - 1).to_string()),
+            )
         } else {
             None
         };
@@ -480,9 +501,24 @@ fn phase12_graph_connectivity() {
     graph.upsert_node("c".into(), "C".into(), "".into(), NodeType::Module);
     graph.upsert_node("d".into(), "D".into(), "".into(), NodeType::Module);
 
-    graph.add_edge("a".into(), "b".into(), 0.9, ccos::memory::EdgeType::DependsOn);
-    graph.add_edge("b".into(), "c".into(), 0.9, ccos::memory::EdgeType::DependsOn);
-    graph.add_edge("c".into(), "d".into(), 0.9, ccos::memory::EdgeType::DependsOn);
+    graph.add_edge(
+        "a".into(),
+        "b".into(),
+        0.9,
+        ccos::memory::EdgeType::DependsOn,
+    );
+    graph.add_edge(
+        "b".into(),
+        "c".into(),
+        0.9,
+        ccos::memory::EdgeType::DependsOn,
+    );
+    graph.add_edge(
+        "c".into(),
+        "d".into(),
+        0.9,
+        ccos::memory::EdgeType::DependsOn,
+    );
 
     // Failure at 'a' should propagate through entire chain
     graph.set_failure_relevance(&"a".into(), 1.0);
@@ -496,7 +532,10 @@ fn phase12_graph_connectivity() {
     assert!(a.failure_relevance > b.failure_relevance);
     assert!(b.failure_relevance >= c.failure_relevance);
     assert!(c.failure_relevance >= d.failure_relevance);
-    assert!(d.failure_relevance > 0.0, "chain end must still be affected");
+    assert!(
+        d.failure_relevance > 0.0,
+        "chain end must still be affected"
+    );
 }
 
 // ── Phase 13: Incremental Engine No Full Rebuild O(Δ) ─────────────
@@ -508,12 +547,7 @@ fn phase13_incremental_no_full_rebuild() {
     // Build large graph
     for i in 0..20 {
         let source = format!("mod mod_{};\nuse dep_{}::lib;\nfn func_{}() {{}}", i, i, i);
-        engine.process_delta(
-            &format!("file_{}.rs", i),
-            None,
-            &source,
-            &mut graph,
-        );
+        engine.process_delta(&format!("file_{}.rs", i), None, &source, &mut graph);
     }
 
     let nodes_before = graph.node_count();
@@ -522,12 +556,7 @@ fn phase13_incremental_no_full_rebuild() {
     // Modify only ONE file
     let modified = "mod mod_5;\nuse dep_5::lib;\nuse dep_extra::lib;\nfn func_5() { let x = 1; }";
     let original = "mod mod_5;\nuse dep_5::lib;\nfn func_5() {}";
-    let delta = engine.process_delta(
-        "file_5.rs",
-        Some(original),
-        modified,
-        &mut graph,
-    );
+    let delta = engine.process_delta("file_5.rs", Some(original), modified, &mut graph);
 
     // O(Δ): only file_5 and its immediate dependencies should change
     // The delta should NOT rebuild the entire graph
@@ -551,7 +580,12 @@ fn phase14_context_window_selection() {
     // Create nodes with varying scores
     for i in 0..30 {
         let id = NodeId(format!("ctx_{}", i));
-        graph.upsert_node(id.clone(), format!("Ctx{}", i), "data".into(), NodeType::ContextBlock);
+        graph.upsert_node(
+            id.clone(),
+            format!("Ctx{}", i),
+            "data".into(),
+            NodeType::ContextBlock,
+        );
         if let Some(node) = graph.nodes.get_mut(&id) {
             node.base_importance = (i as f64) / 60.0;
             node.recency = if i < 10 { 1.0 } else { 0.1 };
@@ -568,6 +602,9 @@ fn phase14_context_window_selection() {
     if context.len() >= 2 {
         let score0 = graph.compute_node_score(context[0]);
         let score1 = graph.compute_node_score(context[1]);
-        assert!(score0 >= score1, "context must be sorted by descending score");
+        assert!(
+            score0 >= score1,
+            "context must be sorted by descending score"
+        );
     }
 }

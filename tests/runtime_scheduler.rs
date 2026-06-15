@@ -26,8 +26,9 @@ fn schedules_real_graph_within_budget() {
     // HOT tier must fit the budget...
     assert!(scheduler.hot_token_usage() <= 256);
     // ...and every node lands in exactly one zone (nothing lost).
-    let zoned =
-        scheduler.hot_context().len() + scheduler.warm_context().len() + scheduler.cold_context().len();
+    let zoned = scheduler.hot_context().len()
+        + scheduler.warm_context().len()
+        + scheduler.cold_context().len();
     assert_eq!(zoned, scheduler.len());
     assert_eq!(scheduler.len(), graph.node_count());
 }

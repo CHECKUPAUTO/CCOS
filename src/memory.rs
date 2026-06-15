@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
-use std::collections::{BinaryHeap, HashMap};
 use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeId(pub String);
@@ -23,8 +23,7 @@ impl std::fmt::Display for NodeId {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GraphNode {
     pub id: NodeId,
     pub label: String,
@@ -128,7 +127,13 @@ impl MemoryGraph {
         self.enforce_paging();
     }
 
-    pub fn add_edge(&mut self, source: NodeId, target: NodeId, weight: f64, edge_type: EdgeType) -> bool {
+    pub fn add_edge(
+        &mut self,
+        source: NodeId,
+        target: NodeId,
+        weight: f64,
+        edge_type: EdgeType,
+    ) -> bool {
         // Refuse to create dangling edges: both endpoints must already exist as
         // nodes. This preserves the invariant `edges ⊆ nodes × nodes`, which
         // bounds the edge set and keeps the graph consistent when paging evicts
@@ -139,9 +144,10 @@ impl MemoryGraph {
         }
         let now = self.clock;
         // Avoid duplicate edges
-        let already_exists = self.edges.iter().any(|e| {
-            e.source == source && e.target == target && e.edge_type == edge_type
-        });
+        let already_exists = self
+            .edges
+            .iter()
+            .any(|e| e.source == source && e.target == target && e.edge_type == edge_type);
         if already_exists {
             return false;
         }
@@ -289,8 +295,7 @@ impl MemoryGraph {
         for (target, weight) in targets {
             let propagation = base_value * weight * 0.8_f64.powi(depth as i32);
             if let Some(node) = self.nodes.get_mut(&target) {
-                node.failure_relevance =
-                    (node.failure_relevance + propagation).clamp(0.0, 1.0);
+                node.failure_relevance = (node.failure_relevance + propagation).clamp(0.0, 1.0);
                 node.recency = 1.0;
                 node.last_accessed = self.clock;
             }
@@ -414,8 +419,11 @@ impl MemoryGraph {
             connected.insert(&e.source);
             connected.insert(&e.target);
         }
-        let mut orphans: Vec<&NodeId> =
-            self.nodes.keys().filter(|id| !connected.contains(id)).collect();
+        let mut orphans: Vec<&NodeId> = self
+            .nodes
+            .keys()
+            .filter(|id| !connected.contains(id))
+            .collect();
         orphans.sort();
         orphans
     }

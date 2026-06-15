@@ -1,6 +1,6 @@
 //! # Context Scheduler (CCOS v0.3)
 //!
-//! Turns the [`MemoryGraph`](crate::memory::MemoryGraph) into a *paged* context
+//! Turns the [`MemoryGraph`] into a *paged* context
 //! memory. Every node is placed in one of three zones by priority and a
 //! configurable **token budget**:
 //!
@@ -81,7 +81,8 @@ impl ContextScheduler {
     pub fn from_graph(graph: &MemoryGraph, token_budget: usize) -> Self {
         let mut scheduler = Self::new(token_budget);
         for (id, node) in &graph.nodes {
-            let token_cost = Self::estimate_tokens(&node.content) + Self::estimate_tokens(&node.label);
+            let token_cost =
+                Self::estimate_tokens(&node.content) + Self::estimate_tokens(&node.label);
             scheduler.nodes.insert(
                 id.clone(),
                 ScheduledNode {

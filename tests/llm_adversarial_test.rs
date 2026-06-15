@@ -114,7 +114,10 @@ fn adversarial_empty_response_blocked() {
     assert_eq!(result.reliability_score, 0.0);
 
     let whitespace_result = guard.validate_and_sanitize("   \n\t  ");
-    assert!(!whitespace_result.passed, "whitespace-only response must be blocked");
+    assert!(
+        !whitespace_result.passed,
+        "whitespace-only response must be blocked"
+    );
 }
 
 // ── Test 6: Control character injection ────────────────────────
@@ -177,7 +180,7 @@ fn adversarial_unicode_homoglyphs() {
     let guard = make_guard();
 
     // Unicode lookalike characters that resemble JSON delimiters
-    let homoglyph = "｛\"key\": \"value\"｝";  // Fullwidth braces
+    let homoglyph = "｛\"key\": \"value\"｝"; // Fullwidth braces
     let result = guard.validate_and_sanitize(homoglyph);
 
     // These are NOT valid JSON (invalid braces) so should be blocked
@@ -208,7 +211,10 @@ fn adversarial_large_input_truncated() {
 fn adversarial_fallback_always_valid() {
     let fallback = GuardLayer::fallback_response();
     let parsed: Result<Value, _> = serde_json::from_str(&fallback);
-    assert!(parsed.is_ok(), "fallback response must always be valid JSON");
+    assert!(
+        parsed.is_ok(),
+        "fallback response must always be valid JSON"
+    );
 
     let obj = parsed.unwrap();
     assert_eq!(obj["status"], "fallback");
@@ -250,14 +256,19 @@ fn adversarial_rapid_succession() {
     for (input, expected_pass) in &attacks {
         let result = guard.validate_and_sanitize(input);
         assert_eq!(
-            result.passed, *expected_pass,
+            result.passed,
+            *expected_pass,
             "adversarial input '{}': expected pass={}, got pass={}",
-            &input[..input.len().min(40)], expected_pass, result.passed
+            &input[..input.len().min(40)],
+            expected_pass,
+            result.passed
         );
     }
 
     // After all attacks, fallback must still be valid
     let fallback = GuardLayer::fallback_response();
-    assert!(serde_json::from_str::<Value>(&fallback).is_ok(),
-        "fallback must remain valid after all attacks");
+    assert!(
+        serde_json::from_str::<Value>(&fallback).is_ok(),
+        "fallback must remain valid after all attacks"
+    );
 }

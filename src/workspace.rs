@@ -79,7 +79,7 @@ impl WorkspaceScanner {
         Ok(delta)
     }
 
-    /// Alias of [`scan_workspace`](Self::scan_workspace) — the delta since the
+    /// Alias of [`Self::scan_workspace`] — the delta since the
     /// last scan.
     pub async fn update_delta(&mut self) -> Result<WorkspaceDelta, WorkspaceError> {
         self.scan_workspace().await
@@ -306,7 +306,9 @@ mod tests {
         std::fs::write(dir.join("a.rs"), "fn a() {}\nfn b() {}").unwrap();
         let mut changed = 0usize;
         let events = scanner
-            .watch_changes(Duration::from_millis(1), 3, |d| changed += d.changed_count())
+            .watch_changes(Duration::from_millis(1), 3, |d| {
+                changed += d.changed_count()
+            })
             .await
             .unwrap();
         assert!(events >= 1, "watch_changes must observe the modification");
@@ -331,8 +333,15 @@ mod tests {
         std::fs::remove_file(dir.join("a.rs")).unwrap();
         let d = scanner.sync(&mut engine, &mut graph).await.unwrap();
         assert_eq!(d.removed.len(), 1);
-        assert!(graph.node_count() < before, "removed file's nodes must be evicted");
-        assert_eq!(graph.prune_dangling_edges(), 0, "no dangling edges after removal");
+        assert!(
+            graph.node_count() < before,
+            "removed file's nodes must be evicted"
+        );
+        assert_eq!(
+            graph.prune_dangling_edges(),
+            0,
+            "no dangling edges after removal"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

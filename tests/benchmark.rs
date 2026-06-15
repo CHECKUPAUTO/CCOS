@@ -8,9 +8,16 @@ fn stress_100k_cycles_stays_bounded() {
     let report = BenchmarkHarness::new().with_paging_cap(200).run(100_000);
 
     assert_eq!(report.cycles, 100_000);
-    assert_eq!(report.dangling_edges, 0, "no dangling edges over 100k cycles");
+    assert_eq!(
+        report.dangling_edges, 0,
+        "no dangling edges over 100k cycles"
+    );
     assert!(report.final_nodes <= 200, "nodes bounded by paging cap");
-    assert!(report.peak_nodes <= 220, "peak {} unbounded", report.peak_nodes);
+    assert!(
+        report.peak_nodes <= 220,
+        "peak {} unbounded",
+        report.peak_nodes
+    );
     assert!(
         report.node_drift.abs() <= 32,
         "node drift {} indicates a leak",

@@ -210,7 +210,8 @@ mod tests {
         log.append("original".into(), "test".into());
 
         // Tamper with the stored hash
-        log.hash_chain[0].hash = "0000000000000000000000000000000000000000000000000000000000000000".into();
+        log.hash_chain[0].hash =
+            "0000000000000000000000000000000000000000000000000000000000000000".into();
 
         let report = log.verify_integrity();
         assert!(!report.valid);

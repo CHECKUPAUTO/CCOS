@@ -99,7 +99,11 @@ impl ConsensusEngine {
 
         let (best_output, (weighted_score, models)) = score_map
             .into_iter()
-            .max_by(|a, b| a.1 .0.partial_cmp(&b.1 .0).unwrap_or(std::cmp::Ordering::Equal))
+            .max_by(|a, b| {
+                a.1 .0
+                    .partial_cmp(&b.1 .0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
             .unwrap_or_else(|| (String::from("NO_CONSENSUS"), (0.0, vec![])));
 
         let total_confidence: f64 = votes.iter().map(|v| v.confidence.max(0.0)).sum();
@@ -134,9 +138,21 @@ mod tests {
     #[test]
     fn test_consensus_selects_majority() {
         let votes = vec![
-            LlmVote { model: "a".into(), output: "X".into(), confidence: 0.9 },
-            LlmVote { model: "b".into(), output: "X".into(), confidence: 0.8 },
-            LlmVote { model: "c".into(), output: "Y".into(), confidence: 0.7 },
+            LlmVote {
+                model: "a".into(),
+                output: "X".into(),
+                confidence: 0.9,
+            },
+            LlmVote {
+                model: "b".into(),
+                output: "X".into(),
+                confidence: 0.8,
+            },
+            LlmVote {
+                model: "c".into(),
+                output: "Y".into(),
+                confidence: 0.7,
+            },
         ];
 
         let engine = ConsensusEngine::new();
@@ -149,9 +165,21 @@ mod tests {
     #[test]
     fn test_consensus_no_majority() {
         let votes = vec![
-            LlmVote { model: "a".into(), output: "A".into(), confidence: 0.9 },
-            LlmVote { model: "b".into(), output: "B".into(), confidence: 0.8 },
-            LlmVote { model: "c".into(), output: "C".into(), confidence: 0.7 },
+            LlmVote {
+                model: "a".into(),
+                output: "A".into(),
+                confidence: 0.9,
+            },
+            LlmVote {
+                model: "b".into(),
+                output: "B".into(),
+                confidence: 0.8,
+            },
+            LlmVote {
+                model: "c".into(),
+                output: "C".into(),
+                confidence: 0.7,
+            },
         ];
 
         let engine = ConsensusEngine::new();
@@ -171,9 +199,21 @@ mod tests {
     #[test]
     fn test_weighted_consensus_favors_high_confidence() {
         let votes = vec![
-            LlmVote { model: "a".into(), output: "X".into(), confidence: 0.95 },
-            LlmVote { model: "b".into(), output: "Y".into(), confidence: 0.2 },
-            LlmVote { model: "c".into(), output: "Y".into(), confidence: 0.3 },
+            LlmVote {
+                model: "a".into(),
+                output: "X".into(),
+                confidence: 0.95,
+            },
+            LlmVote {
+                model: "b".into(),
+                output: "Y".into(),
+                confidence: 0.2,
+            },
+            LlmVote {
+                model: "c".into(),
+                output: "Y".into(),
+                confidence: 0.3,
+            },
         ];
 
         let engine = ConsensusEngine::new();
@@ -186,14 +226,29 @@ mod tests {
     #[test]
     fn test_high_threshold_requires_strong_agreement() {
         let votes = vec![
-            LlmVote { model: "a".into(), output: "X".into(), confidence: 0.9 },
-            LlmVote { model: "b".into(), output: "X".into(), confidence: 0.8 },
-            LlmVote { model: "c".into(), output: "Y".into(), confidence: 0.7 },
+            LlmVote {
+                model: "a".into(),
+                output: "X".into(),
+                confidence: 0.9,
+            },
+            LlmVote {
+                model: "b".into(),
+                output: "X".into(),
+                confidence: 0.8,
+            },
+            LlmVote {
+                model: "c".into(),
+                output: "Y".into(),
+                confidence: 0.7,
+            },
         ];
 
         // 2/3 = 0.66 — with threshold 0.8 this should NOT reach consensus
         let engine = ConsensusEngine::with_threshold(0.8);
         let result = engine.resolve(&votes);
-        assert!(!result.consensus_reached, "2/3 majority must not reach 0.8 threshold");
+        assert!(
+            !result.consensus_reached,
+            "2/3 majority must not reach 0.8 threshold"
+        );
     }
 }

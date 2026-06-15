@@ -63,7 +63,12 @@ mod tests {
         let mut graph = MemoryGraph::default();
         graph.upsert_node("a".into(), "A".into(), "x".into(), NodeType::Module);
         graph.upsert_node("b".into(), "B".into(), "y".into(), NodeType::Symbol);
-        graph.add_edge("a".into(), "b".into(), 0.9, crate::memory::EdgeType::DependsOn);
+        graph.add_edge(
+            "a".into(),
+            "b".into(),
+            0.9,
+            crate::memory::EdgeType::DependsOn,
+        );
 
         let mut event_log = EventLog::new("persist-test".into());
         event_log.append(
