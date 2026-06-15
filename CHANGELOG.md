@@ -8,6 +8,11 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Optional `syn`-based AST parser** behind the `syn-parser` feature (ROADMAP
+  P0.1): accurate parsing of nested-module bodies, multi-line signatures, grouped
+  `use` and impl methods, with the zero-dependency line-based parser as the
+  fallback (used when the feature is off or a file does not parse). CI lints
+  (`--all-features`) and tests both paths.
 - **Graph inspection commands** backed by a new read-only `query` module:
   - `ccos top <path> [--limit N] [--json]` — the hottest nodes by causal score
     (the working set the kernel would page in first).
@@ -21,6 +26,10 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - New docs: [`docs/USAGE.md`](docs/USAGE.md) (full command reference, end-to-end
   walkthrough, troubleshooting FAQ), [`CONTRIBUTING.md`](CONTRIBUTING.md), and
   this changelog.
+- Annotated research **bibliography** ([`docs/BIBLIOGRAPHY.md`](docs/BIBLIOGRAPHY.md))
+  — ~60 web-verified papers across 12 themes, each mapped to a CCOS module
+  (context paging, causal graph, agents, guard/consensus/adversarial, hash-chained
+  log & failure propagation).
 
 ### Changed
 

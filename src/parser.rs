@@ -61,10 +61,7 @@ impl ASTParser {
 
     pub fn parse_source(&self, file_path: &str, source_code: &str) -> ParseResult {
         let hash = Self::compute_hash(source_code);
-
-        let modules = Self::extract_modules(source_code);
-        let use_statements = Self::extract_uses(source_code);
-        let symbols = Self::extract_symbols(source_code);
+        let (modules, use_statements, symbols) = Self::extract_all(source_code);
 
         ParseResult {
             file_path: file_path.to_string(),
@@ -75,6 +72,26 @@ impl ASTParser {
             use_statements,
             symbols,
         }
+    }
+
+    /// Extract modules / `use` statements / symbols from source.
+    ///
+    /// With the `syn-parser` feature enabled, this parses a real Rust AST (which
+    /// captures nested-module bodies, multi-line signatures, grouped `use` and
+    /// impl methods). If the feature is off — or the source does not parse as
+    /// valid Rust — it falls back to the zero-dependency line-based heuristic.
+    fn extract_all(source: &str) -> (Vec<ModuleDecl>, Vec<UseStatement>, Vec<Symbol>) {
+        #[cfg(feature = "syn-parser")]
+        {
+            if let Some(parsed) = syn_ast::parse(source) {
+                return parsed;
+            }
+        }
+        (
+            Self::extract_modules(source),
+            Self::extract_uses(source),
+            Self::extract_symbols(source),
+        )
     }
 
     pub fn update_memory_graph(&self, result: &ParseResult, graph: &mut MemoryGraph) {
@@ -546,6 +563,138 @@ impl Default for ASTParser {
     }
 }
 
+/// Real-AST parsing via `syn` (enabled by the `syn-parser` feature). Produces
+/// the same `(modules, uses, symbols)` triple as the heuristic parser, but
+/// accurately: it descends into nested-module bodies and impl blocks, expands
+/// grouped `use` trees, handles multi-line signatures, and ignores comments
+/// natively. Returns `None` on a syntax error so the caller can fall back.
+#[cfg(feature = "syn-parser")]
+mod syn_ast {
+    use super::{ModuleDecl, Symbol, SymbolKind, UseStatement};
+    use proc_macro2::Span;
+    use syn::spanned::Spanned;
+
+    pub fn parse(source: &str) -> Option<(Vec<ModuleDecl>, Vec<UseStatement>, Vec<Symbol>)> {
+        let file = syn::parse_file(source).ok()?;
+        let mut out = Collected::default();
+        walk(&file.items, &mut out);
+        Some((out.modules, out.uses, out.symbols))
+    }
+
+    #[derive(Default)]
+    struct Collected {
+        modules: Vec<ModuleDecl>,
+        uses: Vec<UseStatement>,
+        symbols: Vec<Symbol>,
+    }
+
+    /// 1-based source line; the `span-locations` feature guarantees real spans.
+    fn line_of(span: Span) -> usize {
+        span.start().line
+    }
+
+    fn is_pub(vis: &syn::Visibility) -> bool {
+        matches!(vis, syn::Visibility::Public(_))
+    }
+
+    fn push_sym(out: &mut Collected, ident: &syn::Ident, kind: SymbolKind) {
+        out.symbols.push(Symbol {
+            name: ident.to_string(),
+            line: line_of(ident.span()),
+            kind,
+        });
+    }
+
+    /// Walk a list of items at one scope. Nested modules become `children` of
+    /// their parent; symbols and `use`s from nested scopes are surfaced into the
+    /// flat lists (matching the line parser, which sees every line).
+    fn walk(items: &[syn::Item], out: &mut Collected) {
+        for item in items {
+            match item {
+                syn::Item::Mod(m) => {
+                    let mut child = Collected::default();
+                    if let Some((_, inner)) = &m.content {
+                        walk(inner, &mut child);
+                    }
+                    out.uses.append(&mut child.uses);
+                    out.symbols.append(&mut child.symbols);
+                    out.modules.push(ModuleDecl {
+                        name: m.ident.to_string(),
+                        line: line_of(m.ident.span()),
+                        is_public: is_pub(&m.vis),
+                        children: child.modules,
+                    });
+                }
+                syn::Item::Use(u) => {
+                    flatten_use(&u.tree, String::new(), line_of(u.span()), &mut out.uses);
+                }
+                syn::Item::Fn(f) => push_sym(out, &f.sig.ident, SymbolKind::Function),
+                syn::Item::Struct(s) => push_sym(out, &s.ident, SymbolKind::Struct),
+                syn::Item::Enum(e) => push_sym(out, &e.ident, SymbolKind::Enum),
+                syn::Item::Trait(t) => {
+                    push_sym(out, &t.ident, SymbolKind::Trait);
+                    for ti in &t.items {
+                        if let syn::TraitItem::Fn(method) = ti {
+                            push_sym(out, &method.sig.ident, SymbolKind::Function);
+                        }
+                    }
+                }
+                syn::Item::Const(c) => push_sym(out, &c.ident, SymbolKind::Const),
+                syn::Item::Static(s) => push_sym(out, &s.ident, SymbolKind::Static),
+                syn::Item::Type(t) => push_sym(out, &t.ident, SymbolKind::Type),
+                syn::Item::Macro(m) => {
+                    if let Some(ident) = &m.ident {
+                        push_sym(out, ident, SymbolKind::Macro);
+                    }
+                }
+                syn::Item::Impl(i) => {
+                    for ii in &i.items {
+                        if let syn::ImplItem::Fn(method) = ii {
+                            push_sym(out, &method.sig.ident, SymbolKind::Function);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Expand a (possibly grouped) `use` tree into one `UseStatement` per leaf
+    /// path, e.g. `use a::{b, c::d}` → `a::b` and `a::c::d`.
+    fn flatten_use(tree: &syn::UseTree, prefix: String, line: usize, out: &mut Vec<UseStatement>) {
+        let join = |p: &str, s: &str| {
+            if p.is_empty() {
+                s.to_string()
+            } else {
+                format!("{p}::{s}")
+            }
+        };
+        match tree {
+            syn::UseTree::Path(p) => {
+                flatten_use(&p.tree, join(&prefix, &p.ident.to_string()), line, out)
+            }
+            syn::UseTree::Name(n) => push_use(join(&prefix, &n.ident.to_string()), line, out),
+            syn::UseTree::Rename(r) => push_use(join(&prefix, &r.ident.to_string()), line, out),
+            syn::UseTree::Glob(_) => push_use(join(&prefix, "*"), line, out),
+            syn::UseTree::Group(g) => {
+                for t in &g.items {
+                    flatten_use(t, prefix.clone(), line, out);
+                }
+            }
+        }
+    }
+
+    fn push_use(full_path: String, line: usize, out: &mut Vec<UseStatement>) {
+        let components: Vec<String> = full_path.split("::").map(str::to_string).collect();
+        out.push(UseStatement {
+            full_path,
+            line,
+            is_import: true,
+            components,
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -640,5 +789,86 @@ mod tests {
         let mut graph = MemoryGraph::default();
         parser.update_memory_graph(&result, &mut graph);
         assert!(graph.node_count() > 3);
+    }
+}
+
+/// Tests exercising the real-AST path (only compiled with `--features syn-parser`).
+#[cfg(all(test, feature = "syn-parser"))]
+mod syn_tests {
+    use super::*;
+
+    #[test]
+    fn syn_captures_nested_module_tree() {
+        let src = "pub mod outer { mod inner { fn deep() {} } }";
+        let r = ASTParser::new().parse_source("t.rs", src);
+        let outer = r
+            .modules
+            .iter()
+            .find(|m| m.name == "outer")
+            .expect("outer module");
+        assert!(outer.is_public);
+        assert!(
+            outer.children.iter().any(|c| c.name == "inner"),
+            "nested module must be a child (heuristic parser cannot do this)"
+        );
+        // The deeply-nested function is still surfaced into the flat symbol list.
+        assert!(r.symbols.iter().any(|s| s.name == "deep"));
+    }
+
+    #[test]
+    fn syn_captures_multiline_signature() {
+        // The `fn` line does not end in `{`, so the line parser would miss it.
+        let src = "fn wide(\n    a: i32,\n    b: i32,\n) -> i32 {\n    a + b\n}";
+        let r = ASTParser::new().parse_source("t.rs", src);
+        assert!(r
+            .symbols
+            .iter()
+            .any(|s| s.name == "wide" && s.kind == SymbolKind::Function));
+    }
+
+    #[test]
+    fn syn_expands_grouped_use() {
+        let src = "use std::collections::{HashMap, HashSet};";
+        let r = ASTParser::new().parse_source("t.rs", src);
+        let paths: Vec<&str> = r
+            .use_statements
+            .iter()
+            .map(|u| u.full_path.as_str())
+            .collect();
+        assert!(paths.contains(&"std::collections::HashMap"));
+        assert!(paths.contains(&"std::collections::HashSet"));
+    }
+
+    #[test]
+    fn syn_captures_impl_methods() {
+        let src = "struct S;\nimpl S {\n    fn a(&self) {}\n    fn b(&self) {}\n}";
+        let r = ASTParser::new().parse_source("t.rs", src);
+        assert!(r
+            .symbols
+            .iter()
+            .any(|s| s.name == "S" && s.kind == SymbolKind::Struct));
+        assert!(r
+            .symbols
+            .iter()
+            .any(|s| s.name == "a" && s.kind == SymbolKind::Function));
+        assert!(r.symbols.iter().any(|s| s.name == "b"));
+    }
+
+    #[test]
+    fn syn_falls_back_on_invalid_syntax() {
+        // Not valid Rust → syn returns None → heuristic parser handles it, no panic.
+        let src = "fn broken( this is not rust {{{";
+        let r = ASTParser::new().parse_source("t.rs", src);
+        // Should not panic; result is whatever the heuristic produced.
+        let _ = r.symbols.len();
+    }
+
+    #[test]
+    fn syn_ignores_commented_out_code() {
+        let src = "fn real() {}\n// fn commented() {}\n/* fn blocked() {} */";
+        let r = ASTParser::new().parse_source("t.rs", src);
+        assert!(r.symbols.iter().any(|s| s.name == "real"));
+        assert!(!r.symbols.iter().any(|s| s.name == "commented"));
+        assert!(!r.symbols.iter().any(|s| s.name == "blocked"));
     }
 }

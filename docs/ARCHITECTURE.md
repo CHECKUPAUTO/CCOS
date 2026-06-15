@@ -7,7 +7,7 @@ A practical map of the codebase for contributors. For the conceptual write-up se
 
 | Module                      | Responsibility | Key types |
 | --------------------------- | -------------- | --------- |
-| `parser`                    | Line-based extraction of modules / `use` / symbols from Rust source | `ASTParser`, `ParseResult`, `Symbol`, `SymbolKind` |
+| `parser`                    | Modules / `use` / symbols from Rust source — line-based heuristic, or a real `syn` AST behind the `syn-parser` feature | `ASTParser`, `ParseResult`, `Symbol`, `SymbolKind` |
 | `memory`                    | The causal graph: scoring, paging, failure propagation, analytics | `MemoryGraph`, `GraphNode`, `GraphEdge`, `NodeId`, `NodeType`, `EdgeType` |
 | `incremental`               | `O(Δ)` graph maintenance on file edits | `IncrementalGraphEngine`, `DeltaMutation`, `MutationOp`, `FileState` |
 | `event_log`                 | Append-only event log, deterministic replay & graph reconstruction | `EventLog`, `TraceEvent`, `EventType`, `EventPayload`, `EventReplayer`, `GraphReconstructor` |
@@ -106,7 +106,7 @@ or loaded from a snapshot (`blame`, `export`):
 
 ```bash
 cargo build --all-targets
-cargo test                    # 165 unit + integration tests
+cargo test                    # 165 tests (171 with --features syn-parser)
 cargo clippy --all-targets    # warning-clean (CI denies warnings)
 cargo doc --open              # rendered module docs
 ```

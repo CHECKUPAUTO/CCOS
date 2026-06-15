@@ -13,6 +13,18 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 rand = "0.8"
 
+# Optional real-AST parser (ROADMAP P0.1). With the `syn-parser` feature, the
+# `parser` module uses `syn` for accurate parsing (nested-module bodies,
+# multi-line signatures, grouped `use`, impl methods); without it the
+# zero-dependency line-based heuristic parser is used. `proc-macro2`'s
+# span-locations supplies real line numbers. Both crates are already present in
+# the dependency tree transitively, so enabling this pulls no new download.
+syn = { version = "2", features = ["full"], optional = true }
+proc-macro2 = { version = "1", features = ["span-locations"], optional = true }
+
+[features]
+syn-parser = ["dep:syn", "dep:proc-macro2"]
+
 [dev-dependencies]
 proptest = "1"
 criterion = "0.5"

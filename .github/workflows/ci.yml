@@ -33,7 +33,8 @@ jobs:
           rustup update stable --no-self-update
           rustup default stable
           rustup component add clippy
-      - run: cargo clippy --all-targets --locked -- -D warnings
+      # --all-features so the optional `syn-parser` code path is linted too.
+      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
   test:
     name: Build & Test
@@ -47,8 +48,10 @@ jobs:
           rustc --version && cargo --version
       - name: Build
         run: cargo build --all-targets --locked
-      - name: Test
+      - name: Test (default — zero-dep heuristic parser)
         run: cargo test --locked
+      - name: Test (syn-parser feature — real AST)
+        run: cargo test --features syn-parser --locked
       - name: Smoke-test the CLI
         run: |
           cargo run --locked -- version
