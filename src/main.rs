@@ -8,6 +8,7 @@ use ccos::guard::{GuardConfig, GuardLayer};
 use ccos::incremental::IncrementalGraphEngine;
 use ccos::memory::{MemoryGraph, NodeId};
 use ccos::persist::KernelSnapshot;
+use ccos::query;
 use ccos::util::sha256_hex;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -40,6 +41,9 @@ async fn main() {
         ),
         "failure" => run_failure(&FailureOpts::parse(rest)),
         "chaos" => run_chaos(&ChaosOpts::parse(rest)),
+        "top" => run_top(&TopOpts::parse(rest)),
+        "blame" => run_blame(&BlameOpts::parse(rest)),
+        "export" => run_export(&ExportOpts::parse(rest)),
         // ── CCOS v0.3 — Autonomous Context Runtime ──────────────────
         "scan" => commands_runtime::run_scan(rest).await,
         "agents" => commands_runtime::run_agents(rest).await,
@@ -632,6 +636,320 @@ fn run_chaos(opts: &ChaosOpts) -> i32 {
     }
 }
 
+/// Ingest every `.rs` file under `path` into a fresh memory graph (the same way
+/// `analyze` does, minus the event log and reporting). Shared by `top`.
+fn build_graph_from_path(path: &str, max_nodes: usize) -> Result<MemoryGraph, String> {
+    let root = Path::new(path);
+    if !root.exists() {
+        return Err(format!("path '{path}' does not exist"));
+    }
+    let mut files: Vec<PathBuf> = Vec::new();
+    if root.is_dir() {
+        collect_rs_files(root, &mut files);
+    } else if root.extension().and_then(|e| e.to_str()) == Some("rs") {
+        files.push(root.to_path_buf());
+    }
+    files.sort();
+    if files.is_empty() {
+        return Err(format!("no .rs files found under '{path}'"));
+    }
+
+    let mut graph = MemoryGraph::new(0.2, max_nodes);
+    let mut engine = IncrementalGraphEngine::new();
+    for file in &files {
+        if let Ok(source) = std::fs::read_to_string(file) {
+            let path_str = file.to_string_lossy().to_string();
+            engine.process_delta(&path_str, None, &source, &mut graph);
+        }
+    }
+    graph.prune_dangling_edges();
+    Ok(graph)
+}
+
+/// Options for `ccos top`.
+struct TopOpts {
+    path: String,
+    limit: usize,
+    json: bool,
+    max_nodes: usize,
+}
+
+impl TopOpts {
+    fn parse(args: &[String]) -> Self {
+        let mut opts = Self {
+            path: ".".to_string(),
+            limit: 20,
+            json: false,
+            max_nodes: 5000,
+        };
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--json" => opts.json = true,
+                "--limit" => {
+                    i += 1;
+                    if let Some(n) = args.get(i).and_then(|v| v.parse().ok()) {
+                        opts.limit = n;
+                    }
+                }
+                "--max-nodes" => {
+                    i += 1;
+                    if let Some(n) = args.get(i).and_then(|v| v.parse().ok()) {
+                        opts.max_nodes = n;
+                    }
+                }
+                s if !s.starts_with("--") => opts.path = s.to_string(),
+                other => eprintln!("ccos: ignoring unknown flag '{other}'"),
+            }
+            i += 1;
+        }
+        opts
+    }
+}
+
+/// `ccos top <path> [--limit N] [--json]` — ingest `path` and print the hottest
+/// nodes by causal score: the working set the kernel would page in first.
+fn run_top(opts: &TopOpts) -> i32 {
+    let graph = match build_graph_from_path(&opts.path, opts.max_nodes) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("ccos: {e}");
+            return 1;
+        }
+    };
+    let hot = query::hot_set(&graph, opts.limit);
+
+    if opts.json {
+        let rows: Vec<_> = hot
+            .iter()
+            .map(|(id, s)| serde_json::json!({ "id": id.0, "score": s }))
+            .collect();
+        let report = serde_json::json!({
+            "path": opts.path,
+            "nodes": graph.node_count(),
+            "edges": graph.edge_count(),
+            "top": rows,
+        });
+        println!("{}", serde_json::to_string_pretty(&report).unwrap());
+        return 0;
+    }
+
+    println!("╔══════════════════════════════════════════════╗");
+    println!("║  CCOS top — {:<33}║", truncate(&opts.path, 33));
+    println!("╚══════════════════════════════════════════════╝\n");
+    println!(
+        "  {} nodes / {} edges — top {}:\n",
+        graph.node_count(),
+        graph.edge_count(),
+        hot.len()
+    );
+    println!("    {:>7}  {:<8}  NODE", "SCORE", "TYPE");
+    for (id, score) in &hot {
+        let ty = graph
+            .nodes
+            .get(id)
+            .map(|n| format!("{:?}", n.node_type))
+            .unwrap_or_else(|| "?".into());
+        println!(
+            "    {:>7.4}  {:<8}  {}",
+            score,
+            truncate(&ty, 8),
+            truncate(&id.0, 44)
+        );
+    }
+    0
+}
+
+/// Options for `ccos blame`.
+struct BlameOpts {
+    snapshot: Option<String>,
+    node: Option<String>,
+    depth: u32,
+    json: bool,
+}
+
+impl BlameOpts {
+    fn parse(args: &[String]) -> Self {
+        let (mut snapshot, mut node, mut depth, mut json) = (None, None, 3u32, false);
+        let mut positional = 0;
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--json" => json = true,
+                "--depth" => {
+                    i += 1;
+                    if let Some(n) = args.get(i).and_then(|v| v.parse().ok()) {
+                        depth = n;
+                    }
+                }
+                s if !s.starts_with("--") => {
+                    if positional == 0 {
+                        snapshot = Some(s.to_string());
+                    } else {
+                        node = Some(s.to_string());
+                    }
+                    positional += 1;
+                }
+                other => eprintln!("ccos: ignoring unknown flag '{other}'"),
+            }
+            i += 1;
+        }
+        Self {
+            snapshot,
+            node,
+            depth,
+            json,
+        }
+    }
+}
+
+/// `ccos blame <snapshot.json> <node-id> [--depth N]` — show a node's upstream
+/// causes (what it rests on) and downstream blast radius (what breaks with it).
+fn run_blame(opts: &BlameOpts) -> i32 {
+    let (Some(file), Some(node_id)) = (opts.snapshot.as_deref(), opts.node.as_deref()) else {
+        eprintln!("usage: ccos blame <snapshot.json> <node-id> [--depth N]");
+        return 2;
+    };
+    let snapshot = match KernelSnapshot::load(file) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("ccos: cannot load '{file}': {e}");
+            return 1;
+        }
+    };
+    let graph = snapshot.graph;
+    let origin = NodeId(node_id.to_string());
+    if !graph.nodes.contains_key(&origin) {
+        eprintln!(
+            "ccos: node '{node_id}' not found ({} nodes). List ids with `ccos analyze <path> --json`.",
+            graph.node_count()
+        );
+        return 1;
+    }
+
+    let causes = query::source_set(&graph, &origin, opts.depth);
+    let impact = query::impact_set(&graph, &origin, opts.depth);
+
+    if opts.json {
+        let to_rows = |v: &[query::Reached]| {
+            v.iter()
+                .map(|r| {
+                    serde_json::json!({ "id": r.id.0, "distance": r.distance, "score": r.score })
+                })
+                .collect::<Vec<_>>()
+        };
+        let report = serde_json::json!({
+            "node": node_id,
+            "depth": opts.depth,
+            "causes": to_rows(&causes),
+            "impact": to_rows(&impact),
+        });
+        println!("{}", serde_json::to_string_pretty(&report).unwrap());
+        return 0;
+    }
+
+    println!("╔══════════════════════════════════════════════╗");
+    println!("║  CCOS blame                                  ║");
+    println!("╚══════════════════════════════════════════════╝\n");
+    println!("  Node:  {}", truncate(node_id, 40));
+    println!("  Depth: {}\n", opts.depth);
+
+    println!(
+        "  ── Causes (upstream — what it rests on): {} ──",
+        causes.len()
+    );
+    for r in causes.iter().take(15) {
+        println!(
+            "    d{}  {:.4}  {}",
+            r.distance,
+            r.score,
+            truncate(&r.id.0, 42)
+        );
+    }
+    println!(
+        "\n  ── Blast radius (downstream — what breaks with it): {} ──",
+        impact.len()
+    );
+    for r in impact.iter().take(15) {
+        println!(
+            "    d{}  {:.4}  {}",
+            r.distance,
+            r.score,
+            truncate(&r.id.0, 42)
+        );
+    }
+    0
+}
+
+/// Options for `ccos export`.
+struct ExportOpts {
+    snapshot: Option<String>,
+    out: String,
+}
+
+impl ExportOpts {
+    fn parse(args: &[String]) -> Self {
+        let (mut snapshot, mut out) = (None, "ccos.graphml".to_string());
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--out" => {
+                    i += 1;
+                    if let Some(v) = args.get(i) {
+                        out = v.clone();
+                    }
+                }
+                // `--format graphml` is accepted for forward-compatibility; GraphML
+                // is currently the only target.
+                "--format" => {
+                    i += 1;
+                    if let Some(fmt) = args.get(i) {
+                        if fmt != "graphml" {
+                            eprintln!("ccos: unknown export format '{fmt}', using graphml");
+                        }
+                    }
+                }
+                s if !s.starts_with("--") => snapshot = Some(s.to_string()),
+                other => eprintln!("ccos: ignoring unknown flag '{other}'"),
+            }
+            i += 1;
+        }
+        Self { snapshot, out }
+    }
+}
+
+/// `ccos export <snapshot.json> [--out FILE]` — export the snapshot's causal
+/// graph as GraphML for Gephi / yEd / Cytoscape / networkx.
+fn run_export(opts: &ExportOpts) -> i32 {
+    let Some(file) = opts.snapshot.as_deref() else {
+        eprintln!("usage: ccos export <snapshot.json> [--out FILE]");
+        return 2;
+    };
+    let snapshot = match KernelSnapshot::load(file) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("ccos: cannot load '{file}': {e}");
+            return 1;
+        }
+    };
+    let graphml = query::to_graphml(&snapshot.graph);
+    match std::fs::write(&opts.out, graphml) {
+        Ok(()) => {
+            println!(
+                "[EXPORT] {} nodes / {} edges → {} (GraphML)",
+                snapshot.graph.node_count(),
+                snapshot.graph.edge_count(),
+                opts.out
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("ccos: failed to write '{}': {e}", opts.out);
+            1
+        }
+    }
+}
+
 /// Recursively collect `.rs` files, skipping `target/`, VCS and hidden dirs.
 fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let entries = match std::fs::read_dir(dir) {
@@ -681,6 +999,11 @@ COMMANDS:\n\
     failure <snap> <node-id>   Inject a fault at a node and propagate it (--depth N)\n\
     chaos [--iters N]          Fuzz the guard with adversarial payloads\n\
 \n\
+  Inspection & export:\n\
+    top <path> [--limit N]     Show the hottest nodes by causal score (--json)\n\
+    blame <snap> <node-id>     Causes (upstream) + blast radius (downstream) (--depth N, --json)\n\
+    export <snap> [--out F]    Export the causal graph as GraphML (default ccos.graphml)\n\
+\n\
   CCOS v0.3 — Autonomous Context Runtime:\n\
     scan <path>                Scan a real workspace and ingest the delta\n\
     agents <path>              Run Coder/Reviewer/Security agents over a workspace\n\
@@ -696,6 +1019,9 @@ ENVIRONMENT (demo only):\n\
 EXAMPLES:\n\
     ccos analyze src --cycles\n\
     ccos analyze src --out run.json && ccos verify run.json && ccos replay run.json\n\
+    ccos top src --limit 15\n\
+    ccos blame run.json file:src/memory.rs --depth 4\n\
+    ccos export run.json --out graph.graphml\n\
     ccos runtime src --state data\n\
     ccos benchmark --cycles 100000\n",
         env!("CARGO_PKG_VERSION")

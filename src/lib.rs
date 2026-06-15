@@ -28,6 +28,8 @@
 //!   injection, timeouts) used to harden the guard and the graph.
 //! - [`persist`] — save/load a full [`persist::KernelSnapshot`] (graph + both
 //!   logs) to JSON for cross-session replay and verification.
+//! - [`query`] — read-only causal queries (impact/cause walks, hot set, GraphML
+//!   export) behind the `top`, `blame` and `export` subcommands.
 //!
 //! ## Invariants
 //!
@@ -47,6 +49,7 @@ pub mod llm;
 pub mod memory;
 pub mod parser;
 pub mod persist;
+pub mod query;
 pub mod util;
 
 // ── CCOS v0.3 — Autonomous Context Runtime ──────────────────────────

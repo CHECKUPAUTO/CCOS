@@ -493,29 +493,51 @@ impl ASTParser {
     }
 }
 
+/// Strip comments from a single source line, ignoring `//` and `/* … */` that
+/// appear inside string literals. Inline block comments (`a(); /* c */ b();`)
+/// are removed in place. A block comment left open at end-of-line is dropped to
+/// the line end — multi-line `/* … */` spans are a known limitation of the
+/// line-based parser (see `ROADMAP.md`).
 fn strip_comments(line: &str) -> String {
-    let bytes = line.as_bytes();
+    let mut out = String::with_capacity(line.len());
     let mut in_string = false;
     let mut escaped = false;
+    let mut chars = line.chars().peekable();
 
-    for (i, &ch) in bytes.iter().enumerate() {
-        if escaped {
-            escaped = false;
+    while let Some(c) = chars.next() {
+        if in_string {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
             continue;
         }
-        if ch == b'\\' && in_string {
-            escaped = true;
-            continue;
-        }
-        if ch == b'"' {
-            in_string = !in_string;
-            continue;
-        }
-        if !in_string && ch == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
-            return line[..i].trim_end().to_string();
+        match c {
+            '"' => {
+                in_string = true;
+                out.push(c);
+            }
+            // Line comment: the rest of the line is dropped.
+            '/' if chars.peek() == Some(&'/') => break,
+            // Block comment: skip until the closing `*/` (or end of line).
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next(); // consume '*'
+                let mut prev = '\0';
+                for d in chars.by_ref() {
+                    if prev == '*' && d == '/' {
+                        break;
+                    }
+                    prev = d;
+                }
+            }
+            _ => out.push(c),
         }
     }
-    line.to_string()
+    out.trim().to_string()
 }
 
 impl Default for ASTParser {
@@ -563,6 +585,37 @@ mod tests {
         assert_eq!(
             strip_comments("let x = \"//not_a_comment\"; // real"),
             "let x = \"//not_a_comment\";"
+        );
+    }
+
+    #[test]
+    fn test_strip_block_comments() {
+        // Inline block comment removed in place.
+        assert_eq!(
+            strip_comments("pub fn a() {} /* fn fake() {} */"),
+            "pub fn a() {}"
+        );
+        // Block comment between tokens.
+        assert_eq!(strip_comments("mod /* x */ real;"), "mod  real;");
+        // Unterminated block comment dropped to end of line.
+        assert_eq!(strip_comments("use foo; /* trailing"), "use foo;");
+        // `/*` inside a string is not a comment.
+        assert_eq!(
+            strip_comments("let u = \"http:/*not*/\";"),
+            "let u = \"http:/*not*/\";"
+        );
+    }
+
+    #[test]
+    fn test_block_comment_hides_fake_symbols() {
+        // A function hidden in a block comment must NOT be extracted as a symbol.
+        let source = "fn real() {}\n/* fn fake() {} */ struct Keep;";
+        let symbols = ASTParser::extract_symbols(source);
+        assert!(symbols.iter().any(|s| s.name == "real"));
+        assert!(symbols.iter().any(|s| s.name == "Keep"));
+        assert!(
+            !symbols.iter().any(|s| s.name == "fake"),
+            "symbol inside a block comment must be ignored"
         );
     }
 

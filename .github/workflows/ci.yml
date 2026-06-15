@@ -55,6 +55,9 @@ jobs:
           cargo run --locked -- analyze src --out /tmp/run.json
           cargo run --locked -- verify /tmp/run.json
           cargo run --locked -- replay /tmp/run.json
+          cargo run --locked -- top src --limit 10
+          cargo run --locked -- blame /tmp/run.json file:src/lib.rs --depth 3
+          cargo run --locked -- export /tmp/run.json --out /tmp/ccos.graphml
           cargo run --locked -- chaos --iters 500
 
   docs:
