@@ -1,4 +1,5 @@
 use crate::memory::{EdgeType, MemoryGraph, NodeId, NodeType};
+use crate::util::sha256_hex;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -8,6 +9,17 @@ pub struct EventLog {
     pub events: Vec<TraceEvent>,
 }
 
+/// Result of verifying an [`EventLog`]'s canonical hash chain.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogIntegrity {
+    /// True when every link verified and the chain is unbroken.
+    pub valid: bool,
+    /// Number of events whose content hash matched.
+    pub verified_events: usize,
+    /// Human-readable descriptions of any broken links or tampered events.
+    pub errors: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraceEvent {
     pub id: String,
@@ -15,6 +27,16 @@ pub struct TraceEvent {
     pub event_type: EventType,
     pub payload: EventPayload,
     pub sequence_number: u64,
+    /// Hash of the previous event in the canonical chain (or [`EventLog::GENESIS_HASH`]
+    /// for the first event). Together with `hash` this makes the *primary* event
+    /// log tamper-evident, covering every run — not just persisted snapshots.
+    #[serde(default)]
+    pub prev_hash: String,
+    /// SHA-256 link over `(prev_hash, sequence_number, event_type, payload)`. The
+    /// non-deterministic `id`/`timestamp` are deliberately excluded so the chain
+    /// is reproducible across runs (preserving CCOS's determinism invariant).
+    #[serde(default)]
+    pub hash: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -122,18 +144,84 @@ impl EventLog {
         }
     }
 
+    /// Genesis predecessor hash for the first event in the chain.
+    pub const GENESIS_HASH: &'static str = "GENESIS";
+
     pub fn append(&mut self, event_type: EventType, payload: EventPayload) -> String {
         let id = Uuid::new_v4().to_string();
         let seq = self.events.len() as u64;
+        let prev_hash = self.chain_head();
+        let hash = Self::link_hash(&prev_hash, seq, &event_type, &payload);
         let event = TraceEvent {
             id: id.clone(),
             timestamp: Self::now_millis(),
             event_type,
             payload,
             sequence_number: seq,
+            prev_hash,
+            hash,
         };
         self.events.push(event);
         id
+    }
+
+    /// Deterministic hash linking one event's replayable content to its
+    /// predecessor. The random `id` and wall-clock `timestamp` are excluded so
+    /// the chain is reproducible across runs.
+    fn link_hash(
+        prev_hash: &str,
+        seq: u64,
+        event_type: &EventType,
+        payload: &EventPayload,
+    ) -> String {
+        let payload_json = serde_json::to_string(payload).unwrap_or_default();
+        sha256_hex(&format!("{prev_hash}|{seq}|{event_type:?}|{payload_json}"))
+    }
+
+    /// The chain head — the last event's hash, a commitment to the whole log so
+    /// far, or [`EventLog::GENESIS_HASH`] when the log is empty.
+    pub fn chain_head(&self) -> String {
+        self.events
+            .last()
+            .map(|e| e.hash.clone())
+            .unwrap_or_else(|| Self::GENESIS_HASH.to_string())
+    }
+
+    /// Recompute the canonical hash chain from genesis and confirm every link is
+    /// intact: a modified payload, a reordering, or an inserted/dropped event
+    /// breaks the chain. Reports how many events verified and any errors found.
+    pub fn verify_integrity(&self) -> LogIntegrity {
+        let mut errors = Vec::new();
+        let mut prev = Self::GENESIS_HASH.to_string();
+        let mut verified = 0usize;
+        for (i, event) in self.events.iter().enumerate() {
+            if event.prev_hash != prev {
+                errors.push(format!(
+                    "event {i} (seq {}): broken link — prev_hash does not match the chain",
+                    event.sequence_number
+                ));
+            }
+            let expected = Self::link_hash(
+                &prev,
+                event.sequence_number,
+                &event.event_type,
+                &event.payload,
+            );
+            if event.hash == expected {
+                verified += 1;
+            } else {
+                errors.push(format!(
+                    "event {i} (seq {}): content tampered — hash mismatch",
+                    event.sequence_number
+                ));
+            }
+            prev = event.hash.clone();
+        }
+        LogIntegrity {
+            valid: errors.is_empty(),
+            verified_events: verified,
+            errors,
+        }
     }
 
     pub fn replay_events(&self, from_sequence: u64, to_sequence: Option<u64>) -> Vec<&TraceEvent> {
@@ -497,5 +585,130 @@ mod tests {
         let restored: EventLog = EventLog::from_json(&json).unwrap();
         assert_eq!(restored.session_id, "test");
         assert_eq!(restored.event_count(), 1);
+    }
+
+    // ── Canonical hash chain (P1.2) ────────────────────────────────
+
+    fn sample(n: u64) -> (EventType, EventPayload) {
+        (
+            EventType::CycleStart,
+            EventPayload::CycleEvent {
+                cycle_number: n,
+                action: format!("c{n}"),
+            },
+        )
+    }
+
+    #[test]
+    fn chain_valid_after_appends() {
+        let mut log = EventLog::new("s".into());
+        for i in 0..10 {
+            let (t, p) = sample(i);
+            log.append(t, p);
+        }
+        let integ = log.verify_integrity();
+        assert!(integ.valid, "fresh chain must verify: {:?}", integ.errors);
+        assert_eq!(integ.verified_events, 10);
+    }
+
+    #[test]
+    fn empty_chain_is_valid() {
+        let log = EventLog::new("s".into());
+        let integ = log.verify_integrity();
+        assert!(integ.valid);
+        assert_eq!(integ.verified_events, 0);
+        assert_eq!(log.chain_head(), EventLog::GENESIS_HASH);
+    }
+
+    #[test]
+    fn chain_detects_payload_tampering() {
+        let mut log = EventLog::new("s".into());
+        for i in 0..5 {
+            let (t, p) = sample(i);
+            log.append(t, p);
+        }
+        // Tamper with one event's payload without recomputing its hash.
+        log.events[2].payload = EventPayload::CycleEvent {
+            cycle_number: 999,
+            action: "evil".into(),
+        };
+        let integ = log.verify_integrity();
+        assert!(!integ.valid, "tampered payload must be detected");
+        assert!(integ.errors.iter().any(|e| e.contains("seq 2")));
+    }
+
+    #[test]
+    fn chain_detects_reorder() {
+        let mut log = EventLog::new("s".into());
+        for i in 0..5 {
+            let (t, p) = sample(i);
+            log.append(t, p);
+        }
+        log.events.swap(1, 3);
+        assert!(
+            !log.verify_integrity().valid,
+            "reordering must break the chain"
+        );
+    }
+
+    #[test]
+    fn chain_detects_deletion() {
+        let mut log = EventLog::new("s".into());
+        for i in 0..5 {
+            let (t, p) = sample(i);
+            log.append(t, p);
+        }
+        log.events.remove(2);
+        assert!(
+            !log.verify_integrity().valid,
+            "dropping an event must break the chain"
+        );
+    }
+
+    #[test]
+    fn chain_survives_serialization_roundtrip() {
+        let mut log = EventLog::new("s".into());
+        for i in 0..6 {
+            let (t, p) = sample(i);
+            log.append(t, p);
+        }
+        let restored = EventLog::from_json(&log.to_json()).unwrap();
+        assert!(restored.verify_integrity().valid);
+        assert_eq!(restored.chain_head(), log.chain_head());
+    }
+
+    #[test]
+    fn chain_head_is_deterministic_across_identical_logs() {
+        // The canonical chain excludes the random id/timestamp, so identical
+        // event sequences commit to the same head regardless of run.
+        let build = || {
+            let mut log = EventLog::new("ignored-session".into());
+            for i in 0..8 {
+                let (t, p) = sample(i);
+                log.append(t, p);
+            }
+            log.chain_head()
+        };
+        assert_eq!(build(), build(), "chain head must be reproducible");
+    }
+
+    #[test]
+    fn recorded_graph_chain_is_valid() {
+        use crate::memory::{MemoryGraph, NodeType};
+        let mut graph = MemoryGraph::new(0.0, usize::MAX);
+        for i in 0..20 {
+            graph.upsert_node(
+                NodeId(format!("n{i}")),
+                format!("l{i}"),
+                String::new(),
+                NodeType::Module,
+            );
+        }
+        let mut log = EventLog::new("rec".into());
+        log.record_graph(&graph);
+        assert!(
+            log.verify_integrity().valid,
+            "record_graph appends must chain correctly"
+        );
     }
 }

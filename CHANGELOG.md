@@ -8,6 +8,12 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Canonical tamper-evident `EventLog`** (ROADMAP P1.2): every appended event is
+  linked into a SHA-256 hash chain over its replayable content (sequence + type +
+  payload), so integrity now covers *all* runs, not just persisted snapshots.
+  `EventLog::verify_integrity` detects payload tampering, reordering, insertion or
+  deletion; `ccos verify` and `ccos replay` check it. The chain excludes the
+  non-deterministic `id`/`timestamp`, so logs stay reproducible.
 - **Optional `syn`-based AST parser** behind the `syn-parser` feature (ROADMAP
   P0.1): accurate parsing of nested-module bodies, multi-line signatures, grouped
   `use` and impl methods, with the zero-dependency line-based parser as the

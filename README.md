@@ -20,7 +20,7 @@ Coding agents drown in context. CCOS reframes context management as an operating
 | Pages / working set   | Graph nodes (files, modules, symbols, imports)           |
 | RAM ↔ VRAM paging     | `select_context_window()` + `enforce_paging()`           |
 | Process scheduling    | Causal scoring (importance · failure · recency · access) |
-| Write-ahead log       | Append-only `EventLog` + hash-chained distributed log    |
+| Write-ahead log       | Append-only, **hash-chained** `EventLog` + distributed log |
 | Fault handling        | Failure detection → weighted propagation across edges    |
 | Syscall validation    | `GuardLayer` over every LLM response                     |
 
@@ -207,8 +207,9 @@ Heavier stress/chaos harnesses live in [`scripts/`](scripts/) (multi-day chaos,
 - **Guard safety**: every guard output is valid JSON; injection/hallucination
   payloads are rejected (`tests/llm_adversarial_test.rs`,
   `tests/ccos_adversarial_suite.rs`).
-- **Tamper-evidence**: the hash-chained log detects any mutation
-  (`src/distributed_event_log.rs`).
+- **Tamper-evidence**: both the primary `EventLog` (canonical hash chain) and
+  the `DistributedEventLog` detect any payload mutation, reorder, insertion or
+  deletion (`src/event_log.rs`, `src/distributed_event_log.rs`).
 
 ## Documentation
 

@@ -93,7 +93,7 @@ These are enforced in code and covered by tests; don't regress them.
 | Node count ≤ `max_in_memory_nodes` | `enforce_paging` |
 | Deterministic eviction / ordering | total order *(score, NodeId)* across `memory` |
 | Guard output is always valid JSON | `GuardLayer::validate_and_sanitize` → `fallback_response` |
-| Hash chain is tamper-evident | `DistributedEventLog::verify_integrity` |
+| Hash chain is tamper-evident | `EventLog::verify_integrity` (primary log) + `DistributedEventLog::verify_integrity` |
 
 Regression coverage lives in `tests/graph_invariants.rs`,
 `tests/snapshot_differential.rs`, `tests/long_term_stability.rs`,

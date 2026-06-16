@@ -10,7 +10,7 @@ A practical map of the codebase for contributors. For the conceptual write-up se
 | `parser`                    | Modules / `use` / symbols from Rust source — line-based heuristic, or a real `syn` AST behind the `syn-parser` feature | `ASTParser`, `ParseResult`, `Symbol`, `SymbolKind` |
 | `memory`                    | The causal graph: scoring, paging, failure propagation, analytics | `MemoryGraph`, `GraphNode`, `GraphEdge`, `NodeId`, `NodeType`, `EdgeType` |
 | `incremental`               | `O(Δ)` graph maintenance on file edits | `IncrementalGraphEngine`, `DeltaMutation`, `MutationOp`, `FileState` |
-| `event_log`                 | Append-only event log, deterministic replay & graph reconstruction | `EventLog`, `TraceEvent`, `EventType`, `EventPayload`, `EventReplayer`, `GraphReconstructor` |
+| `event_log`                 | Append-only event log with a canonical tamper-evident hash chain, deterministic replay & graph reconstruction | `EventLog`, `TraceEvent`, `EventType`, `EventPayload`, `LogIntegrity`, `EventReplayer`, `GraphReconstructor` |
 | `distributed_event_log`     | Tamper-evident hash-chained log | `DistributedEventLog`, `HashChainLink`, `IntegrityReport` |
 | `llm`                       | Async Ollama-style client + retries + fallback | `LlmClient`, `LlmConfig`, `ValidatedResponse` |
 | `guard`                     | Validate/sanitize model output | `GuardLayer`, `GuardConfig`, `GuardResult` |
@@ -53,7 +53,7 @@ relies on these prefixes to evict exactly one file's subgraph.
 | Node count ≤ `max_in_memory_nodes` | `enforce_paging` (called from `upsert_node`) |
 | Deterministic eviction/ordering | total order *(score, NodeId)* in `enforce_paging`, `get_node_scores`, `select_context_window` |
 | Guard output is always valid JSON | `GuardLayer::validate_and_sanitize` → `fallback_response` |
-| Hash chain is tamper-evident | `DistributedEventLog::compute_link_hash` / `verify_integrity` |
+| Hash chain is tamper-evident | `EventLog::verify_integrity` (primary log, canonical chain) + `DistributedEventLog::compute_link_hash` / `verify_integrity` |
 
 Regression coverage: `tests/graph_invariants.rs` (dangling-free, bounded,
 deterministic), `tests/long_term_stability.rs` (10k cycles),

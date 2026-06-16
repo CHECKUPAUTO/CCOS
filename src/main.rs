@@ -306,6 +306,7 @@ fn run_verify(file: Option<&str>) -> i32 {
     };
 
     let integrity = snapshot.dist_log.verify_integrity();
+    let log_integrity = snapshot.event_log.verify_integrity();
     let mut graph = snapshot.graph.clone();
     let dangling = graph.prune_dangling_edges();
 
@@ -321,14 +322,21 @@ fn run_verify(file: Option<&str>) -> i32 {
     println!("  Dangling edges:    {dangling} (must be 0)");
     println!("  Event-log events:  {}", snapshot.event_log.event_count());
     println!(
-        "  Hash-chain links:  {} | valid: {}",
+        "  Dist-log chain:    {} links | valid: {}",
         integrity.verified_events, integrity.valid
     );
     for err in integrity.errors.iter().take(10) {
         println!("    ! {err}");
     }
+    println!(
+        "  Event-log chain:   {} verified | valid: {}",
+        log_integrity.verified_events, log_integrity.valid
+    );
+    for err in log_integrity.errors.iter().take(10) {
+        println!("    ! {err}");
+    }
 
-    if integrity.valid && dangling == 0 {
+    if integrity.valid && log_integrity.valid && dangling == 0 {
         println!("\n  ✓ snapshot verified");
         0
     } else {
@@ -392,8 +400,12 @@ fn run_replay(file: Option<&str>) -> i32 {
     }
 
     let integrity = snapshot.dist_log.verify_integrity();
-    println!("  Hash-chain valid: {}", integrity.valid);
-    if integrity.valid {
+    let log_integrity = snapshot.event_log.verify_integrity();
+    println!(
+        "  Hash-chain valid: {} (dist-log) · {} (event-log, {} links)",
+        integrity.valid, log_integrity.valid, log_integrity.verified_events
+    );
+    if integrity.valid && log_integrity.valid {
         0
     } else {
         1
