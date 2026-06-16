@@ -77,9 +77,12 @@ Prioritized roadmap from the audit. Effort: S/M/L.
 
 ### P1 — Depth
 
-2. **Canonical hash-chained log.** (M) Fold tamper-evidence into the primary
-   `EventLog` (or mirror every kernel event), so integrity covers *all* runs, not
-   just snapshots.
+- ✅ **Canonical hash-chained log** — *done.* The primary `EventLog` is now
+  tamper-evident: every `append` links the event into a SHA-256 chain over its
+  replayable content (sequence + type + payload, excluding the non-deterministic
+  `id`/`timestamp` so the chain stays reproducible). `EventLog::verify_integrity`
+  detects any payload tamper, reorder, insertion or deletion, and `ccos verify` /
+  `ccos replay` check it on every run. See `src/event_log.rs`.
 3. **Semantic edges.** (L) Call-graph and data-flow edges, not just
    containment/dependency — richer causal propagation.
 
@@ -103,6 +106,6 @@ Prioritized roadmap from the audit. Effort: S/M/L.
 
 ### Suggested order
 
-~~`P0.1 (syn)`~~ ✅ → **`P1.2 (canonical log)`** (next) → `P2.5 (benches)` →
+~~`P0.1 (syn)`~~ ✅ → ~~`P1.2 (canonical log)`~~ ✅ → **`P2.5 (benches)`** (next) →
 `P1.3 (semantic edges)` → polish. P2.4 and P3.7 are quick wins
 that can land anytime.
