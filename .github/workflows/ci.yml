@@ -8,50 +8,59 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
-# Only GitHub-authored actions (actions/checkout) + the runner's pre-installed
-# rustup are used, so no third-party action can be blocked by org policy.
+# A single consolidated job keeps GitHub Actions minute usage low on this private
+# repo: one checkout, one toolchain setup, and one shared `target/` so
+# dependencies compile once and every step reuses them; dependency caching cuts
+# repeat runs further. Cheapest checks run first (fail-fast). Only GitHub-authored
+# actions are used (actions/checkout, actions/cache) so no third-party action can
+# be blocked by org policy. The slower `cargo audit` runs weekly in audit.yml,
+# off the per-push path.
 jobs:
-  format:
-    name: Format
+  ci:
+    name: CI
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Rust
-        run: |
-          rustup update stable --no-self-update
-          rustup default stable
-          rustup component add rustfmt
-      - run: cargo fmt --all --check
 
-  clippy:
-    name: Clippy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
       - name: Set up Rust
         run: |
           rustup update stable --no-self-update
           rustup default stable
-          rustup component add clippy
-      # --all-features so the optional `syn-parser` code path is linted too.
-      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
-
-  test:
-    name: Build & Test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Set up Rust
-        run: |
-          rustup update stable --no-self-update
-          rustup default stable
+          rustup component add rustfmt clippy
           rustc --version && cargo --version
-      - name: Build
-        run: cargo build --all-targets --locked
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      # Cheapest first: formatting needs no compilation.
+      - name: Format
+        run: cargo fmt --all --check
+
+      # One compile of all dependencies (incl. the optional `syn` path), reused
+      # by the test/doc/run steps below.
+      - name: Clippy (default + all features)
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
       - name: Test (default — zero-dep heuristic parser)
         run: cargo test --locked
+
       - name: Test (syn-parser feature — real AST)
         run: cargo test --features syn-parser --locked
+
+      - name: Docs
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --no-deps --locked
+
       - name: Smoke-test the CLI
         run: |
           cargo run --locked -- version
@@ -62,33 +71,3 @@ jobs:
           cargo run --locked -- blame /tmp/run.json file:src/lib.rs --depth 3
           cargo run --locked -- export /tmp/run.json --out /tmp/ccos.graphml
           cargo run --locked -- chaos --iters 500
-
-  docs:
-    name: Docs
-    runs-on: ubuntu-latest
-    env:
-      RUSTDOCFLAGS: "-D warnings"
-    steps:
-      - uses: actions/checkout@v4
-      - name: Set up Rust
-        run: |
-          rustup update stable --no-self-update
-          rustup default stable
-      - run: cargo doc --no-deps --locked
-
-  audit:
-    name: Security Audit
-    runs-on: ubuntu-latest
-    # Informational: a transitive-dependency advisory outside our control should
-    # not block the pipeline. Surfaced as a check, but non-blocking.
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - name: Set up Rust
-        run: |
-          rustup update stable --no-self-update
-          rustup default stable
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
-      - name: Audit
-        run: cargo audit
