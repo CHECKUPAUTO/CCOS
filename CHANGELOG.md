@@ -39,9 +39,11 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- The CI pipeline is now a five-job matrix (Format, Clippy, Build & Test, Docs,
-  Security Audit) using only GitHub-authored actions + `rustup`. The smoke run
-  now also exercises `top`, `blame` and `export`.
+- The CI pipeline is **consolidated into a single cached job** (Format → Clippy
+  `--all-features` → tests on both parser paths → Docs → CLI smoke) to keep
+  GitHub Actions minute usage low on the private repo; `cargo audit` moved to a
+  **weekly** `audit.yml` (and on-demand) instead of every push. Uses only
+  GitHub-authored actions (`actions/checkout`, `actions/cache`).
 - `README.md` and `docs/ARCHITECTURE.md` updated for the `query` module and the
   new commands.
 
