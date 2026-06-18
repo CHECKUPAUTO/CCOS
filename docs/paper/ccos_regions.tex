@@ -1,0 +1,411 @@
+\documentclass[11pt]{article}
+
+% --- arXiv-friendly preamble (standard packages only) ---
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\geometry{margin=1in}
+\hypersetup{colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue}
+
+\newtheorem{definition}{Definition}
+\newtheorem{proposition}{Proposition}
+\newtheorem{theorem}{Theorem}
+
+\newcommand{\dcausal}{d_{\mathrm{c}}}
+\newcommand{\Nk}{\mathcal{N}_k}
+\newcommand{\code}[1]{\texttt{#1}}
+
+\title{\textbf{Causal Context Regions:\\ A Spatial Memory Model for Long-Horizon LLM Coding Agents}}
+\author{The CCOS Project\thanks{Causal Context Operating System (CCOS), an open
+research prototype. Source, reproduction scripts and this paper:
+\url{https://github.com/CHECKUPAUTO/CCOS}.}}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Coding agents backed by large language models (LLMs) drown in context: a
+repository is paged into a bounded window as a flat, ranked list of files, and as
+tasks lengthen the window fills with globally ``important'' but locally
+irrelevant material. We argue that the unit of context should not be the file but
+the \emph{region}: a causally coherent neighbourhood of code, dependencies and
+associated faults that is hydrated as a whole, the way an operating system pages
+in a working set rather than a single address. We present the \emph{Context
+Region Engine} (CCOS v0.3), which lifts a 1-D causal memory graph into a spatial
+map of regions with a temperature, a causal density and a dynamic admission
+policy. We give a precise, deterministic definition of a region in terms of
+connected components of a cross-file causal-link graph, and of causal distance as
+a weighted shortest path. We prove that regions are a pure function of the graph
+and therefore reconstruct bit-for-bit on replay, preserving CCOS's auditability
+invariant. On the system's own source tree we measure, \emph{without any LLM
+calls}, that region-based selection covers a task's $k$-hop causal neighbourhood
+with recall $0.97$ versus $0.35$ for the flat top-score strategy, at
+$\approx\!48\%$ fewer tokens for equal coverage, with regions that are
+$95.5\%$ internally connected. We then specify a falsifiable protocol --- not yet
+executed --- to test whether causal regional memory improves task success and
+reduces hallucination relative to classical RAG, GraphRAG, MemGPT and LangGraph
+on long-horizon repository tasks. We are explicit throughout about what is
+\emph{proven} (formal structure, determinism, locality) versus \emph{hypothesised}
+(downstream agent gains), so that the contribution can be evaluated honestly.
+\end{abstract}
+
+\section{Introduction}
+
+An LLM coding agent operating over a repository must repeatedly decide \emph{what
+to put in the context window}. The dominant pattern is retrieval: embed code
+chunks, rank them against the task, and concatenate the top-$k$ until a token
+budget is exhausted~\cite{lewis2020rag}. This treats context as a one-dimensional
+ranked list. Two failure modes follow. First, \emph{dilution}: as tasks lengthen,
+the window accumulates globally salient but task-irrelevant code, and models
+attend poorly to the middle of long contexts~\cite{liu2023lost}. Second,
+\emph{incoherence}: the top-$k$ chunks need not form a connected unit of
+reasoning --- a function may be paged in without its callers, its error sites or
+the data it depends on.
+
+Operating systems faced the analogous problem decades ago and answered with the
+\emph{working set}: the set of recently referenced pages that must stay
+resident~\cite{denning1968working}. CCOS adopts the analogy for LLM
+context~\cite{packer2023memgpt}: source is parsed into a causal
+graph, nodes are scored, and a bounded ``context window'' is paged in and out
+like RAM~$\leftrightarrow$~VRAM. CCOS v0.2 keeps this at one dimension: a scalar
+score per node. The present work (v0.3) makes the memory \emph{spatial}. Our
+contributions are:
+
+\begin{enumerate}
+  \item A \textbf{formal model of context regions} (\S\ref{sec:regions}):
+  causal distance as a weighted shortest path, and region membership as a
+  connected component of a cross-file causal-link graph, with external
+  dependency hubs collapsed.
+  \item A \textbf{dynamic admission policy} (\S\ref{sec:policy}) that replaces a
+  global threshold with a per-region score modulated by temperature, causal
+  density, token pressure and task complexity.
+  \item A \textbf{determinism theorem} (\S\ref{sec:determinism}): regions are a
+  pure function of the graph, and a session reconstructs bit-for-bit from its
+  event log, preserving tamper-evident replay.
+  \item An \textbf{LLM-free locality evaluation} (\S\ref{sec:eval}) with real,
+  reproducible numbers, plus a \textbf{falsifiable comparison protocol}
+  (\S\ref{sec:protocol}) against RAG, GraphRAG, MemGPT and LangGraph that we
+  state but do not yet run.
+\end{enumerate}
+
+\section{Related Work}\label{sec:related}
+
+\paragraph{Retrieval-augmented generation.} RAG augments a parametric model with
+a non-parametric store and retrieves passages per
+query~\cite{lewis2020rag}. Self-RAG adds reflection tokens that gate
+retrieval and critique generations~\cite{asai2023selfrag}. These operate on
+\emph{independent} chunks; coherence between retrieved items is not modelled.
+
+\paragraph{Graph- and structure-aware retrieval.} GraphRAG builds an entity
+knowledge graph and answers global queries by summarising community
+structure~\cite{edge2024graphrag}. For code, property graphs unify AST, control
+flow and data flow~\cite{yamaguchi2014cpg}. CCOS regions are in this lineage but
+target \emph{paging}: which connected sub-structure to make resident for a task,
+under a token budget, with deterministic eviction.
+
+\paragraph{Agent memory.} MemGPT casts the LLM as an OS that pages between an
+in-context window and external storage~\cite{packer2023memgpt}; Generative Agents
+retrieve memories scored by recency, importance and
+relevance~\cite{park2023generative} --- the same factors CCOS aggregates into a
+region temperature. LangGraph~\cite{langgraph} structures agents as stateful
+graphs of steps; it orchestrates \emph{control} flow, whereas CCOS structures
+\emph{memory}. The two are complementary.
+
+\paragraph{Context-window management.} KV-cache eviction keeps ``heavy hitter''
+or sink tokens resident~\cite{liu2023lost}, and PagedAttention applies OS paging
+to the KV cache~\cite{kwon2023paged}. These act at the token level inside one
+forward pass; CCOS acts at the \emph{semantic} level across an agent session.
+
+\section{The Causal Context Substrate}\label{sec:substrate}
+
+CCOS parses source into a directed \emph{causal memory graph} $G=(V,E)$. A node
+$v\in V$ is a file, module, symbol or external dependency, with scalar fields
+$\mathrm{imp}(v)$ (base importance), $\mathrm{fail}(v)\in[0,1]$ (failure
+relevance) and $\mathrm{rec}(v)\in[0,1]$ (recency). An edge $e=(u\!\to\!w)\in E$
+carries a weight $w(e)\in(0,1]$ and a type (containment, dependency, reference,
+causation). The kernel assigns each node a causal score
+\begin{equation}
+\mathrm{score}(v) = \mathrm{clamp}\big(0.15\,\mathrm{imp}(v) + 0.50\,\mathrm{fail}(v)
+  + 0.30\,\mathrm{rec}(v) + 0.05\ln(1{+}\mathrm{acc}(v)),\,0,1\big),
+\label{eq:score}
+\end{equation}
+where $\mathrm{acc}(v)$ is the access count. Faults propagate along edges,
+$\mathrm{fail}$ decays with a logical clock, and every state transition is
+appended to a hash-chained event log enabling deterministic
+replay~\cite{haber1991timestamp}. Node identifiers are namespaced
+(\code{file:p}, \code{mod:p:n}, \code{use:p:path}, \code{sym:p:n},
+\code{dep:root}); the owning file of a node is recoverable from its identifier.
+CCOS v0.2 pages in the top-$\mathrm{score}$ nodes: a flat, 1-D policy. We now
+make selection spatial.
+
+\section{Context Regions}\label{sec:regions}
+
+\subsection{Causal distance}
+
+\begin{definition}[Causal distance]
+Let $\hat G$ be the undirected multigraph on $V$ induced by $E$, and assign each
+edge the cost $c(e) = -\ln w(e) \ge 0$, so that a stronger causal link is a
+shorter step. The \emph{causal distance} $\dcausal(u,v)$ is the minimum total
+cost over all $u$--$v$ paths in $\hat G$, and $+\infty$ if none exists. The
+unweighted hop distance $\mathrm{hops}(u,v)$ is defined analogously with unit
+costs.
+\end{definition}
+
+$c(e)\ge 0$ since $w(e)\le 1$, so $\dcausal$ is a genuine shortest-path metric on
+each connected component (non-negative, symmetric, triangle inequality). The
+\emph{$k$-hop causal neighbourhood} of a target $t$ is
+\begin{equation}
+\Nk(t) = \{\, v \in V : \mathrm{hops}(t,v) \le k \,\}.
+\end{equation}
+$\Nk(t)$ is the ground truth ``what is causally relevant to a task at $t$'' used
+in the evaluation (\S\ref{sec:eval}).
+
+\subsection{Region membership}
+
+External dependency hubs (e.g.\ \code{dep:std}) connect almost everything and
+must not collapse the graph into one component. We therefore separate them.
+
+\begin{definition}[Cross-file causal link]
+For a non-external node $v$ let $\phi(v)$ be its owning file. Two files $f,g$ are
+\emph{directly linked}, written $f \approx g$, iff there exists an edge
+$(u\!\to\!w)\in E$ with $\phi(u)=f$, $\phi(w)=g$, $f\neq g$, and neither $u$ nor
+$w$ is an external dependency node.
+\end{definition}
+
+\begin{definition}[Region]\label{def:region}
+Let $\approx^{*}$ be the reflexive-transitive closure of $\approx$ on the set of
+file keys. A \emph{region} is the set of all nodes whose files lie in one
+equivalence class of $\approx^{*}$; all external dependency nodes form one
+additional region. Two nodes belong to the same region iff their files are in the
+same connected component of the cross-file causal-link graph.
+\end{definition}
+
+\begin{proposition}[Regions partition the nodes]
+The regions of Definition~\ref{def:region} form a partition of $V$: every node
+lies in exactly one region.
+\end{proposition}
+\begin{proof}
+$\approx^{*}$ is an equivalence relation on file keys, so its classes partition
+the file keys; the external bucket is a distinct class by construction. Mapping
+each non-external node to its file's class and each external node to the external
+class is a total function into disjoint blocks, hence a partition. \qed
+\end{proof}
+
+By default (only containment and import edges) each source file is its own region.
+A genuine cross-file dependency or a propagated failure merges files into a single
+multi-file region --- the ``zone of knowledge'' an agent should wake together.
+
+\subsection{Region scalars}
+
+For a region $R$ with member set $M$:
+\begin{align}
+\mathrm{heat}(v)        &= 0.5\,\mathrm{score}(v) + 0.3\,\mathrm{fail}(v) + 0.2\,\mathrm{rec}(v), \\
+\mathrm{temp}(R)        &= \mathrm{clamp}\!\Big(\tfrac{1}{|M|}\textstyle\sum_{v\in M}\mathrm{heat}(v),\,0,1\Big), \label{eq:temp}\\
+\mathrm{dens}(R)        &= \frac{|\{\,e\in E : \text{both endpoints} \in M\,\}|}{|M|}. \label{eq:dens}
+\end{align}
+Temperature is how ``awake'' a region is; density is its internal causal cohesion
+(internal edges per member). Activation warms a region
+($\mathrm{temp}\mathrel{+}=0.25$, capped) and records a logical tick; a cooldown
+step multiplies temperatures by a decay factor and evicts regions below a floor.
+
+\subsection{Dynamic admission policy}\label{sec:policy}
+
+The static threshold $0.6$ becomes a function of token pressure $u\in[0,1]$ (the
+used fraction of the budget) and task complexity $\kappa\in[0,1]$:
+\begin{align}
+\theta(u,\kappa)       &= \mathrm{clamp}(0.6 + 0.3\,u - 0.2\,\kappa,\; 0.05,\; 0.95), \\
+a(R)                   &= 0.55\,\mathrm{temp}(R) + 0.30\,\frac{\mathrm{dens}(R)}{1+\mathrm{dens}(R)} + 0.15\,\kappa, \\
+\mathrm{admit}(R)      &\iff a(R) \ge \theta(u,\kappa).
+\end{align}
+A hot, cohesive region can be admitted even when the static $0.6$ would reject it;
+a nearly-full window raises $\theta$ so only the hottest regions enter.
+
+\section{Determinism and Replay}\label{sec:determinism}
+
+\begin{theorem}[Regional determinism]
+The region partition, every region scalar in
+\eqref{eq:temp}--\eqref{eq:dens}, and the activation history are pure,
+order-independent functions of the graph $G$ and the sequence of (logically
+timestamped) activation events. Consequently, given the event log of a session,
+the engine state reconstructs identically: if $G'$ is the graph rebuilt from the
+log and $L$ its region events, then $\mathrm{replay\_from}(G',L)$ equals the live
+engine that produced $L$.
+\end{theorem}
+\begin{proof}[Proof sketch]
+Clustering enumerates nodes and edges in sorted order and computes connected
+components by a sorted breadth-first search, so its output is independent of hash
+iteration order. Equations \eqref{eq:score}, \eqref{eq:temp} and \eqref{eq:dens}
+are deterministic arithmetic over node fields and a count of qualifying edges.
+Activation reads a logical clock (a counter), never wall-clock time, and the
+emitted \code{RegionActivated} event records the exact tick. Reconstruction
+re-clusters $G'$ (identical base state, since $G'\!=\!G$ structurally) and applies
+the recorded activations in log order; each step is the same pure function of the
+same inputs, so the resulting state is identical. The integration test
+\code{replay\_reconstructs\_identical\_engine} checks
+$\mathrm{engine}=\mathrm{replay\_from}(G',L)$ by structural equality. \qed
+\end{proof}
+
+This extends CCOS's existing guarantees: the primary event log is hash-chained and
+tamper-evident, so the region history is auditable, and a 10\,000-cycle test
+exhibits no drift in region count or temperatures.
+
+\section{Implementation}\label{sec:impl}
+
+The engine is $\approx\!600$ lines of dependency-light Rust layered above the
+graph, with no change to the parser, guard, incremental builder or event-sourcing
+core. The public surface is: \code{ContextRegionEngine} (\code{cluster\_nodes},
+\code{initialize\_regions}, \code{activate\_region}, \code{tick\_cooldown},
+\code{replay\_from}), the data types \code{ContextRegion} / \code{ContextPoint} /
+\code{ContextWindow}, the \code{ContextPolicy}, and five new event variants
+(\code{RegionCreated}, \code{RegionActivated}, \code{RegionMerged},
+\code{RegionEvicted}, \code{ContextWindowGenerated}). A \code{ccos regions} CLI
+exposes clustering, activation and the locality report. The whole crate builds
+warning-clean under \code{clippy -D warnings} and passes 202 tests.
+
+\section{Evaluation: what we can measure today}\label{sec:eval}
+
+We separate \emph{measured} results (this section, fully reproducible and
+LLM-free) from \emph{hypothesised} agent-level gains (\S\ref{sec:protocol}).
+
+\paragraph{Setup.} We run on CCOS's own source tree
+($|V|=705$ nodes, $|E|=822$ edges, yielding $26$ regions). For a target node $t$
+we take $\Nk(t)$ with $k=2$ as ground truth and compare two selection strategies
+at the region's size budget: \textbf{flat} --- the top-$|R|$ nodes by
+$\mathrm{score}$ (CCOS v0.2 / classical ranked retrieval) --- and \textbf{region}
+--- the members of $t$'s region. We report causal precision $|S\cap\Nk|/|S|$,
+recall $|S\cap\Nk|/|\Nk|$, and the tokens each strategy needs to \emph{cover}
+$\Nk$. All numbers are emitted by \code{scripts/region\_benchmark.sh} and are
+deterministic.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lcc}
+\toprule
+Strategy & causal precision & causal recall \\
+\midrule
+flat (v0.2 / ranked) & 0.021 & 0.347 \\
+\textbf{region (v0.3)} & \textbf{0.057} & \textbf{0.972} \\
+\bottomrule
+\end{tabular}
+\caption{Locality on \code{src/} ($k=2$, 12 targets). Region selection covers
+$97\%$ of a task's causal neighbourhood versus $35\%$ for flat, at
+$\approx\!48\%$ fewer tokens for equal coverage.}
+\label{tab:locality}
+\end{table}
+
+\paragraph{Cohesion and cost.} Regions reach an \textbf{average causal density of
+$0.955$} (Eq.~\ref{eq:dens}, normalised) --- they are almost entirely internally
+connected, i.e.\ genuine causal clusters rather than arbitrary file groups.
+Building the region map for $705$ nodes takes $\approx\!20$\,ms
+($54.5$ builds/s); a single activation is $\approx\!20$\,ms.
+
+\paragraph{Honest reading.} Absolute precision is low ($0.06$) because the v0.2
+parser emits only containment and import edges, so $\Nk(t)$ is tiny (often $2$--$3$
+nodes) while a region spans a whole file. The robust, real wins are
+\emph{recall} ($0.97$ vs $0.35$) and \emph{token efficiency} ($\approx\!48\%$):
+a region reliably contains a task's causal neighbourhood and pays fewer tokens to
+do so. Richer semantic edges (call graph / data flow, roadmap item P1.3) would
+sharpen $\Nk$ and is the main lever to raise precision; we flag this rather than
+hide it.
+
+\section{Proposed comparative study (not yet run)}\label{sec:protocol}
+
+The thesis worth testing is: \emph{does causal regional memory help an agent solve
+long-horizon tasks better than chunk-based retrieval?} We cannot answer this with
+the implementation alone --- it requires LLM rollouts, baselines and datasets we
+have not run --- so we specify a falsifiable protocol and \textbf{report no
+numbers for it}.
+
+\paragraph{Baselines.} (i) \emph{Classical RAG}: embedding retrieval over code
+chunks, top-$k$ by cosine~\cite{lewis2020rag}. (ii) \emph{GraphRAG}: community
+summarisation over a code/entity graph~\cite{edge2024graphrag}. (iii)
+\emph{MemGPT}: OS-style paged agent memory~\cite{packer2023memgpt}. (iv)
+\emph{LangGraph} agent with a vector store~\cite{langgraph}. (v) \emph{CCOS
+regions}: hydrate the target's region under the dynamic policy. All share the same
+base LLM and token budget.
+
+\paragraph{Tasks and data.} Long-horizon repository tasks where context selection
+is decisive: SWE-bench~\cite{jimenez2023swebench} issue resolution (patch passes
+the hidden tests), and a controlled \emph{multi-file bug} suite where the fault
+site, its cause and its blast radius lie in distinct files (so coherent selection
+matters).
+
+\paragraph{Metrics.}
+(1) \textbf{Task success}: resolved-rate / unit-test pass.
+(2) \textbf{Token efficiency}: input tokens to success, and success at a fixed
+budget.
+(3) \textbf{Hallucination}: rate of references to non-existent symbols / files in
+the agent's output, checked against the ground-truth graph (a citation-grounding
+test, automatable without human labels).
+
+\paragraph{Hypotheses.}
+\textbf{H1} (efficiency): CCOS reaches equal task success at fewer input tokens
+than RAG/GraphRAG, because a region covers the causal neighbourhood with higher
+recall (Table~\ref{tab:locality}).
+\textbf{H2} (long-horizon success): on multi-file tasks CCOS's resolved-rate
+exceeds chunk RAG by a margin that grows with the causal diameter of the task.
+\textbf{H3} (grounding): CCOS lowers the symbol-hallucination rate, because the
+admitted window is a connected sub-graph of \emph{real} nodes.
+
+\paragraph{Threats to validity.} Region quality is bounded by edge quality
+(\S\ref{sec:eval}); results would conflate the region \emph{policy} with the
+underlying \emph{graph}. Ablations must therefore fix the graph and vary only the
+selection strategy, and report per-task causal diameter so that gains are
+attributed to coherence, not to retrieving more text. A positive result on H1--H3
+would constitute the research contribution; a null result would still validate the
+deterministic, auditable infrastructure.
+
+\section{Limitations}
+
+The parser is a line/AST heuristic, so causal neighbourhoods are shallow; regions
+are file-granular by default and only merge on explicit cross-file edges;
+temperature/policy constants are hand-tuned, not learned; and the agent-level
+claims of \S\ref{sec:protocol} are untested. None of these affect the proven
+properties (partition, determinism, replay) or the measured locality.
+
+\section{Conclusion}
+
+We reframed LLM context selection from a 1-D ranked list to a spatial map of
+\emph{causal regions}, gave the construction a precise and deterministic
+definition, proved it reconstructs bit-for-bit on replay, and measured --- without
+any LLM --- that regions cover a task's causal neighbourhood far more completely
+and cheaply than flat ranking. Whether this locality translates into better
+long-horizon agent behaviour is an empirical question we have framed as a
+falsifiable protocol against RAG, GraphRAG, MemGPT and LangGraph. We release the
+engine, the metrics and this paper so the claim can be tested rather than
+asserted.
+
+\begin{thebibliography}{99}
+\bibitem{lewis2020rag} P.~Lewis et al. Retrieval-Augmented Generation for
+Knowledge-Intensive NLP Tasks. \emph{NeurIPS}, 2020. arXiv:2005.11401.
+\bibitem{asai2023selfrag} A.~Asai et al. Self-RAG: Learning to Retrieve, Generate
+and Critique through Self-Reflection. \emph{ICLR}, 2024. arXiv:2310.11511.
+\bibitem{edge2024graphrag} D.~Edge et al. From Local to Global: A Graph RAG
+Approach to Query-Focused Summarization. 2024. arXiv:2404.16130.
+\bibitem{yamaguchi2014cpg} F.~Yamaguchi et al. Modeling and Discovering
+Vulnerabilities with Code Property Graphs. \emph{IEEE S\&P}, 2014.
+\bibitem{packer2023memgpt} C.~Packer et al. MemGPT: Towards LLMs as Operating
+Systems. 2023. arXiv:2310.08560.
+\bibitem{park2023generative} J.~S.~Park et al. Generative Agents: Interactive
+Simulacra of Human Behavior. \emph{UIST}, 2023. arXiv:2304.03442.
+\bibitem{langgraph} LangChain. LangGraph: Building Stateful, Multi-Actor
+Applications with LLMs. Software framework, 2023--2024.
+\url{https://github.com/langchain-ai/langgraph}.
+\bibitem{denning1968working} P.~J.~Denning. The Working Set Model for Program
+Behavior. \emph{Communications of the ACM}, 11(5), 1968.
+\bibitem{liu2023lost} N.~F.~Liu et al. Lost in the Middle: How Language Models Use
+Long Contexts. \emph{TACL}, 2024. arXiv:2307.03172.
+\bibitem{kwon2023paged} W.~Kwon et al. Efficient Memory Management for Large
+Language Model Serving with PagedAttention. \emph{SOSP}, 2023. arXiv:2309.06180.
+\bibitem{haber1991timestamp} S.~Haber and W.~S.~Stornetta. How to Time-Stamp a
+Digital Document. \emph{Journal of Cryptology}, 3(2), 1991.
+\bibitem{jimenez2023swebench} C.~E.~Jimenez et al. SWE-bench: Can Language Models
+Resolve Real-World GitHub Issues? \emph{ICLR}, 2024. arXiv:2310.06770.
+\end{thebibliography}
+
+\end{document}

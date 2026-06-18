@@ -8,6 +8,18 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Context Region Engine** (CCOS v0.3) — a spatial memory model above the causal
+  graph. New modules `context_region`, `region_engine`, `context_policy`,
+  `region_metrics`: nodes are embedded in a 3-D context space and clustered into
+  **regions** (connected components of the cross-file causal-link graph) with a
+  temperature and causal density; a region is hydrated as a `ContextWindow` under
+  a **dynamic admission policy**. Five new event types
+  (`RegionCreated/Activated/Merged/Evicted/ContextWindowGenerated`) keep it
+  event-sourced and deterministically replayable (`replay_from`). New `ccos
+  regions` CLI (cluster / activate / metrics), `scripts/region_benchmark.sh`,
+  `docs/context_regions.md`, and an arXiv research paper in `docs/paper/`.
+  Measured: region selection covers 97% of a task's causal neighbourhood vs 35%
+  flat at ≈48% fewer tokens; regions 95.5% internally connected.
 - **Canonical tamper-evident `EventLog`** (ROADMAP P1.2): every appended event is
   linked into a SHA-256 hash chain over its replayable content (sequence + type +
   payload), so integrity now covers *all* runs, not just persisted snapshots.

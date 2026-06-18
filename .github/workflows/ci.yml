@@ -70,4 +70,7 @@ jobs:
           cargo run --locked -- top src --limit 10
           cargo run --locked -- blame /tmp/run.json file:src/lib.rs --depth 3
           cargo run --locked -- export /tmp/run.json --out /tmp/ccos.graphml
+          cargo run --locked -- regions src
+          cargo run --locked -- regions src --activate file:src/lib.rs
+          cargo run --locked -- regions src --metrics file:src/lib.rs --json
           cargo run --locked -- chaos --iters 500

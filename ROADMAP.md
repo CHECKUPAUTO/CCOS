@@ -65,6 +65,28 @@ Prioritized roadmap from the audit. Effort: S/M/L.
 
 ---
 
+## ✅ Done — v0.3 Context Region Engine (spatial memory)
+
+- **Context regions** (`context_region`, `region_engine`) — the 1-D scored graph
+  is lifted into a spatial map: nodes are embedded in a 3-D context space
+  (structural / causal / temporal) and clustered into regions (connected
+  components of the cross-file causal-link graph) with a temperature and causal
+  density. Regions are hydrated as `ContextWindow`s instead of loading files.
+- **Dynamic admission policy** (`context_policy`) — the static `0.6` threshold
+  becomes a function of token pressure, task complexity, region temperature and
+  density.
+- **Event sourcing + deterministic replay** — `RegionCreated/Activated/Merged/
+  Evicted/ContextWindowGenerated` events; `replay_from` reconstructs regions
+  bit-for-bit from a rebuilt graph (proof + 10k-cycle no-drift test).
+- **Locality metrics** (`region_metrics`) + `scripts/region_benchmark.sh`: region
+  selection covers 97% of a task's causal neighbourhood vs 35% flat, ≈48% fewer
+  tokens; regions 95.5% internally connected.
+- **Docs**: `docs/context_regions.md` + an arXiv research paper in `docs/paper/`
+  (formal model, determinism theorem, falsifiable comparison protocol vs
+  RAG/GraphRAG/MemGPT/LangGraph). `ccos regions` CLI.
+
+---
+
 ## Remaining
 
 ### P0 — Correctness

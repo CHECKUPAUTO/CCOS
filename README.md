@@ -79,6 +79,11 @@ COMMANDS:
     blame <snap> <node-id>     Causes (upstream) + blast radius (downstream) (--depth N)
     export <snap> [--out F]    Export the causal graph as GraphML (default ccos.graphml)
 
+  Context Region Engine (spatial memory):
+    regions <path>             Cluster the causal graph into context regions (--json)
+        --activate <node-id>   Hydrate the context window for a node's region
+        --metrics <node-id>    Flat-vs-region locality comparison (--radius N)
+
   CCOS v0.3 — Autonomous Context Runtime:
     scan <path>                Scan a real workspace and ingest the delta
     agents <path>              Run Coder/Reviewer/Security agents over a workspace
@@ -170,6 +175,26 @@ upstream (`target → source`, what the node rests on) and the **blast radius** 
 downstream (`source → target`, what breaks if the node fails). See
 [`docs/USAGE.md`](docs/USAGE.md) for a full command reference and walkthrough.
 
+### Context Region Engine — `regions`
+
+CCOS v0.3 lifts the 1-D scored graph into a **spatial map of causal regions**: an
+agent no longer loads files, it hydrates a *region* (a causally coherent cluster
+of files, dependencies and faults) with a temperature, a density and a dynamic
+admission policy.
+
+```bash
+cargo run -- regions src                                   # cluster → region map
+cargo run -- regions src --activate file:src/memory.rs     # hydrate a context window
+cargo run -- regions src --metrics sym:src/memory.rs:MemoryGraph --json  # flat vs region
+bash scripts/region_benchmark.sh src                       # full locality benchmark
+```
+
+On CCOS's own tree, region selection covers **97%** of a task's causal
+neighbourhood (vs 35% for flat top-score selection) at **≈48% fewer tokens**, with
+regions that are **95.5%** internally connected. See
+[`docs/context_regions.md`](docs/context_regions.md) and the research paper in
+[`docs/paper/`](docs/paper/).
+
 ### CCOS v0.3 — Autonomous Context Runtime
 
 v0.3 scans a real workspace, pages its context (HOT/WARM/COLD), runs specialized
@@ -188,7 +213,7 @@ See [`CCOS_v0.3_REPORT.md`](CCOS_v0.3_REPORT.md) for the full v0.3 report.
 ## Testing
 
 ```bash
-cargo test          # 165 unit + integration tests
+cargo test          # 202 unit + integration tests
 cargo clippy --all-targets   # lint-clean
 cargo test -- --ignored      # opt-in: 1,000,000-cycle long-stability run
 ```
@@ -216,6 +241,12 @@ Heavier stress/chaos harnesses live in [`scripts/`](scripts/) (multi-day chaos,
 - [`docs/USAGE.md`](docs/USAGE.md) — **command reference & walkthroughs**: every
   command with example invocations and output, an end-to-end "analyze a real
   project" tour, the snapshot/replay workflow, and a troubleshooting FAQ.
+- [`docs/context_regions.md`](docs/context_regions.md) — the **Context Region
+  Engine** (v0.3): spatial memory model, formal region definition, dynamic
+  admission policy, determinism, and measured locality.
+- [`docs/paper/`](docs/paper/) — **research paper** (arXiv LaTeX): *Causal Context
+  Regions* — formal model, determinism proof, measured locality, and a falsifiable
+  comparison protocol vs RAG / GraphRAG / MemGPT / LangGraph.
 - [`docs/PAPER.md`](docs/PAPER.md) — design paper: architecture, algorithms
   (causal scoring, failure propagation, deterministic paging, hash-chained log,
   consensus) and the audit-driven evaluation.

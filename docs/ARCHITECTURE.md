@@ -18,6 +18,10 @@ A practical map of the codebase for contributors. For the conceptual write-up se
 | `adversarial`               | Fault injection for hardening | `AdversarialEngine`, `AdversarialMode` |
 | `persist`                   | Save/load a kernel snapshot (one file) | `KernelSnapshot` |
 | `query`                     | Read-only causal queries: impact/cause walks, hot set, GraphML export | `Reached`, `Direction`, `impact_set`, `source_set`, `hot_set`, `to_graphml` |
+| **`region_engine`** (v0.3)  | Clusters the graph into spatial regions; activation → context window; deterministic replay | `ContextRegionEngine`, `ContextWindow`, `RegionQuery` |
+| **`context_region`** (v0.3) | Spatial-memory data model (3-D embedding, temperature, density) | `ContextRegion`, `ContextPoint` |
+| **`context_policy`** (v0.3) | Dynamic context-admission score (replaces the static threshold) | `ContextPolicy` |
+| **`region_metrics`** (v0.3) | Flat-vs-region locality measurement (precision/recall/tokens) | `LocalityReport`, `locality_report`, `causal_neighborhood` |
 | `util`                      | Shared helpers (`sha256_hex`) | `sha256_hex` |
 | **`scheduler`** (v0.3)      | HOT/WARM/COLD context paging by token budget | `ContextScheduler`, `MemoryZone` |
 | **`workspace`** (v0.3)      | Async real-FS scanner; add/modify/remove delta | `WorkspaceScanner`, `WorkspaceDelta` |
@@ -106,7 +110,7 @@ or loaded from a snapshot (`blame`, `export`):
 
 ```bash
 cargo build --all-targets
-cargo test                    # 165 tests (171 with --features syn-parser)
+cargo test                    # 202 tests (208 with --features syn-parser)
 cargo clippy --all-targets    # warning-clean (CI denies warnings)
 cargo doc --open              # rendered module docs
 ```

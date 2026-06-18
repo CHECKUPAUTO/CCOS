@@ -30,6 +30,10 @@
 //!   logs) to JSON for cross-session replay and verification.
 //! - [`query`] — read-only causal queries (impact/cause walks, hot set, GraphML
 //!   export) behind the `top`, `blame` and `export` subcommands.
+//! - [`region_engine`] — the **Context Region Engine** (v0.3): clusters the
+//!   graph into spatial [`region_engine::ContextRegionEngine`] regions that are
+//!   hydrated as context windows, with a dynamic [`context_policy`] admission
+//!   policy and deterministic replay. See [`context_region`], [`region_metrics`].
 //!
 //! ## Invariants
 //!
@@ -58,3 +62,9 @@ pub mod benchmark;
 pub mod persistence;
 pub mod scheduler;
 pub mod workspace;
+
+// ── CCOS v0.3 — Context Region Engine (spatial memory) ──────────────
+pub mod context_policy;
+pub mod context_region;
+pub mod region_engine;
+pub mod region_metrics;

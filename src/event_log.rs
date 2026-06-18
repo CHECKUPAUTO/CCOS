@@ -54,6 +54,12 @@ pub enum EventType {
     ReplayEnd,
     Snapshot,
     AgentAction,
+    // ── Context Region Engine (v0.3) ────────────────────────────────
+    RegionCreated,
+    RegionActivated,
+    RegionMerged,
+    RegionEvicted,
+    ContextWindowGenerated,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,6 +135,43 @@ pub enum EventPayload {
         target: String,
         weight: f64,
         edge_type: EdgeType,
+    },
+    // ── Context Region Engine (v0.3) ────────────────────────────────
+    /// A spatial region was formed during clustering.
+    RegionCreated {
+        region_id: String,
+        center: String,
+        member_count: usize,
+        temperature: f32,
+        causal_density: f32,
+    },
+    /// A region was woken for a task (carries the logical tick for replay).
+    RegionActivated {
+        region_id: String,
+        tick: u64,
+        temperature: f32,
+        activation_count: u64,
+        reason: String,
+    },
+    /// Two or more file-buckets were merged into one region.
+    RegionMerged {
+        into_region: String,
+        from_region: String,
+        member_count: usize,
+    },
+    /// A cold region was evicted from the context map.
+    RegionEvicted {
+        region_id: String,
+        temperature: f32,
+        reason: String,
+    },
+    /// A context window was hydrated from a region.
+    ContextWindowGenerated {
+        region_id: String,
+        file_count: usize,
+        tokens_estimated: usize,
+        region_score: f32,
+        reason: String,
     },
     Custom {
         key: String,
@@ -339,6 +382,9 @@ pub struct ReplayStatistics {
     pub failures: usize,
     pub guard_checks: usize,
     pub cycles: usize,
+    pub regions_created: usize,
+    pub regions_activated: usize,
+    pub context_windows: usize,
 }
 
 impl ReplayHandler for EventReplayer {
@@ -356,6 +402,9 @@ impl ReplayHandler for EventReplayer {
             EventPayload::FailurePropagation { .. } => self.statistics.failures += 1,
             EventPayload::GuardCheck { .. } => self.statistics.guard_checks += 1,
             EventPayload::CycleEvent { .. } => self.statistics.cycles += 1,
+            EventPayload::RegionCreated { .. } => self.statistics.regions_created += 1,
+            EventPayload::RegionActivated { .. } => self.statistics.regions_activated += 1,
+            EventPayload::ContextWindowGenerated { .. } => self.statistics.context_windows += 1,
             _ => {}
         }
         Ok(())
