@@ -8,6 +8,28 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Causal-validation harness** (`scripts/causal_validation/`) — a closed-loop,
+  LLM-free harness that tests CCOS's failure-propagation claim against the
+  repository's **own Git history**. Phase 1 mines fix commits, reconstructs the
+  pre-fix world in a throwaway worktree, and injects the fault at a changed file;
+  Phase 2 scores `R_cov = |F_target ∩ WorkingSet_K| / |F_target|` per node budget
+  `K` (arithmetic + geometric mean). Has a `--dry-run`; standard-library only.
+  First run (on this thin history) honestly reports `R_cov ≈ 0.30`, flat across
+  `K` — only the seed file is recovered — which localises a real limitation
+  (failure pressure flows downstream only) and gives Phase 3 a concrete objective.
+- **Tunable scoring weights** — the causal-score coefficients and the
+  failure-propagation decay are now a `ScoringWeights` value on `MemoryGraph`
+  (defaults reproduce the shipped constants exactly, regression-tested), settable
+  via `set_scoring_weights` or the environment (`CCOS_W_BASE`, `CCOS_W_FAILURE`,
+  `CCOS_W_RECENCY`, `CCOS_W_ACCESS`, `CCOS_FAILURE_DECAY`). `ccos analyze` and
+  `ccos failure` honour them, so a hyperparameter search needs no recompile.
+- **`ccos failure --max-nodes K --json`** — re-pages the graph to the bounded
+  **WorkingSet_K** after fault injection and emits it (plus the affected set and
+  the weights used) as JSON: the measurement hook the validation harness drives.
+- **Anthropic Messages provider** for `ccos eval` — the real-LLM harness now also
+  speaks `/v1/messages` (`ANTHROPIC_API_KEY` + optional `ANTHROPIC_BASE_URL` /
+  `ANTHROPIC_MODEL`), so it can drive any Anthropic-compatible endpoint (e.g.
+  DeepSeek at `https://api.deepseek.com/anthropic`, model `deepseek-v4-pro`).
 - **Context Region Engine** (CCOS v0.3) — a spatial memory model above the causal
   graph. New modules `context_region`, `region_engine`, `context_policy`,
   `region_metrics`: nodes are embedded in a 3-D context space and clustered into

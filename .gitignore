@@ -1,1 +1,4 @@
 /target
+
+# Causal-validation harness output (reproducible)
+scripts/causal_validation/results*.jsonl
