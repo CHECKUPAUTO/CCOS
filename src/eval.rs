@@ -655,10 +655,14 @@ pub async fn run_eval(cfg: &EvalConfig) -> EvalReport {
     let mut rng = StdRng::seed_from_u64(cfg.seed);
     let tasks = generate(cfg, &mut rng);
     let (provider, model) = provider_label();
+    // Live progress on stderr (so it never pollutes the JSON/table on stdout),
+    // but only with a real model — the offline stub is instant and silent.
+    let show_progress = !provider.starts_with("none");
+    let scenario = if cfg.noisy { "noisy" } else { "clean" };
 
     // strategy → diameter → tally
     let mut acc: BTreeMap<(String, u32), Tally> = BTreeMap::new();
-    for task in &tasks {
+    for (ti, task) in tasks.iter().enumerate() {
         let (g, _text) = build_graph(task);
         for strat in STRATEGIES {
             let sel = select(strat, task, &g, cfg.budget_tokens);
@@ -676,6 +680,22 @@ pub async fn run_eval(cfg: &EvalConfig) -> EvalReport {
             e.3 += toks as f32;
             e.4 += 1;
         }
+        if show_progress {
+            use std::io::Write;
+            eprint!(
+                "\r  [{scenario}] {}/{} tasks ({} calls each)…   ",
+                ti + 1,
+                tasks.len(),
+                STRATEGIES.len()
+            );
+            let _ = std::io::stderr().flush();
+        }
+    }
+    if show_progress {
+        eprintln!(
+            "\r  [{scenario}] {} tasks done.                    ",
+            tasks.len()
+        );
     }
 
     let mk =

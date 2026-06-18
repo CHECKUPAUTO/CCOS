@@ -1345,18 +1345,25 @@ fn run_experiment_cmd(args: &[String]) -> i32 {
     0
 }
 
-/// `ccos eval [--tasks N] [--seed S] [--budget T] [--json]` — the **real-LLM**
-/// evaluation (clean + noisy). Configure a model with `ANTHROPIC_API_KEY`
-/// (+`ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL`), `OPENAI_API_KEY`
+/// `ccos eval [--tasks N] [--seed S] [--budget T] [--model M] [--json]` — the
+/// **real-LLM** evaluation (clean + noisy). Configure a model with
+/// `ANTHROPIC_API_KEY` (+`ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL`), `OPENAI_API_KEY`
 /// (+`OPENAI_BASE_URL`, `OPENAI_MODEL`) or `OLLAMA_ENDPOINT`; with none set it
-/// runs an offline stub (every answer wrong) to exercise the pipeline.
+/// runs an offline stub (every answer wrong) to exercise the pipeline. `--model`
+/// overrides the active provider's model (defaulting to a local Ollama server if
+/// no provider env is set).
 async fn run_eval_cmd(args: &[String]) -> i32 {
     let mut cfg = EvalConfig::default();
     let mut json = false;
+    let mut model: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--json" => json = true,
+            "--model" => {
+                i += 1;
+                model = args.get(i).cloned();
+            }
             "--tasks" => {
                 i += 1;
                 if let Some(n) = args.get(i).and_then(|v| v.parse().ok()) {
@@ -1378,6 +1385,21 @@ async fn run_eval_cmd(args: &[String]) -> i32 {
             other => eprintln!("ccos: ignoring unknown flag '{other}'"),
         }
         i += 1;
+    }
+
+    // `--model M` overrides the model for whichever provider is active; with no
+    // provider env set, default to a local Ollama server (the common case).
+    if let Some(m) = model {
+        if std::env::var("ANTHROPIC_API_KEY").is_ok() {
+            std::env::set_var("ANTHROPIC_MODEL", &m);
+        } else if std::env::var("OPENAI_API_KEY").is_ok() {
+            std::env::set_var("OPENAI_MODEL", &m);
+        } else {
+            if std::env::var("OLLAMA_ENDPOINT").is_err() {
+                std::env::set_var("OLLAMA_ENDPOINT", "http://localhost:11434");
+            }
+            std::env::set_var("OLLAMA_MODEL", &m);
+        }
     }
 
     let clean = run_eval(&EvalConfig {
@@ -1523,7 +1545,7 @@ COMMANDS:\n\
         --activate <node-id>   Hydrate the context window for a node's region\n\
         --metrics <node-id>    Flat-vs-region locality comparison (--radius N)\n\
     experiment [--tasks N]     Hypothesis test: regional memory vs RAG/GraphRAG (--json)\n\
-    eval [--tasks N]           Real-LLM eval (set ANTHROPIC/OPENAI_API_KEY or OLLAMA_ENDPOINT)\n\
+    eval [--tasks N] [--model M]  Real-LLM eval (ANTHROPIC/OPENAI_API_KEY or OLLAMA_ENDPOINT)\n\
 \n\
   CCOS v0.3 — Autonomous Context Runtime:\n\
     scan <path>                Scan a real workspace and ingest the delta\n\
