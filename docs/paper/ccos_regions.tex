@@ -50,8 +50,11 @@ $95.5\%$ internally connected. In a deterministic, LLM-free \emph{simulation}
 under an explicit retrieval oracle, classical (lexical) RAG solves $0\%$ of
 cross-file causal tasks while structure-aware regional selection solves $100\%$,
 with the gap widening with task diameter --- though a strong graph-traversal
-baseline ties the regional method, so the lever is causal \emph{structure} and
-CCOS's value is operationalising it deterministically. We are careful that this
+baseline ties it on a clean query. Under a \emph{misleading} query, however, every
+lexically-seeded method --- including that graph baseline and an ablation of CCOS
+that trusts the query --- collapses to $0\%$, while only the workspace-anchored
+region survives: the differentiator is the \emph{anchor} (a structural workspace
+signal vs.\ a lexical query), not the region machinery. We are careful that this
 tests the \emph{necessary} (retrieval) condition, not the \emph{sufficient}
 (generation) one, and we then specify a falsifiable protocol --- not yet executed
 --- to test whether the gain survives with real LLMs against classical RAG,
@@ -332,65 +335,86 @@ the required causal context in the window}.
 \paragraph{Setup.} We generate modular synthetic repositories: $S$ independent
 subsystems, each a set of files linked by one cross-file causal chain plus
 high-score \emph{decoy} symbols; there are no edges between subsystems, so each
-subsystem is one bounded causal region. Crucially the causal structure is
-\emph{decoupled} from the lexical structure --- a chain neighbour shares no
-identifier token with the target, only an edge --- modelling a dependency that is
-causally essential yet lexically dissimilar to the query. A task of
-\emph{diameter} $d$ targets a symbol and requires the $\pm d$ window along its
-chain (up to $2d{+}1$ files). The token budget holds roughly one subsystem --- far
-less than the repository, so selection is a real constraint. The \textbf{success
-oracle} is $R(t)\subseteq S$: the required causal set lies inside the window. We
-compare five strategies at equal budget: \code{rag-dense} (top-$k$ lexical),
-\code{rag-hybrid} (lexical $+$ score), \code{graphrag-1hop} (best hit $+$ one
-hop), \code{graphrag-bfs} (unbounded graph expansion from the best hit --- a
-strong baseline), and \code{ccos-region}. Everything is seeded and deterministic;
-reproduce with \code{ccos experiment}.
+subsystem is one bounded causal region. The causal structure is \emph{decoupled}
+from the lexical structure --- a chain neighbour shares no identifier token with
+the target, only an edge --- modelling a dependency that is causally essential yet
+lexically dissimilar. A task of \emph{diameter} $d$ requires the $\pm d$ window
+along its chain (up to $2d{+}1$ files); the budget holds $\approx$ one subsystem,
+far less than the repository. The \textbf{oracle} is $R(t)\subseteq S$.
+
+Crucially, retrieval pipelines locate code from a text \emph{query}, whereas an
+OS-style memory \emph{anchors} on the workspace signal (the active file, a failing
+test). We model both: each task carries a query (a token bag) and an anchor (the
+active file node), and we run two scenarios --- \textbf{clean} (the query points
+at the target) and \textbf{noisy} (a trap decoy in an unrelated subsystem
+out-scores the target lexically). Six strategies share the budget:
+\code{rag-dense} (top-$k$ lexical), \code{rag-hybrid} (lexical $+$ causal score),
+\code{graphrag-1hop} (best hit $+$ one hop), \code{graphrag-bfs} (unbounded
+expansion from the best hit), \code{ccos-from-query} (CCOS region of the best
+\emph{lexical} hit --- an ablation), and \code{ccos-region} (CCOS region of the
+\emph{anchor}). Seeded and deterministic; reproduce with \code{ccos experiment}.
 
 \begin{table}[h]
 \centering
 \begin{tabular}{lcccccc}
 \toprule
-& \multicolumn{4}{c}{success rate at diameter $d$} & \multicolumn{2}{c}{overall} \\
+& \multicolumn{4}{c}{success at diameter $d$} & \multicolumn{2}{c}{overall} \\
 \cmidrule(lr){2-5}\cmidrule(lr){6-7}
-Strategy & $d{=}1$ & $d{=}2$ & $d{=}3$ & $d{=}4$ & success & coverage \\
+Strategy & $d{=}1$ & $d{=}2$ & $d{=}3$ & $d{=}4$ & succ. & cov. \\
 \midrule
-\code{rag-dense}     & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 0.19 \\
-\code{rag-hybrid}    & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 0.50 \\
-\code{graphrag-1hop} & 1.00 & 0.00 & 0.00 & 0.00 & 0.23 & 0.58 \\
-\code{graphrag-bfs}  & 1.00 & 1.00 & 1.00 & 1.00 & 1.00 & 1.00 \\
+\multicolumn{7}{l}{\emph{Clean query (points at the target)}}\\
+\code{rag-dense}      & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 0.19 \\
+\code{rag-hybrid}     & 1.00 & 0.00 & 0.00 & 0.00 & 0.23 & 0.65 \\
+\code{graphrag-1hop}  & 1.00 & 0.00 & 0.00 & 0.00 & 0.23 & 0.58 \\
+\code{graphrag-bfs}   & 1.00 & 1.00 & 1.00 & 1.00 & 1.00 & 1.00 \\
+\code{ccos-from-query}& 1.00 & 1.00 & 1.00 & 1.00 & 1.00 & 1.00 \\
+\code{ccos-region}    & 1.00 & 1.00 & 1.00 & 1.00 & 1.00 & 1.00 \\
+\midrule
+\multicolumn{7}{l}{\emph{Noisy query (a decoy out-scores the target lexically)}}\\
+\code{rag-dense}      & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 0.19 \\
+\code{rag-hybrid}     & 1.00 & 0.00 & 0.00 & 0.00 & 0.23 & 0.65 \\
+\code{graphrag-1hop}  & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 0.19 \\
+\code{graphrag-bfs}   & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 \\
+\code{ccos-from-query}& 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 \\
 \textbf{\code{ccos-region}} & \textbf{1.00} & \textbf{1.00} & \textbf{1.00} & \textbf{1.00} & \textbf{1.00} & \textbf{1.00} \\
 \bottomrule
 \end{tabular}
-\caption{Hypothesis simulation ($800$ tasks, seed $42$, budget $=30$ nodes
-$\approx$ one subsystem). Success $=$ the required causal set is inside the
-window.}
+\caption{Hypothesis simulation ($800$ tasks, seed $42$, budget $\approx$ one
+subsystem). Success $=$ the required causal set $R(t)$ is inside the window. Under
+a clean query every structure-aware method ties; under a misleading query only
+the workspace-anchored region survives.}
 \label{tab:sim}
 \end{table}
 
 \paragraph{Findings (and their honest limits).}
-\textbf{(1)} Lexical retrieval --- classical RAG --- \emph{fails} on cross-file
-causal tasks here ($0\%$ success; coverage $0.19$--$0.50$): ranking by similarity
-cannot surface causally-essential but lexically-dissimilar context. This
-validates the hypothesis's premise.
-\textbf{(2)} Shallow graph expansion (\code{graphrag-1hop}) solves only $d{=}1$
-and collapses beyond; the value of structure-aware selection \emph{grows with
-task diameter} (the direction of H2).
-\textbf{(3)} Critically, both \code{ccos-region} \emph{and} the strong
-\code{graphrag-bfs} baseline reach $1.00$. The lever is therefore causal
-\emph{structure}, \textbf{not CCOS per se}: any method that pages the causal
-component succeeds. CCOS's distinct contribution is \emph{operationalising} this
-as deterministic, replayable, precomputed, bounded, temperature-governed memory
-rather than per-query traversal --- at fewer tokens ($\approx\!3456$ vs the
-$3840$-token budget, since regions are bounded).
-\textbf{(4) Boundary condition.} This holds for \emph{modular} repositories with
-separable regions (we measured density $0.955$ on real code, \S\ref{sec:eval}). A
-monolithic single-component graph collapses the advantage: in an early run a
-single giant region exceeded the budget and CCOS degraded to $0\%$ --- reported
-rather than hidden.
-\textbf{(5)} This is a \emph{simulation under a stated oracle}, not an LLM
-evaluation. It tests the \emph{necessary} condition (the right context is
-retrievable), not the \emph{sufficient} one (the LLM then produces a correct
-patch), which is \S\ref{sec:protocol}.
+\textbf{(1)} Lexical retrieval (\code{rag-dense}) \emph{fails} on cross-file
+causal tasks ($0\%$; coverage $0.19$): similarity cannot surface
+causally-essential but lexically-dissimilar context --- the hypothesis's premise.
+(\code{rag-hybrid}'s $d{=}1$ wins come from the \emph{causal score} it borrows,
+not lexical similarity, which is why they persist under noise.)
+\textbf{(2)} The value of structure-aware selection \emph{grows with diameter}:
+one-hop expansion solves only $d{=}1$, while full causal paging
+(\code{graphrag-bfs}, \code{ccos-region}) solves all $d$ --- the direction of H2.
+\textbf{(3) The clean tie.} Under a clean query, \code{graphrag-bfs},
+\code{ccos-from-query} and \code{ccos-region} all reach $1.00$: the lever is
+causal \emph{structure}, \textbf{not CCOS per se}.
+\textbf{(4) The noisy separation.} Under a \emph{misleading} query, every method
+that locates code lexically collapses to $0\%$ --- including the strong
+\code{graphrag-bfs} \emph{and} the \code{ccos-from-query} ablation (CCOS seeded on
+the query). Only \code{ccos-region}, which anchors on the workspace signal rather
+than the query, survives at $1.00$. The ablation isolates the differentiator: it
+is the \emph{anchor source} (a structural workspace signal vs.\ a lexical query),
+not the region machinery. This is the realistic regime --- a task description
+rarely names the exact distant cause, and an OS-style memory that tracks the
+active working set is robust where query-time retrieval is misled.
+\textbf{(5) Assumptions, stated.} This credits CCOS with a reliable anchor (the
+active file / failing test), which an OS-level memory has but a pure retrieval
+pipeline does not; and it assumes \emph{modular} repositories with separable
+regions (density $0.955$ on real code, \S\ref{sec:eval}) --- a monolithic giant
+region exceeding the budget collapses the advantage (observed, reported).
+\textbf{(6)} Throughout this is a \emph{simulation under a stated oracle}: it
+tests the \emph{necessary} (retrieval) condition, not the \emph{sufficient}
+(generation) one of \S\ref{sec:protocol}.
 
 \section{Proposed comparative study with real LLMs (not yet run)}\label{sec:protocol}
 

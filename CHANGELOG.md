@@ -22,13 +22,16 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   flat at ≈48% fewer tokens; regions 95.5% internally connected.
 - **Hypothesis harness** (`experiment` module + `ccos experiment` CLI) — a
   deterministic, LLM-free simulation testing the *necessary condition* of the
-  research thesis (is the required causal context retrievable?) on modular
-  synthetic repos with cross-file causal tasks of growing diameter, comparing
-  five strategies (RAG-dense/hybrid, GraphRAG-1hop/BFS, CCOS-region) under an
-  explicit success oracle. Result: lexical RAG solves 0% of cross-file causal
-  tasks while structure-aware regional selection solves 100% (the gap widens with
-  diameter), with a strong graph-BFS baseline tying the regional method — folded
-  into the paper as `docs/paper/` §8.
+  research thesis on modular synthetic repos with cross-file causal tasks of
+  growing diameter, six strategies (RAG-dense/hybrid, GraphRAG-1hop/BFS,
+  CCOS-from-query, CCOS-region), under an explicit success oracle, across two
+  scenarios. **Clean query:** lexical RAG solves 0% while structure-aware methods
+  (graph-BFS, CCOS) solve 100% — the lever is causal *structure*, not CCOS per se.
+  **Noisy query** (a decoy out-scores the target lexically): every lexically-seeded
+  method collapses to 0% — including graph-BFS and the `ccos-from-query` ablation —
+  while only `ccos-region`, anchored on the workspace signal, survives at 100%. The
+  ablation isolates the differentiator: the *anchor source*, not the region
+  machinery. Folded into the paper (`docs/paper/` §8, two-scenario table).
 - **Canonical tamper-evident `EventLog`** (ROADMAP P1.2): every appended event is
   linked into a SHA-256 hash chain over its replayable content (sequence + type +
   payload), so integrity now covers *all* runs, not just persisted snapshots.

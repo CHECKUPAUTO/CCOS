@@ -195,9 +195,10 @@ On CCOS's own tree, region selection covers **97%** of a task's causal
 neighbourhood (vs 35% for flat top-score selection) at **≈48% fewer tokens**, with
 regions that are **95.5%** internally connected. In a deterministic, LLM-free
 simulation (`ccos experiment`), **lexical RAG solves 0%** of cross-file causal
-tasks while **structure-aware regional selection solves 100%** (the gap widening
-with task diameter) — though a strong graph-traversal baseline ties it, so the
-lever is causal *structure* that CCOS operationalises deterministically. See
+tasks while structure-aware methods solve 100%; and under a **misleading query**,
+every lexically-seeded method (RAG, GraphRAG, *and* an ablation of CCOS that
+trusts the query) collapses to **0%** while only the **workspace-anchored region
+survives** — isolating the *anchor* as CCOS's differentiator. See
 [`docs/context_regions.md`](docs/context_regions.md) and the research paper in
 [`docs/paper/`](docs/paper/).
 

@@ -1199,59 +1199,77 @@ fn run_experiment_cmd(args: &[String]) -> i32 {
         i += 1;
     }
 
-    let report = run_experiment(&cfg);
+    // Run both scenarios: clean (query points at the target) and noisy (a trap
+    // decoy out-scores the target lexically).
+    let clean = run_experiment(&ExperimentConfig {
+        noisy: false,
+        ..cfg.clone()
+    });
+    let noisy = run_experiment(&ExperimentConfig {
+        noisy: true,
+        ..cfg.clone()
+    });
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&report).unwrap());
+        let out = serde_json::json!({ "clean": clean, "noisy": noisy });
+        println!("{}", serde_json::to_string_pretty(&out).unwrap());
         return 0;
     }
+
+    let strategies = [
+        "rag-dense",
+        "rag-hybrid",
+        "graphrag-1hop",
+        "graphrag-bfs",
+        "ccos-from-query",
+        "ccos-region",
+    ];
+    let print_table = |report: &ccos::experiment::ExperimentReport, title: &str| {
+        println!("  ── {title} ──");
+        println!(
+            "    {:<16} {:>6} {:>6} {:>6} {:>6}",
+            "strategy", "d=1", "d=2", "d=3", "d=4"
+        );
+        for strat in strategies {
+            let cell = |d: u32| -> String {
+                report
+                    .per_diameter
+                    .iter()
+                    .find(|(dd, _)| *dd == d)
+                    .and_then(|(_, row)| row.iter().find(|r| r.strategy == strat))
+                    .map(|r| format!("{:.2}", r.success_rate))
+                    .unwrap_or_else(|| "  – ".into())
+            };
+            println!(
+                "    {:<16} {:>6} {:>6} {:>6} {:>6}",
+                strat,
+                cell(1),
+                cell(2),
+                cell(3),
+                cell(4)
+            );
+        }
+    };
 
     println!("╔══════════════════════════════════════════════╗");
     println!("║  CCOS experiment — regional memory vs RAG    ║");
     println!("╚══════════════════════════════════════════════╝\n");
     println!(
         "  seed={}  tasks={}  budget={} tokens   (success = required causal set ⊆ window)\n",
-        report.seed, report.n_tasks, report.budget_tokens
+        clean.seed, clean.n_tasks, clean.budget_tokens
     );
-
-    println!("  ── Task-success rate by causal diameter ──");
+    print_table(&clean, "CLEAN query (points at the target)");
+    println!();
+    print_table(
+        &noisy,
+        "NOISY query (a decoy out-scores the target lexically)",
+    );
     println!(
-        "    {:<14} {:>6} {:>6} {:>6} {:>6}",
-        "strategy", "d=1", "d=2", "d=3", "d=4"
+        "\n  Reading: lexical RAG fails on cross-file tasks; structure-aware methods\n  \
+         (graph-BFS, CCOS) tie when the query is clean — but under a misleading query\n  \
+         only `ccos-region`, which anchors on the workspace signal (not the query),\n  \
+         survives. The differentiator is the anchor, not the region machinery."
     );
-    for strat in [
-        "rag-dense",
-        "rag-hybrid",
-        "graphrag-1hop",
-        "graphrag-bfs",
-        "ccos-region",
-    ] {
-        let cell = |d: u32| -> String {
-            report
-                .per_diameter
-                .iter()
-                .find(|(dd, _)| *dd == d)
-                .and_then(|(_, row)| row.iter().find(|r| r.strategy == strat))
-                .map(|r| format!("{:.2}", r.success_rate))
-                .unwrap_or_else(|| "  – ".into())
-        };
-        println!(
-            "    {:<14} {:>6} {:>6} {:>6} {:>6}",
-            strat,
-            cell(1),
-            cell(2),
-            cell(3),
-            cell(4)
-        );
-    }
-
-    println!("\n  ── Overall (success · coverage · tokens) ──");
-    for r in &report.overall {
-        println!(
-            "    {:<14} success {:.2}   coverage {:.2}   ~{:.0} tokens",
-            r.strategy, r.success_rate, r.mean_coverage, r.mean_tokens
-        );
-    }
     0
 }
 
