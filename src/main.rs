@@ -2,6 +2,7 @@ mod commands_demo;
 mod commands_runtime;
 
 use ccos::adversarial::{AdversarialEngine, AdversarialMode};
+use ccos::context_policy::ContextPolicy;
 use ccos::distributed_event_log::DistributedEventLog;
 use ccos::event_log::{EventLog, EventPayload, EventReplayer, EventType, GraphReconstructor};
 use ccos::guard::{GuardConfig, GuardLayer};
@@ -9,6 +10,8 @@ use ccos::incremental::IncrementalGraphEngine;
 use ccos::memory::{MemoryGraph, NodeId};
 use ccos::persist::KernelSnapshot;
 use ccos::query;
+use ccos::region_engine::{ContextRegionEngine, RegionQuery};
+use ccos::region_metrics;
 use ccos::util::sha256_hex;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -44,6 +47,7 @@ async fn main() {
         "top" => run_top(&TopOpts::parse(rest)),
         "blame" => run_blame(&BlameOpts::parse(rest)),
         "export" => run_export(&ExportOpts::parse(rest)),
+        "regions" => run_regions(&RegionsOpts::parse(rest)),
         // ── CCOS v0.3 — Autonomous Context Runtime ──────────────────
         "scan" => commands_runtime::run_scan(rest).await,
         "agents" => commands_runtime::run_agents(rest).await,
@@ -962,6 +966,204 @@ fn run_export(opts: &ExportOpts) -> i32 {
     }
 }
 
+/// Options for `ccos regions`.
+struct RegionsOpts {
+    path: String,
+    json: bool,
+    activate: Option<String>,
+    metrics: Option<String>,
+    radius: u32,
+    max_nodes: usize,
+}
+
+impl RegionsOpts {
+    fn parse(args: &[String]) -> Self {
+        let mut opts = Self {
+            path: ".".to_string(),
+            json: false,
+            activate: None,
+            metrics: None,
+            radius: 2,
+            max_nodes: 5000,
+        };
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--json" => opts.json = true,
+                "--activate" => {
+                    i += 1;
+                    opts.activate = args.get(i).cloned();
+                }
+                "--metrics" => {
+                    i += 1;
+                    opts.metrics = args.get(i).cloned();
+                }
+                "--radius" => {
+                    i += 1;
+                    if let Some(n) = args.get(i).and_then(|v| v.parse().ok()) {
+                        opts.radius = n;
+                    }
+                }
+                "--max-nodes" => {
+                    i += 1;
+                    if let Some(n) = args.get(i).and_then(|v| v.parse().ok()) {
+                        opts.max_nodes = n;
+                    }
+                }
+                s if !s.starts_with("--") => opts.path = s.to_string(),
+                other => eprintln!("ccos: ignoring unknown flag '{other}'"),
+            }
+            i += 1;
+        }
+        opts
+    }
+}
+
+/// `ccos regions <path> [--activate ID] [--metrics ID] [--radius N] [--json]` —
+/// cluster the causal graph into spatial regions; optionally activate one
+/// (hydrate a context window) or print the flat-vs-region locality comparison.
+fn run_regions(opts: &RegionsOpts) -> i32 {
+    let graph = match build_graph_from_path(&opts.path, opts.max_nodes) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("ccos: {e}");
+            return 1;
+        }
+    };
+    let mut engine = ContextRegionEngine::new();
+    let mut log = EventLog::new(Uuid::new_v4().to_string());
+    engine.initialize_regions(&graph, &mut log);
+
+    // ── metrics mode: flat vs region locality for a target node ──
+    if let Some(target) = &opts.metrics {
+        let Some(report) = region_metrics::locality_report(&graph, target, opts.radius) else {
+            eprintln!("ccos: node '{target}' not found in graph");
+            return 1;
+        };
+        if opts.json {
+            println!("{}", serde_json::to_string_pretty(&report).unwrap());
+            return 0;
+        }
+        println!("╔══════════════════════════════════════════════╗");
+        println!("║  CCOS regions — locality metrics             ║");
+        println!("╚══════════════════════════════════════════════╝\n");
+        println!("  Target:            {}", truncate(target, 40));
+        println!(
+            "  Causal nbhd (r={}): {} nodes",
+            report.radius, report.neighborhood_size
+        );
+        println!(
+            "  flat   : precision {:.2}  recall {:.2}  ({} nodes)",
+            report.flat.causal_precision, report.flat.causal_recall, report.flat.nodes_selected
+        );
+        println!(
+            "  region : precision {:.2}  recall {:.2}  ({} nodes)",
+            report.region.causal_precision,
+            report.region.causal_recall,
+            report.region.nodes_selected
+        );
+        println!("  Precision gain:    {:+.2}", report.precision_gain);
+        println!(
+            "  Tokens to cover Nk: flat {} vs region {}  (saving {:+.0}%)",
+            report.flat_tokens_to_cover,
+            report.region_tokens_to_cover,
+            report.token_saving_ratio * 100.0
+        );
+        return 0;
+    }
+
+    // ── activate mode: hydrate a context window from a region ──
+    if let Some(target) = &opts.activate {
+        let policy = ContextPolicy::default();
+        let Some(win) = engine.activate_region(
+            &graph,
+            &RegionQuery::Node(target.clone()),
+            &policy,
+            &mut log,
+        ) else {
+            eprintln!("ccos: node '{target}' not found in any region");
+            return 1;
+        };
+        if opts.json {
+            let report = serde_json::json!({
+                "region": win.region,
+                "files": win.files,
+                "tokens_estimated": win.tokens_estimated,
+                "region_score": win.region_score,
+                "reason": win.reason,
+            });
+            println!("{}", serde_json::to_string_pretty(&report).unwrap());
+            return 0;
+        }
+        println!("╔══════════════════════════════════════════════╗");
+        println!("║  CCOS regions — context window               ║");
+        println!("╚══════════════════════════════════════════════╝\n");
+        println!("  Region:  {}", truncate(&win.region, 38));
+        println!("  Score:   {:.3}", win.region_score);
+        println!("  Tokens:  ~{}", win.tokens_estimated);
+        println!("  Reason:  {}", win.reason);
+        println!("\n  Files ({}):", win.files.len());
+        for f in win.files.iter().take(20) {
+            println!("    • {}", truncate(f, 44));
+        }
+        return 0;
+    }
+
+    // ── default: region map summary ──
+    let mut regions: Vec<_> = engine.regions.values().collect();
+    regions.sort_by(|a, b| {
+        b.temperature
+            .partial_cmp(&a.temperature)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+
+    if opts.json {
+        let rows: Vec<_> = regions
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.id,
+                    "center": r.center,
+                    "members": r.member_count(),
+                    "temperature": r.temperature,
+                    "causal_density": r.causal_density,
+                })
+            })
+            .collect();
+        let report = serde_json::json!({
+            "path": opts.path,
+            "nodes": graph.node_count(),
+            "edges": graph.edge_count(),
+            "regions": engine.region_count(),
+            "map": rows,
+        });
+        println!("{}", serde_json::to_string_pretty(&report).unwrap());
+        return 0;
+    }
+
+    println!("╔══════════════════════════════════════════════╗");
+    println!("║  CCOS regions — {:<29}║", truncate(&opts.path, 29));
+    println!("╚══════════════════════════════════════════════╝\n");
+    println!(
+        "  {} nodes / {} edges → {} regions\n",
+        graph.node_count(),
+        graph.edge_count(),
+        engine.region_count()
+    );
+    println!("    {:>5}  {:>7}  {:>7}  REGION", "MEMB", "TEMP", "DENS");
+    for r in regions.iter().take(20) {
+        println!(
+            "    {:>5}  {:>7.4}  {:>7.3}  {}",
+            r.member_count(),
+            r.temperature,
+            r.causal_density,
+            truncate(&r.id, 40)
+        );
+    }
+    0
+}
+
 /// Recursively collect `.rs` files, skipping `target/`, VCS and hidden dirs.
 fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let entries = match std::fs::read_dir(dir) {
@@ -1015,6 +1217,11 @@ COMMANDS:\n\
     top <path> [--limit N]     Show the hottest nodes by causal score (--json)\n\
     blame <snap> <node-id>     Causes (upstream) + blast radius (downstream) (--depth N, --json)\n\
     export <snap> [--out F]    Export the causal graph as GraphML (default ccos.graphml)\n\
+\n\
+  Context Region Engine (spatial memory):\n\
+    regions <path>             Cluster the causal graph into context regions (--json)\n\
+        --activate <node-id>   Hydrate the context window for a node's region\n\
+        --metrics <node-id>    Flat-vs-region locality comparison (--radius N)\n\
 \n\
   CCOS v0.3 — Autonomous Context Runtime:\n\
     scan <path>                Scan a real workspace and ingest the delta\n\
