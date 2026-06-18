@@ -1276,8 +1276,9 @@ fn run_experiment_cmd(args: &[String]) -> i32 {
 }
 
 /// `ccos eval [--tasks N] [--seed S] [--budget T] [--json]` — the **real-LLM**
-/// evaluation (clean + noisy). Configure a model with `OPENAI_API_KEY`
-/// (+`OPENAI_BASE_URL`, `OPENAI_MODEL`) or `OLLAMA_ENDPOINT`; with neither set it
+/// evaluation (clean + noisy). Configure a model with `ANTHROPIC_API_KEY`
+/// (+`ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL`), `OPENAI_API_KEY`
+/// (+`OPENAI_BASE_URL`, `OPENAI_MODEL`) or `OLLAMA_ENDPOINT`; with none set it
 /// runs an offline stub (every answer wrong) to exercise the pipeline.
 async fn run_eval_cmd(args: &[String]) -> i32 {
     let mut cfg = EvalConfig::default();
@@ -1378,9 +1379,9 @@ async fn run_eval_cmd(args: &[String]) -> i32 {
     );
     if clean.provider.starts_with("none") {
         println!(
-            "  ⚠  No LLM configured — set OPENAI_API_KEY (+ OPENAI_BASE_URL, OPENAI_MODEL)\n     \
-             or OLLAMA_ENDPOINT, and allowlist the host. Running the offline stub:\n     \
-             every answer is wrong (pipeline check only, NOT a result).\n"
+            "  ⚠  No LLM configured — set ANTHROPIC_API_KEY (+ ANTHROPIC_BASE_URL,\n     \
+             ANTHROPIC_MODEL), OPENAI_API_KEY, or OLLAMA_ENDPOINT, and allowlist the host.\n     \
+             Running the offline stub: every answer is wrong (pipeline check, NOT a result).\n"
         );
     }
     table(&clean, "CLEAN query (names the target function)");
@@ -1451,7 +1452,7 @@ COMMANDS:\n\
         --activate <node-id>   Hydrate the context window for a node's region\n\
         --metrics <node-id>    Flat-vs-region locality comparison (--radius N)\n\
     experiment [--tasks N]     Hypothesis test: regional memory vs RAG/GraphRAG (--json)\n\
-    eval [--tasks N]           Real-LLM eval (set OPENAI_API_KEY or OLLAMA_ENDPOINT)\n\
+    eval [--tasks N]           Real-LLM eval (set ANTHROPIC/OPENAI_API_KEY or OLLAMA_ENDPOINT)\n\
 \n\
   CCOS v0.3 — Autonomous Context Runtime:\n\
     scan <path>                Scan a real workspace and ingest the delta\n\

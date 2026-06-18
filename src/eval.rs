@@ -26,7 +26,11 @@
 //!
 //! ## Providers
 //!
-//! Set one of:
+//! Set one of (checked in this order):
+//! - `ANTHROPIC_API_KEY` (+ optional `ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL`) —
+//!   any Anthropic-Messages-compatible `/v1/messages` endpoint. For DeepSeek set
+//!   `ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic` and
+//!   `ANTHROPIC_MODEL=deepseek-v4-pro`;
 //! - `OPENAI_API_KEY` (+ optional `OPENAI_BASE_URL`, `OPENAI_MODEL`) — any
 //!   OpenAI-compatible `/v1/chat/completions` endpoint;
 //! - `OLLAMA_ENDPOINT` (+ optional `OLLAMA_MODEL`) — a local Ollama server.
@@ -505,6 +509,30 @@ async fn ask(prompt: &str) -> Option<String> {
         .timeout(std::time::Duration::from_secs(60))
         .build()
         .ok()?;
+    if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+        let base = std::env::var("ANTHROPIC_BASE_URL")
+            .unwrap_or_else(|_| "https://api.anthropic.com".into());
+        let model =
+            std::env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| "claude-3-5-sonnet-latest".into());
+        let body = serde_json::json!({
+            "model": model,
+            "max_tokens": 1024,
+            "temperature": 0,
+            "messages": [{"role": "user", "content": prompt}],
+        });
+        let resp = client
+            .post(format!("{base}/v1/messages"))
+            .header("x-api-key", key)
+            .header("anthropic-version", "2023-06-01")
+            .json(&body)
+            .send()
+            .await
+            .ok()?
+            .json::<serde_json::Value>()
+            .await
+            .ok()?;
+        return resp["content"][0]["text"].as_str().map(String::from);
+    }
     if let Ok(key) = std::env::var("OPENAI_API_KEY") {
         let base =
             std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com".into());
@@ -549,7 +577,12 @@ async fn ask(prompt: &str) -> Option<String> {
 }
 
 fn provider_label() -> (String, String) {
-    if std::env::var("OPENAI_API_KEY").is_ok() {
+    if std::env::var("ANTHROPIC_API_KEY").is_ok() {
+        (
+            "anthropic-messages".into(),
+            std::env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| "claude-3-5-sonnet-latest".into()),
+        )
+    } else if std::env::var("OPENAI_API_KEY").is_ok() {
         (
             "openai-compatible".into(),
             std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into()),
