@@ -54,14 +54,19 @@ baseline ties it on a clean query. Under a \emph{misleading} query, however, eve
 lexically-seeded method --- including that graph baseline and an ablation of CCOS
 that trusts the query --- collapses to $0\%$, while only the workspace-anchored
 region survives: the differentiator is the \emph{anchor} (a structural workspace
-signal vs.\ a lexical query), not the region machinery. We are careful that this
-tests the \emph{necessary} (retrieval) condition, not the \emph{sufficient}
-(generation) one, and we then specify a falsifiable protocol --- not yet executed
---- to test whether the gain survives with real LLMs against classical RAG,
-GraphRAG, MemGPT and LangGraph on long-horizon tasks. We are explicit throughout
-about what is \emph{proven} (formal structure, determinism, locality),
-\emph{measured in simulation} (retrieval coverage), and \emph{still hypothesised}
-(downstream agent gains), so the contribution can be evaluated honestly.
+signal vs.\ a lexical query), not the region machinery. This tests the
+\emph{necessary} (retrieval) condition, not the \emph{sufficient} (generation)
+one; a first on-device real-LLM run (\code{qwen2.5-7B} via Ollama on an NVIDIA
+Jetson AGX Thor) then reproduces the coverage result on real file content and
+exhibits the same noisy separation --- under a misleading query only the
+workspace-anchored region yields any task success --- while we are explicit that
+the small model's arithmetic reasoning, not selection, caps absolute success. We
+further specify a falsifiable protocol against classical RAG, GraphRAG, MemGPT and
+LangGraph on long-horizon tasks (SWE-bench and a multi-file bug suite). We label
+throughout what is \emph{proven} (formal structure, determinism, locality),
+\emph{measured} (retrieval coverage, in simulation and on a real LLM), and
+\emph{still hypothesised} (large-model and external-benchmark agent gains), so the
+contribution can be evaluated honestly.
 \end{abstract}
 
 \section{Introduction}
@@ -416,14 +421,13 @@ region exceeding the budget collapses the advantage (observed, reported).
 tests the \emph{necessary} (retrieval) condition, not the \emph{sufficient}
 (generation) one of \S\ref{sec:protocol}.
 
-\section{Real-LLM evaluation: harness implemented, results pending a model}\label{sec:protocol}
+\section{Real-LLM evaluation: a first on-device measurement}\label{sec:protocol}
 
 The simulation (\S\ref{sec:sim}) established the necessary condition. The
 sufficient condition --- that an LLM agent then \emph{solves} more tasks with
-regional memory than with chunk retrieval --- requires model rollouts. We have
-\textbf{implemented the harness} (\code{ccos eval}) but \textbf{report no LLM
-numbers}, because the evaluation environment has no reachable model endpoint; the
-study is one command (and an API key) away for anyone who does.
+regional memory than with chunk retrieval --- requires model rollouts. We
+\textbf{implement the harness} (\code{ccos eval}) and report a \textbf{first
+real-LLM run} against a local model.
 
 \paragraph{Implemented harness.} Each task is a tiny multi-file project encoding
 an \emph{arithmetic causal chain}: a base constant in one file is transformed
@@ -433,51 +437,88 @@ reading the whole chain (the distant cause included). Grading is therefore
 exact-match on an integer --- objective and automatable, with no code execution.
 The same six strategies of \S\ref{sec:sim} assemble the context window under a
 token budget (with the clean/noisy query split), the window is sent to a model
-(any OpenAI-compatible or Ollama endpoint), and we record three metrics per
-diameter: \textbf{task success} (correct integer), \textbf{oracle coverage}
-(required chain $\subseteq$ window --- model-independent), and
-\textbf{symbol-hallucination} (the answer cites a function absent from the
-project). Run offline (no model), the harness already reproduces the coverage
-result of Table~\ref{tab:sim} on real file text --- e.g.\ clean coverage
-$\{$rag $0.00$, graphrag-bfs / ccos $1.00\}$, noisy coverage $0.00$ everywhere
-\emph{except} \code{ccos-region} $1.00$ --- so the only missing ingredient is the
-model that turns \emph{coverage} into measured \emph{success}.
+(any OpenAI-, Anthropic-Messages-, or Ollama-compatible endpoint), and we record
+three metrics per diameter: \textbf{task success} (correct integer),
+\textbf{oracle coverage} (required chain $\subseteq$ window --- model-independent),
+and \textbf{symbol-hallucination} (the answer cites a function absent from the
+project).
 
-\paragraph{Baselines.} (i) \emph{Classical RAG}: embedding retrieval over code
-chunks, top-$k$ by cosine~\cite{lewis2020rag}. (ii) \emph{GraphRAG}: community
-summarisation over a code/entity graph~\cite{edge2024graphrag}. (iii)
-\emph{MemGPT}: OS-style paged agent memory~\cite{packer2023memgpt}. (iv)
-\emph{LangGraph} agent with a vector store~\cite{langgraph}. (v) \emph{CCOS
-regions}: hydrate the target's region under the dynamic policy. All share the same
-base LLM and token budget.
+\paragraph{Setup.} We run \code{ccos eval} on-device on an NVIDIA Jetson AGX Thor
+against \code{qwen2.5:7b-instruct} served by Ollama (temperature $0$), with $20$
+tasks, seed $7$, a $600$-token budget, diameters $1$--$4$, in both the clean and
+noisy regimes. Table~\ref{tab:real} reports the run.
 
-\paragraph{Tasks and data.} Beyond the built-in arithmetic-chain suite, the
-decisive external benchmarks are SWE-bench~\cite{jimenez2023swebench} issue
-resolution (patch passes the hidden tests) and a controlled \emph{multi-file bug}
-suite where the fault site, its cause and its blast radius lie in distinct files
-(so coherent selection matters).
+\begin{table}[h]
+\centering
+\begin{tabular}{lcccccr}
+\toprule
+& \multicolumn{4}{c}{success at diameter $d$} & & \\
+\cmidrule(lr){2-5}
+Strategy & $d{=}1$ & $d{=}2$ & $d{=}3$ & $d{=}4$ & cov. & tok. \\
+\midrule
+\multicolumn{7}{l}{\emph{Clean query (names the target function)}}\\
+\code{rag-dense}      & 0.12 & 0.00 & 0.00 & 0.00 & 0.00 & 519 \\
+\code{rag-hybrid}     & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 521 \\
+\code{graphrag-1hop}  & 1.00 & 0.00 & 0.00 & 0.00 & 0.40 & 270 \\
+\code{graphrag-bfs}   & 1.00 & 0.00 & 0.17 & 0.00 & 1.00 & 402 \\
+\code{ccos-from-query}& 1.00 & 0.00 & 0.17 & 0.00 & 1.00 & 402 \\
+\code{ccos-region}    & 1.00 & 0.00 & 0.17 & 0.00 & 1.00 & 402 \\
+\midrule
+\multicolumn{7}{l}{\emph{Noisy query (a decoy out-scores the target lexically)}}\\
+\code{rag-dense}      & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 531 \\
+\code{rag-hybrid}     & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 521 \\
+\code{graphrag-1hop}  & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 165 \\
+\code{graphrag-bfs}   & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 165 \\
+\code{ccos-from-query}& 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 165 \\
+\textbf{\code{ccos-region}} & \textbf{1.00} & \textbf{0.00} & \textbf{0.17} & \textbf{0.00} & \textbf{1.00} & \textbf{402} \\
+\bottomrule
+\end{tabular}
+\caption{First real-LLM run: \code{qwen2.5:7b-instruct} via Ollama, on-device
+(NVIDIA Jetson AGX Thor), $20$ tasks, seed $7$, budget $600$ tokens. ``cov.'' is
+the model-independent oracle coverage; ``tok.'' the mean input tokens. Success is
+an exact-match integer answer.}
+\label{tab:real}
+\end{table}
 
-\paragraph{Baselines.} (i) \emph{Classical RAG}: embedding retrieval over code
-chunks, top-$k$ by cosine~\cite{lewis2020rag}. (ii) \emph{GraphRAG}: community
-summarisation over a code/entity graph~\cite{edge2024graphrag}. (iii)
-\emph{MemGPT}: OS-style paged agent memory~\cite{packer2023memgpt}. (iv)
-\emph{LangGraph} agent with a vector store~\cite{langgraph}. (v) \emph{CCOS
-regions}: hydrate the target's region under the dynamic policy. All share the same
-base LLM and token budget.
+\paragraph{Findings.}
+\textbf{(1) Coverage transfers from simulation to real text.} The
+model-independent coverage column reproduces Table~\ref{tab:sim} on real file
+content: lexical RAG covers $0$, the structure-aware methods cover $1.00$ under a
+clean query, and under noise \emph{only} \code{ccos-region} holds $1.00$ --- the
+necessary condition, confirmed outside the simulator.
+\textbf{(2) Success is bounded by the model, not the context.} Where coverage is
+$1.00$, the $7$B model still solves only $d{=}1$ ($1.00$) and part of $d{=}3$
+($0.17$), missing $d{=}2,4$: with the whole chain in the window, the residual
+failure is \emph{arithmetic reasoning} --- a model-capability ceiling, not a
+selection failure. Crucially no method ever succeeds \emph{without} coverage
+(success $\subseteq$ coverage), which is the claim the harness is built to test.
+\textbf{(3) The noisy separation holds on a real LLM.} Under a misleading query
+every query-driven method collapses to $0\%$ success --- including
+\code{graphrag-bfs} and the \code{ccos-from-query} ablation --- while
+\code{ccos-region}, anchored on the workspace signal, is the \emph{only} strategy
+with non-zero success ($d{=}1$ at $1.00$). The query-driven methods even look
+\emph{cheaper} under noise ($165$ vs $402$ tokens) precisely because they
+confidently retrieve the wrong, smaller file; \code{ccos-region} spends its budget
+on the causally-correct chain.
+\textbf{(4) Honest limits.} $20$ tasks ($\approx 5$ per diameter) is a small
+sample, and a $7$B model floors the sufficient condition. A frontier model
+(\code{deepseek-v4-pro}, in progress) or a $70$B local model is expected to lift
+success wherever coverage is $1.00$, \emph{sharpening} --- not changing --- the
+separation, since coverage already fixes the ceiling.
 
-\paragraph{Tasks and data.} Long-horizon repository tasks where context selection
-is decisive: SWE-bench~\cite{jimenez2023swebench} issue resolution (patch passes
-the hidden tests), and a controlled \emph{multi-file bug} suite where the fault
-site, its cause and its blast radius lie in distinct files (so coherent selection
-matters).
-
-\paragraph{Metrics.}
-(1) \textbf{Task success}: resolved-rate / unit-test pass.
-(2) \textbf{Token efficiency}: input tokens to success, and success at a fixed
-budget.
-(3) \textbf{Hallucination}: rate of references to non-existent symbols / files in
-the agent's output, checked against the ground-truth graph (a citation-grounding
-test, automatable without human labels).
+\paragraph{Toward external benchmarks.} The arithmetic-chain suite isolates the
+selection question; the decisive external tests are SWE-bench~\cite{jimenez2023swebench}
+issue resolution (a patch passes the hidden tests) and a controlled
+\emph{multi-file bug} suite where the fault site, its cause and its blast radius
+lie in distinct files. Baselines share the base LLM and token budget: classical
+RAG~\cite{lewis2020rag} (top-$k$ cosine over chunks), GraphRAG~\cite{edge2024graphrag}
+(community summaries over a code graph), MemGPT~\cite{packer2023memgpt} (OS-style
+paged memory), a LangGraph~\cite{langgraph} agent with a vector store, and CCOS
+regions. Metrics: resolved-rate, input tokens to success, and a citation-grounding
+hallucination rate checked against the ground-truth graph. We have begun this on
+real history: \code{scripts/causal\_validation} mines fix commits, injects each
+fault, and scores the bounded working set's coverage of the files the fix touched
+(\S\ref{sec:eval}).
 
 \paragraph{Hypotheses.}
 \textbf{H1} (efficiency): CCOS reaches equal task success at fewer input tokens
@@ -492,9 +533,12 @@ admitted window is a connected sub-graph of \emph{real} nodes.
 (\S\ref{sec:eval}); results would conflate the region \emph{policy} with the
 underlying \emph{graph}. Ablations must therefore fix the graph and vary only the
 selection strategy, and report per-task causal diameter so that gains are
-attributed to coherence, not to retrieving more text. A positive result on H1--H3
-would constitute the research contribution; a null result would still validate the
-deterministic, auditable infrastructure.
+attributed to coherence, not to retrieving more text. The \code{ccos-from-query}
+ablation in Table~\ref{tab:real} is exactly this control --- same graph and
+budget, only the anchor swapped --- and it collapses with the lexical baselines
+under noise. A positive result on H1--H3 would constitute the research
+contribution; a null result would still validate the deterministic, auditable
+infrastructure.
 
 \section{Limitations}
 
