@@ -447,11 +447,47 @@ pub struct EvalReport {
     pub overall: Vec<EvalStrategy>,
 }
 
-/// Parse the first standalone integer from a model reply.
+/// ASCII case-insensitive substring search starting at byte offset `from`.
+fn find_ci(haystack: &str, needle: &str, from: usize) -> Option<usize> {
+    let (h, n) = (haystack.as_bytes(), needle.as_bytes());
+    if n.is_empty() || from + n.len() > h.len() {
+        return None;
+    }
+    (from..=h.len() - n.len()).find(|&i| {
+        h[i..i + n.len()]
+            .iter()
+            .zip(n)
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+    })
+}
+
+/// Strip reasoning blocks (`<think>…</think>`, `<thinking>…</thinking>`) that some
+/// models emit before their answer, so the grader scores the final answer, not the
+/// scratch work. Case-insensitive, but it preserves the case of the surrounding
+/// text (hallucination detection matches symbol names case-sensitively). An
+/// unclosed opening tag drops everything after it.
+fn strip_reasoning(reply: &str) -> String {
+    let mut s = reply.to_string();
+    for (open, close) in [("<think>", "</think>"), ("<thinking>", "</thinking>")] {
+        while let Some(start) = find_ci(&s, open, 0) {
+            if let Some(close_at) = find_ci(&s, close, start + open.len()) {
+                s.replace_range(start..close_at + close.len(), " ");
+            } else {
+                s.replace_range(start.., " ");
+                break;
+            }
+        }
+    }
+    s
+}
+
+/// Parse the first standalone integer from a model reply (after removing any
+/// reasoning block).
 fn parse_answer(reply: &str) -> Option<i64> {
+    let cleaned = strip_reasoning(reply);
     let mut num = String::new();
     let mut found = None;
-    let chars: Vec<char> = reply.chars().collect();
+    let chars: Vec<char> = cleaned.chars().collect();
     for (i, &c) in chars.iter().enumerate() {
         let sign = c == '-' && i + 1 < chars.len() && chars[i + 1].is_ascii_digit();
         if c.is_ascii_digit() || sign {
@@ -468,9 +504,12 @@ fn parse_answer(reply: &str) -> Option<i64> {
 }
 
 /// Whether the reply cites a function/const name that does not exist in the task.
+/// Reasoning blocks are stripped first, so exploring a hypothesis inside
+/// `<think>…</think>` is not counted as a hallucination in the final answer.
 fn hallucinates(reply: &str, task: &Task) -> bool {
     // Look for `name(` call patterns; flag any that aren't real symbols.
-    let bytes = reply.as_bytes();
+    let cleaned = strip_reasoning(reply);
+    let bytes = cleaned.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'(' {
@@ -485,7 +524,7 @@ fn hallucinates(reply: &str, task: &Task) -> bool {
                 }
             }
             if j < i {
-                let name = &reply[j..i];
+                let name = &cleaned[j..i];
                 if name
                     .chars()
                     .next()
@@ -752,6 +791,20 @@ mod tests {
         assert_eq!(parse_answer("42"), Some(42));
         assert_eq!(parse_answer("The answer is -7."), Some(-7));
         assert_eq!(parse_answer("no number here"), None);
+        // Reasoning blocks are ignored; the post-think answer wins.
+        assert_eq!(parse_answer("<think>base is 5, 5+3=8</think>\n8"), Some(8));
+        assert_eq!(parse_answer("<THINK>1+1=2</THINK> 42"), Some(42));
+        assert_eq!(parse_answer("<think>unfinished 5"), None);
+    }
+
+    #[test]
+    fn strip_reasoning_removes_think_blocks() {
+        assert_eq!(strip_reasoning("a<think>b</think>c"), "a c");
+        assert_eq!(strip_reasoning("<thinking>x</thinking>y").trim(), "y");
+        assert_eq!(strip_reasoning("plain"), "plain");
+        let mixed = strip_reasoning("KEEP<THINK>drop</THINK>Case");
+        assert!(mixed.contains("KEEP") && mixed.contains("Case"));
+        assert!(!mixed.to_lowercase().contains("drop"));
     }
 
     #[test]
@@ -759,6 +812,8 @@ mod tests {
         let task = one_task(false);
         assert!(hallucinates("I called ghost_fn() to get it", &task));
         assert!(!hallucinates("the value is 12", &task));
+        // A call inside a reasoning block is not a hallucination in the answer.
+        assert!(!hallucinates("<think>maybe ghost_fn()?</think> 12", &task));
     }
 
     #[tokio::test]
