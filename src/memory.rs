@@ -65,6 +65,63 @@ pub enum EdgeType {
     RelatedTo,
 }
 
+/// Tunable coefficients of the causal score and failure-propagation decay.
+///
+/// A node's score is
+/// `clamp(w_base·imp + w_failure·fail + w_recency·rec + w_access·ln(1+acc), 0, 1)`,
+/// and injected failure pressure attenuates by `failure_decay^depth` per hop.
+/// [`Default`] reproduces the constants CCOS shipped with; [`ScoringWeights::from_env`]
+/// lets an external optimiser (the causal-validation harness) override them per
+/// run without recompiling — the knobs Phase 3 of that harness searches over.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct ScoringWeights {
+    /// Weight on a node's intrinsic importance.
+    pub w_base: f64,
+    /// Weight on propagated failure relevance (the dominant term by default).
+    pub w_failure: f64,
+    /// Weight on recency.
+    pub w_recency: f64,
+    /// Weight on `ln(access_count)`.
+    pub w_access: f64,
+    /// Geometric attenuation of failure pressure per propagation hop.
+    pub failure_decay: f64,
+}
+
+impl Default for ScoringWeights {
+    fn default() -> Self {
+        Self {
+            w_base: 0.15,
+            w_failure: 0.50,
+            w_recency: 0.30,
+            w_access: 0.05,
+            failure_decay: 0.8,
+        }
+    }
+}
+
+impl ScoringWeights {
+    /// Read overrides from the environment, falling back to [`Default`] for any
+    /// variable that is unset or unparsable. Recognised variables: `CCOS_W_BASE`,
+    /// `CCOS_W_FAILURE`, `CCOS_W_RECENCY`, `CCOS_W_ACCESS`, `CCOS_FAILURE_DECAY`.
+    pub fn from_env() -> Self {
+        let d = Self::default();
+        let get = |key: &str, fallback: f64| -> f64 {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .filter(|x| x.is_finite())
+                .unwrap_or(fallback)
+        };
+        Self {
+            w_base: get("CCOS_W_BASE", d.w_base),
+            w_failure: get("CCOS_W_FAILURE", d.w_failure),
+            w_recency: get("CCOS_W_RECENCY", d.w_recency),
+            w_access: get("CCOS_W_ACCESS", d.w_access),
+            failure_decay: get("CCOS_FAILURE_DECAY", d.failure_decay),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryGraph {
     pub nodes: HashMap<NodeId, GraphNode>,
@@ -72,6 +129,11 @@ pub struct MemoryGraph {
     pub paging_threshold: f64,
     pub max_in_memory_nodes: usize,
     pub clock: u64,
+    /// Scoring/decay coefficients (see [`ScoringWeights`]). Serialised so a
+    /// snapshot records the weights it was scored under; `serde(default)` keeps
+    /// older snapshots (written before this field existed) loadable.
+    #[serde(default)]
+    pub scoring_weights: ScoringWeights,
 }
 
 impl MemoryGraph {
@@ -82,7 +144,14 @@ impl MemoryGraph {
             paging_threshold,
             max_in_memory_nodes,
             clock: 0,
+            scoring_weights: ScoringWeights::default(),
         }
+    }
+
+    /// Replace the scoring/decay coefficients (see [`ScoringWeights`]). Set these
+    /// before ingesting or re-paging so the new weights drive eviction.
+    pub fn set_scoring_weights(&mut self, weights: ScoringWeights) {
+        self.scoring_weights = weights;
     }
 
     pub fn tick(&mut self) {
@@ -175,10 +244,11 @@ impl MemoryGraph {
     }
 
     pub fn compute_node_score(&self, node: &GraphNode) -> f64 {
-        let base = node.base_importance * 0.15;
-        let failure = node.failure_relevance * 0.50;
-        let recency = node.recency * 0.30;
-        let access = (node.access_count.max(1) as f64).ln() * 0.05;
+        let w = &self.scoring_weights;
+        let base = node.base_importance * w.w_base;
+        let failure = node.failure_relevance * w.w_failure;
+        let recency = node.recency * w.w_recency;
+        let access = (node.access_count.max(1) as f64).ln() * w.w_access;
         (base + failure + recency + access).clamp(0.0, 1.0)
     }
 
@@ -292,8 +362,9 @@ impl MemoryGraph {
             .map(|e| (e.target.clone(), e.weight))
             .collect();
 
+        let decay = self.scoring_weights.failure_decay;
         for (target, weight) in targets {
-            let propagation = base_value * weight * 0.8_f64.powi(depth as i32);
+            let propagation = base_value * weight * decay.powi(depth as i32);
             if let Some(node) = self.nodes.get_mut(&target) {
                 node.failure_relevance = (node.failure_relevance + propagation).clamp(0.0, 1.0);
                 node.recency = 1.0;
@@ -532,6 +603,63 @@ mod tests {
         graph.upsert_node("b".into(), "B".into(), "".into(), NodeType::Module);
         graph.add_edge("a".into(), "b".into(), 0.8, EdgeType::DependsOn);
         assert_eq!(graph.edge_count(), 1);
+    }
+
+    #[test]
+    fn scoring_weights_default_matches_shipped_constants() {
+        // Regression guard: the tunable defaults must reproduce the original
+        // hard-coded score, so existing snapshots/hashes/behaviour are unchanged.
+        let w = ScoringWeights::default();
+        assert_eq!(w.w_base, 0.15);
+        assert_eq!(w.w_failure, 0.50);
+        assert_eq!(w.w_recency, 0.30);
+        assert_eq!(w.w_access, 0.05);
+        assert_eq!(w.failure_decay, 0.8);
+    }
+
+    #[test]
+    fn scoring_weights_alter_score() {
+        let mut g = MemoryGraph::new(0.0, usize::MAX);
+        g.upsert_node("n".into(), "n".into(), "".into(), NodeType::Module);
+        g.set_failure_relevance(&"n".into(), 1.0);
+        let node = g.nodes.get(&"n".into()).unwrap().clone();
+        g.set_scoring_weights(ScoringWeights {
+            w_failure: 0.0,
+            ..Default::default()
+        });
+        let low = g.compute_node_score(&node);
+        g.set_scoring_weights(ScoringWeights {
+            w_failure: 1.0,
+            ..Default::default()
+        });
+        let high = g.compute_node_score(&node);
+        assert!(
+            high > low,
+            "raising w_failure must raise a failing node's score"
+        );
+    }
+
+    #[test]
+    fn smaller_failure_decay_reduces_distant_pressure() {
+        let pressure_at_c = |decay: f64| {
+            let mut g = MemoryGraph::new(0.0, usize::MAX);
+            g.set_scoring_weights(ScoringWeights {
+                failure_decay: decay,
+                ..Default::default()
+            });
+            for n in ["a", "b", "c"] {
+                g.upsert_node(n.into(), n.into(), "".into(), NodeType::Module);
+            }
+            g.add_edge("a".into(), "b".into(), 1.0, EdgeType::DependsOn);
+            g.add_edge("b".into(), "c".into(), 1.0, EdgeType::DependsOn);
+            g.set_failure_relevance(&"a".into(), 1.0);
+            g.propagate_failure(&"a".into(), 0, 5);
+            g.nodes.get(&"c".into()).unwrap().failure_relevance
+        };
+        assert!(
+            pressure_at_c(0.9) > pressure_at_c(0.5),
+            "a smaller decay must attenuate failure pressure two hops out"
+        );
     }
 
     #[test]

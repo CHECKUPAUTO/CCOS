@@ -9,7 +9,7 @@ use ccos::event_log::{EventLog, EventPayload, EventReplayer, EventType, GraphRec
 use ccos::experiment::{run_experiment, ExperimentConfig};
 use ccos::guard::{GuardConfig, GuardLayer};
 use ccos::incremental::IncrementalGraphEngine;
-use ccos::memory::{MemoryGraph, NodeId};
+use ccos::memory::{MemoryGraph, NodeId, ScoringWeights};
 use ccos::persist::KernelSnapshot;
 use ccos::query;
 use ccos::region_engine::{ContextRegionEngine, RegionQuery};
@@ -153,6 +153,9 @@ fn run_analyze(opts: &AnalyzeOpts) -> i32 {
     }
 
     let mut graph = MemoryGraph::new(0.2, opts.max_nodes);
+    // Honour scoring-weight overrides (CCOS_W_*) so the validation harness can
+    // re-score the ingest under a trial's hyperparameters without recompiling.
+    graph.set_scoring_weights(ScoringWeights::from_env());
     let mut engine = IncrementalGraphEngine::new();
     let mut event_log = EventLog::new(Uuid::new_v4().to_string());
     let mut dist_log = DistributedEventLog::new();
@@ -494,11 +497,18 @@ struct FailureOpts {
     snapshot: Option<String>,
     node: Option<String>,
     depth: u32,
+    /// Re-page the graph to this node budget K after injection, exposing the
+    /// surviving WorkingSet_K (the proxy-coverage measurement of the harness).
+    max_nodes: Option<usize>,
+    /// Emit a machine-readable working set instead of the human report.
+    json: bool,
 }
 
 impl FailureOpts {
     fn parse(args: &[String]) -> Self {
         let (mut snapshot, mut node, mut depth) = (None, None, 3u32);
+        let mut max_nodes = None;
+        let mut json = false;
         let mut positional = 0;
         let mut i = 0;
         while i < args.len() {
@@ -509,6 +519,11 @@ impl FailureOpts {
                         depth = n;
                     }
                 }
+                "--max-nodes" => {
+                    i += 1;
+                    max_nodes = args.get(i).and_then(|v| v.parse().ok());
+                }
+                "--json" => json = true,
                 s if !s.starts_with("--") => {
                     if positional == 0 {
                         snapshot = Some(s.to_string());
@@ -525,16 +540,27 @@ impl FailureOpts {
             snapshot,
             node,
             depth,
+            max_nodes,
+            json,
         }
     }
 }
 
-/// `ccos failure <snapshot.json> <node-id> [--depth N]` — inject a fault at a
-/// node and propagate it across the causal graph, reporting the affected
-/// neighborhood ranked by resulting failure relevance.
+/// `ccos failure <snapshot.json> <node-id> [--depth N] [--max-nodes K] [--json]`
+/// — inject a fault at a node and propagate it across the causal graph, reporting
+/// the affected neighborhood ranked by resulting failure relevance.
+///
+/// With `--max-nodes K` the graph is re-paged to the budget *after* injection,
+/// so the survivors are the bounded **WorkingSet_K**; with `--json` that working
+/// set is emitted as a machine-readable object. Together they are the Phase-1/2
+/// hook the causal-validation harness drives: inject a mined fault, then measure
+/// `R_cov = |F_target ∩ WorkingSet_K| / |F_target|`. Honours `CCOS_W_*` /
+/// `CCOS_FAILURE_DECAY` so a hyperparameter trial re-scores without recompiling.
 fn run_failure(opts: &FailureOpts) -> i32 {
     let (Some(file), Some(node_id)) = (opts.snapshot.as_deref(), opts.node.as_deref()) else {
-        eprintln!("usage: ccos failure <snapshot.json> <node-id> [--depth N]");
+        eprintln!(
+            "usage: ccos failure <snapshot.json> <node-id> [--depth N] [--max-nodes K] [--json]"
+        );
         return 2;
     };
     let snapshot = match KernelSnapshot::load(file) {
@@ -545,6 +571,8 @@ fn run_failure(opts: &FailureOpts) -> i32 {
         }
     };
     let mut graph = snapshot.graph;
+    // Re-score under any trial weights before injection/eviction.
+    graph.set_scoring_weights(ScoringWeights::from_env());
     let origin = NodeId(node_id.to_string());
     if !graph.nodes.contains_key(&origin) {
         eprintln!(
@@ -554,12 +582,17 @@ fn run_failure(opts: &FailureOpts) -> i32 {
         return 1;
     }
 
-    println!("╔══════════════════════════════════════════════╗");
-    println!("║  CCOS failure propagation                    ║");
-    println!("╚══════════════════════════════════════════════╝\n");
-
+    let nodes_before = graph.node_count();
     graph.set_failure_relevance(&origin, 0.95);
     graph.propagate_failure(&origin, 0, opts.depth);
+
+    // Optionally constrain the working set to the top-K by score (failure
+    // pressure has just lifted the causally-relevant subgraph, so eviction keeps
+    // it preferentially). This is the WorkingSet_K the proxy metric scores.
+    if let Some(k) = opts.max_nodes {
+        graph.max_in_memory_nodes = k;
+        graph.enforce_paging();
+    }
 
     let mut affected: Vec<(String, f64)> = graph
         .nodes
@@ -573,8 +606,45 @@ fn run_failure(opts: &FailureOpts) -> i32 {
             .then_with(|| a.0.cmp(&b.0))
     });
 
+    if opts.json {
+        let mut working_set: Vec<&NodeId> = graph.nodes.keys().collect();
+        working_set.sort();
+        let w = graph.scoring_weights;
+        let report = serde_json::json!({
+            "origin": node_id,
+            "severity": 0.95,
+            "depth": opts.depth,
+            "max_nodes": opts.max_nodes,
+            "nodes_before": nodes_before,
+            "working_set_size": working_set.len(),
+            "working_set": working_set.iter().map(|id| &id.0).collect::<Vec<_>>(),
+            "affected": affected
+                .iter()
+                .map(|(id, fr)| serde_json::json!({ "id": id, "failure_relevance": fr }))
+                .collect::<Vec<_>>(),
+            "weights": {
+                "w_base": w.w_base,
+                "w_failure": w.w_failure,
+                "w_recency": w.w_recency,
+                "w_access": w.w_access,
+                "failure_decay": w.failure_decay,
+            },
+        });
+        println!("{}", serde_json::to_string_pretty(&report).unwrap());
+        return 0;
+    }
+
+    println!("╔══════════════════════════════════════════════╗");
+    println!("║  CCOS failure propagation                    ║");
+    println!("╚══════════════════════════════════════════════╝\n");
     println!("  Origin:   {}", truncate(node_id, 40));
     println!("  Severity: 0.95   depth: {}", opts.depth);
+    if let Some(k) = opts.max_nodes {
+        println!(
+            "  WorkingSet_K: {} survivors of {nodes_before} (K={k})",
+            graph.node_count()
+        );
+    }
     println!("  Affected: {} nodes", affected.len());
     if !affected.is_empty() {
         println!("\n  Causal neighborhood (by failure relevance):");
@@ -1439,7 +1509,8 @@ COMMANDS:\n\
     verify <snapshot.json>     Re-check a saved snapshot's hash chain & integrity\n\
     replay <snapshot.json>     Deterministically replay a saved event log\n\
     diff <a.json> <b.json>     Structural diff between two snapshots (+ score drift)\n\
-    failure <snap> <node-id>   Inject a fault at a node and propagate it (--depth N)\n\
+    failure <snap> <node-id>   Inject a fault at a node and propagate it (--depth N,\n\
+    \x20                          --max-nodes K for the bounded WorkingSet_K, --json)\n\
     chaos [--iters N]          Fuzz the guard with adversarial payloads\n\
 \n\
   Inspection & export:\n\
