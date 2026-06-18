@@ -46,12 +46,19 @@ invariant. On the system's own source tree we measure, \emph{without any LLM
 calls}, that region-based selection covers a task's $k$-hop causal neighbourhood
 with recall $0.97$ versus $0.35$ for the flat top-score strategy, at
 $\approx\!48\%$ fewer tokens for equal coverage, with regions that are
-$95.5\%$ internally connected. We then specify a falsifiable protocol --- not yet
-executed --- to test whether causal regional memory improves task success and
-reduces hallucination relative to classical RAG, GraphRAG, MemGPT and LangGraph
-on long-horizon repository tasks. We are explicit throughout about what is
-\emph{proven} (formal structure, determinism, locality) versus \emph{hypothesised}
-(downstream agent gains), so that the contribution can be evaluated honestly.
+$95.5\%$ internally connected. In a deterministic, LLM-free \emph{simulation}
+under an explicit retrieval oracle, classical (lexical) RAG solves $0\%$ of
+cross-file causal tasks while structure-aware regional selection solves $100\%$,
+with the gap widening with task diameter --- though a strong graph-traversal
+baseline ties the regional method, so the lever is causal \emph{structure} and
+CCOS's value is operationalising it deterministically. We are careful that this
+tests the \emph{necessary} (retrieval) condition, not the \emph{sufficient}
+(generation) one, and we then specify a falsifiable protocol --- not yet executed
+--- to test whether the gain survives with real LLMs against classical RAG,
+GraphRAG, MemGPT and LangGraph on long-horizon tasks. We are explicit throughout
+about what is \emph{proven} (formal structure, determinism, locality),
+\emph{measured in simulation} (retrieval coverage), and \emph{still hypothesised}
+(downstream agent gains), so the contribution can be evaluated honestly.
 \end{abstract}
 
 \section{Introduction}
@@ -313,13 +320,85 @@ do so. Richer semantic edges (call graph / data flow, roadmap item P1.3) would
 sharpen $\Nk$ and is the main lever to raise precision; we flag this rather than
 hide it.
 
-\section{Proposed comparative study (not yet run)}\label{sec:protocol}
+\section{Hypothesis simulation under a stated oracle (LLM-free)}\label{sec:sim}
 
-The thesis worth testing is: \emph{does causal regional memory help an agent solve
-long-horizon tasks better than chunk-based retrieval?} We cannot answer this with
-the implementation alone --- it requires LLM rollouts, baselines and datasets we
-have not run --- so we specify a falsifiable protocol and \textbf{report no
-numbers for it}.
+The core thesis --- \emph{does regional causal memory help an agent on long,
+multi-file tasks?} --- ultimately needs LLM rollouts (\S\ref{sec:protocol}). But
+its \emph{necessary condition} is testable now, without an LLM: \textbf{an agent
+cannot solve a task whose required causal context is absent from its window}. We
+measure, under an explicit oracle, whether each selection strategy \emph{places
+the required causal context in the window}.
+
+\paragraph{Setup.} We generate modular synthetic repositories: $S$ independent
+subsystems, each a set of files linked by one cross-file causal chain plus
+high-score \emph{decoy} symbols; there are no edges between subsystems, so each
+subsystem is one bounded causal region. Crucially the causal structure is
+\emph{decoupled} from the lexical structure --- a chain neighbour shares no
+identifier token with the target, only an edge --- modelling a dependency that is
+causally essential yet lexically dissimilar to the query. A task of
+\emph{diameter} $d$ targets a symbol and requires the $\pm d$ window along its
+chain (up to $2d{+}1$ files). The token budget holds roughly one subsystem --- far
+less than the repository, so selection is a real constraint. The \textbf{success
+oracle} is $R(t)\subseteq S$: the required causal set lies inside the window. We
+compare five strategies at equal budget: \code{rag-dense} (top-$k$ lexical),
+\code{rag-hybrid} (lexical $+$ score), \code{graphrag-1hop} (best hit $+$ one
+hop), \code{graphrag-bfs} (unbounded graph expansion from the best hit --- a
+strong baseline), and \code{ccos-region}. Everything is seeded and deterministic;
+reproduce with \code{ccos experiment}.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lcccccc}
+\toprule
+& \multicolumn{4}{c}{success rate at diameter $d$} & \multicolumn{2}{c}{overall} \\
+\cmidrule(lr){2-5}\cmidrule(lr){6-7}
+Strategy & $d{=}1$ & $d{=}2$ & $d{=}3$ & $d{=}4$ & success & coverage \\
+\midrule
+\code{rag-dense}     & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 0.19 \\
+\code{rag-hybrid}    & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 0.50 \\
+\code{graphrag-1hop} & 1.00 & 0.00 & 0.00 & 0.00 & 0.23 & 0.58 \\
+\code{graphrag-bfs}  & 1.00 & 1.00 & 1.00 & 1.00 & 1.00 & 1.00 \\
+\textbf{\code{ccos-region}} & \textbf{1.00} & \textbf{1.00} & \textbf{1.00} & \textbf{1.00} & \textbf{1.00} & \textbf{1.00} \\
+\bottomrule
+\end{tabular}
+\caption{Hypothesis simulation ($800$ tasks, seed $42$, budget $=30$ nodes
+$\approx$ one subsystem). Success $=$ the required causal set is inside the
+window.}
+\label{tab:sim}
+\end{table}
+
+\paragraph{Findings (and their honest limits).}
+\textbf{(1)} Lexical retrieval --- classical RAG --- \emph{fails} on cross-file
+causal tasks here ($0\%$ success; coverage $0.19$--$0.50$): ranking by similarity
+cannot surface causally-essential but lexically-dissimilar context. This
+validates the hypothesis's premise.
+\textbf{(2)} Shallow graph expansion (\code{graphrag-1hop}) solves only $d{=}1$
+and collapses beyond; the value of structure-aware selection \emph{grows with
+task diameter} (the direction of H2).
+\textbf{(3)} Critically, both \code{ccos-region} \emph{and} the strong
+\code{graphrag-bfs} baseline reach $1.00$. The lever is therefore causal
+\emph{structure}, \textbf{not CCOS per se}: any method that pages the causal
+component succeeds. CCOS's distinct contribution is \emph{operationalising} this
+as deterministic, replayable, precomputed, bounded, temperature-governed memory
+rather than per-query traversal --- at fewer tokens ($\approx\!3456$ vs the
+$3840$-token budget, since regions are bounded).
+\textbf{(4) Boundary condition.} This holds for \emph{modular} repositories with
+separable regions (we measured density $0.955$ on real code, \S\ref{sec:eval}). A
+monolithic single-component graph collapses the advantage: in an early run a
+single giant region exceeded the budget and CCOS degraded to $0\%$ --- reported
+rather than hidden.
+\textbf{(5)} This is a \emph{simulation under a stated oracle}, not an LLM
+evaluation. It tests the \emph{necessary} condition (the right context is
+retrievable), not the \emph{sufficient} one (the LLM then produces a correct
+patch), which is \S\ref{sec:protocol}.
+
+\section{Proposed comparative study with real LLMs (not yet run)}\label{sec:protocol}
+
+The simulation (\S\ref{sec:sim}) established the necessary condition. The
+sufficient condition --- that an LLM agent then \emph{solves} more long-horizon
+tasks with regional memory than with chunk retrieval --- requires rollouts,
+baselines and datasets we have not run, so we specify a falsifiable protocol and
+\textbf{report no numbers for it}.
 
 \paragraph{Baselines.} (i) \emph{Classical RAG}: embedding retrieval over code
 chunks, top-$k$ by cosine~\cite{lewis2020rag}. (ii) \emph{GraphRAG}: community

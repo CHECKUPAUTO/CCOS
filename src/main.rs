@@ -5,6 +5,7 @@ use ccos::adversarial::{AdversarialEngine, AdversarialMode};
 use ccos::context_policy::ContextPolicy;
 use ccos::distributed_event_log::DistributedEventLog;
 use ccos::event_log::{EventLog, EventPayload, EventReplayer, EventType, GraphReconstructor};
+use ccos::experiment::{run_experiment, ExperimentConfig};
 use ccos::guard::{GuardConfig, GuardLayer};
 use ccos::incremental::IncrementalGraphEngine;
 use ccos::memory::{MemoryGraph, NodeId};
@@ -48,6 +49,7 @@ async fn main() {
         "blame" => run_blame(&BlameOpts::parse(rest)),
         "export" => run_export(&ExportOpts::parse(rest)),
         "regions" => run_regions(&RegionsOpts::parse(rest)),
+        "experiment" => run_experiment_cmd(rest),
         // ── CCOS v0.3 — Autonomous Context Runtime ──────────────────
         "scan" => commands_runtime::run_scan(rest).await,
         "agents" => commands_runtime::run_agents(rest).await,
@@ -1164,6 +1166,95 @@ fn run_regions(opts: &RegionsOpts) -> i32 {
     0
 }
 
+/// `ccos experiment [--tasks N] [--seed S] [--budget B] [--json]` — run the
+/// LLM-free hypothesis simulation: regional causal memory vs. RAG / GraphRAG
+/// baselines on synthetic multi-file causal tasks of growing diameter.
+fn run_experiment_cmd(args: &[String]) -> i32 {
+    let mut cfg = ExperimentConfig::default();
+    let mut json = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--json" => json = true,
+            "--tasks" => {
+                i += 1;
+                if let Some(n) = args.get(i).and_then(|v| v.parse().ok()) {
+                    cfg.tasks = n;
+                }
+            }
+            "--seed" => {
+                i += 1;
+                if let Some(n) = args.get(i).and_then(|v| v.parse().ok()) {
+                    cfg.seed = n;
+                }
+            }
+            "--budget" => {
+                i += 1;
+                if let Some(n) = args.get(i).and_then(|v| v.parse().ok()) {
+                    cfg.budget = n;
+                }
+            }
+            other => eprintln!("ccos: ignoring unknown flag '{other}'"),
+        }
+        i += 1;
+    }
+
+    let report = run_experiment(&cfg);
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report).unwrap());
+        return 0;
+    }
+
+    println!("╔══════════════════════════════════════════════╗");
+    println!("║  CCOS experiment — regional memory vs RAG    ║");
+    println!("╚══════════════════════════════════════════════╝\n");
+    println!(
+        "  seed={}  tasks={}  budget={} tokens   (success = required causal set ⊆ window)\n",
+        report.seed, report.n_tasks, report.budget_tokens
+    );
+
+    println!("  ── Task-success rate by causal diameter ──");
+    println!(
+        "    {:<14} {:>6} {:>6} {:>6} {:>6}",
+        "strategy", "d=1", "d=2", "d=3", "d=4"
+    );
+    for strat in [
+        "rag-dense",
+        "rag-hybrid",
+        "graphrag-1hop",
+        "graphrag-bfs",
+        "ccos-region",
+    ] {
+        let cell = |d: u32| -> String {
+            report
+                .per_diameter
+                .iter()
+                .find(|(dd, _)| *dd == d)
+                .and_then(|(_, row)| row.iter().find(|r| r.strategy == strat))
+                .map(|r| format!("{:.2}", r.success_rate))
+                .unwrap_or_else(|| "  – ".into())
+        };
+        println!(
+            "    {:<14} {:>6} {:>6} {:>6} {:>6}",
+            strat,
+            cell(1),
+            cell(2),
+            cell(3),
+            cell(4)
+        );
+    }
+
+    println!("\n  ── Overall (success · coverage · tokens) ──");
+    for r in &report.overall {
+        println!(
+            "    {:<14} success {:.2}   coverage {:.2}   ~{:.0} tokens",
+            r.strategy, r.success_rate, r.mean_coverage, r.mean_tokens
+        );
+    }
+    0
+}
+
 /// Recursively collect `.rs` files, skipping `target/`, VCS and hidden dirs.
 fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let entries = match std::fs::read_dir(dir) {
@@ -1222,6 +1313,7 @@ COMMANDS:\n\
     regions <path>             Cluster the causal graph into context regions (--json)\n\
         --activate <node-id>   Hydrate the context window for a node's region\n\
         --metrics <node-id>    Flat-vs-region locality comparison (--radius N)\n\
+    experiment [--tasks N]     Hypothesis test: regional memory vs RAG/GraphRAG (--json)\n\
 \n\
   CCOS v0.3 — Autonomous Context Runtime:\n\
     scan <path>                Scan a real workspace and ingest the delta\n\

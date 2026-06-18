@@ -20,6 +20,15 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `docs/context_regions.md`, and an arXiv research paper in `docs/paper/`.
   Measured: region selection covers 97% of a task's causal neighbourhood vs 35%
   flat at ≈48% fewer tokens; regions 95.5% internally connected.
+- **Hypothesis harness** (`experiment` module + `ccos experiment` CLI) — a
+  deterministic, LLM-free simulation testing the *necessary condition* of the
+  research thesis (is the required causal context retrievable?) on modular
+  synthetic repos with cross-file causal tasks of growing diameter, comparing
+  five strategies (RAG-dense/hybrid, GraphRAG-1hop/BFS, CCOS-region) under an
+  explicit success oracle. Result: lexical RAG solves 0% of cross-file causal
+  tasks while structure-aware regional selection solves 100% (the gap widens with
+  diameter), with a strong graph-BFS baseline tying the regional method — folded
+  into the paper as `docs/paper/` §8.
 - **Canonical tamper-evident `EventLog`** (ROADMAP P1.2): every appended event is
   linked into a SHA-256 hash chain over its replayable content (sequence + type +
   payload), so integrity now covers *all* runs, not just persisted snapshots.

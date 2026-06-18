@@ -66,5 +66,6 @@ pub mod workspace;
 // ── CCOS v0.3 — Context Region Engine (spatial memory) ──────────────
 pub mod context_policy;
 pub mod context_region;
+pub mod experiment;
 pub mod region_engine;
 pub mod region_metrics;

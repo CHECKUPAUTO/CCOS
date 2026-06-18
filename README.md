@@ -83,6 +83,7 @@ COMMANDS:
     regions <path>             Cluster the causal graph into context regions (--json)
         --activate <node-id>   Hydrate the context window for a node's region
         --metrics <node-id>    Flat-vs-region locality comparison (--radius N)
+    experiment [--tasks N]     Hypothesis test: regional memory vs RAG/GraphRAG (--json)
 
   CCOS v0.3 — Autonomous Context Runtime:
     scan <path>                Scan a real workspace and ingest the delta
@@ -187,11 +188,16 @@ cargo run -- regions src                                   # cluster → region 
 cargo run -- regions src --activate file:src/memory.rs     # hydrate a context window
 cargo run -- regions src --metrics sym:src/memory.rs:MemoryGraph --json  # flat vs region
 bash scripts/region_benchmark.sh src                       # full locality benchmark
+cargo run -- experiment --tasks 800                        # hypothesis test (vs RAG/GraphRAG)
 ```
 
 On CCOS's own tree, region selection covers **97%** of a task's causal
 neighbourhood (vs 35% for flat top-score selection) at **≈48% fewer tokens**, with
-regions that are **95.5%** internally connected. See
+regions that are **95.5%** internally connected. In a deterministic, LLM-free
+simulation (`ccos experiment`), **lexical RAG solves 0%** of cross-file causal
+tasks while **structure-aware regional selection solves 100%** (the gap widening
+with task diameter) — though a strong graph-traversal baseline ties it, so the
+lever is causal *structure* that CCOS operationalises deterministically. See
 [`docs/context_regions.md`](docs/context_regions.md) and the research paper in
 [`docs/paper/`](docs/paper/).
 
@@ -213,7 +219,7 @@ See [`CCOS_v0.3_REPORT.md`](CCOS_v0.3_REPORT.md) for the full v0.3 report.
 ## Testing
 
 ```bash
-cargo test          # 202 unit + integration tests
+cargo test          # 205 unit + integration tests
 cargo clippy --all-targets   # lint-clean
 cargo test -- --ignored      # opt-in: 1,000,000-cycle long-stability run
 ```

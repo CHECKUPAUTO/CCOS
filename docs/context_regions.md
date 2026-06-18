@@ -159,6 +159,40 @@ Region selection covers **97%** of a task's causal neighbourhood vs **35%** for
 flat, using **≈48% fewer tokens** to reach equal coverage. Absolute precision is
 low because the v0.2 parser emits only containment/import edges (shallow
 neighbourhoods); richer **semantic edges** (call graph / data flow, roadmap
-P1.3) would tighten `N_k` and amplify the precision gain. See
-[`paper/`](paper/) for the formal treatment, the determinism proof and the
-proposed comparison against RAG / GraphRAG / MemGPT / LangGraph.
+P1.3) would tighten `N_k` and amplify the precision gain.
+
+## Testing the hypothesis
+
+> *Does an agent with regional causal memory solve long, multi-file tasks better
+> than a classical RAG agent?*
+
+The full answer needs LLM rollouts, but its **necessary condition** is testable
+now, deterministically, without an LLM: *an agent cannot solve a task whose
+required causal context is absent from its window.* `ccos experiment` runs that
+test — modular synthetic repos, cross-file causal tasks of growing **diameter**,
+five selection strategies at equal token budget, oracle success = "required
+causal set ⊆ window":
+
+```bash
+cargo run -- experiment --tasks 800
+```
+
+| strategy | d=1 | d=2 | d=3 | d=4 | overall | coverage |
+| -------- | --- | --- | --- | --- | ------- | -------- |
+| `rag-dense` (lexical RAG) | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.19 |
+| `rag-hybrid` | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.50 |
+| `graphrag-1hop` | 1.00 | 0.00 | 0.00 | 0.00 | 0.23 | 0.58 |
+| `graphrag-bfs` (strong graph baseline) | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
+| **`ccos-region`** | **1.00** | **1.00** | **1.00** | **1.00** | **1.00** | **1.00** |
+
+**Honest reading:** lexical RAG *fails entirely* on cross-file causal tasks
+(0%) — the hypothesis's premise validated. But `graphrag-bfs` ties `ccos-region`,
+so the lever is causal **structure**, not CCOS specifically; CCOS's value is
+operationalising it as *deterministic, bounded, precomputed* memory (at fewer
+tokens). It only holds for **modular** repos — a single giant region exceeding the
+budget collapses the advantage. This is a **simulation under a stated oracle**
+(necessary condition), not an LLM evaluation (sufficient condition).
+
+See [`paper/`](paper/) for the formal model, the determinism proof, this
+simulation in full, and the proposed real-LLM comparison against RAG / GraphRAG /
+MemGPT / LangGraph.
