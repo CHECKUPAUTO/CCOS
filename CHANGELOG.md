@@ -32,6 +32,14 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   while only `ccos-region`, anchored on the workspace signal, survives at 100%. The
   ablation isolates the differentiator: the *anchor source*, not the region
   machinery. Folded into the paper (`docs/paper/` §8, two-scenario table).
+- **Real-LLM evaluation harness** (`eval` module + `ccos eval` CLI) — tests the
+  *sufficient* condition: auto-gradable multi-file "arithmetic causal chain" tasks
+  whose answer requires the distant cause, six strategies assembling a budgeted
+  window, sent to any OpenAI-compatible or Ollama endpoint. Reports task success,
+  model-independent **oracle coverage**, and symbol-hallucination per diameter.
+  Runs offline against a no-model stub (reproducing the coverage result on real
+  file text) so the pipeline is CI-checked; real success numbers await a reachable
+  model. Paper §9 updated (harness implemented; results pending a model).
 - **Canonical tamper-evident `EventLog`** (ROADMAP P1.2): every appended event is
   linked into a SHA-256 hash chain over its replayable content (sequence + type +
   payload), so integrity now covers *all* runs, not just persisted snapshots.

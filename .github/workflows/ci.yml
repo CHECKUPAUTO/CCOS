@@ -74,4 +74,5 @@ jobs:
           cargo run --locked -- regions src --activate file:src/lib.rs
           cargo run --locked -- regions src --metrics file:src/lib.rs --json
           cargo run --locked -- experiment --tasks 60
+          cargo run --locked -- eval --tasks 4
           cargo run --locked -- chaos --iters 500

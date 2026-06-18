@@ -36,7 +36,7 @@ locally CI will too:
 ```bash
 cargo fmt --all                          # format (CI runs --check)
 cargo clippy --all-targets -- -D warnings  # lint; warnings are errors
-cargo test                               # 205 unit + integration tests
+cargo test                               # 212 unit + integration tests
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps   # docs must build clean
 ```
 

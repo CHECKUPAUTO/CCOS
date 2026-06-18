@@ -84,6 +84,7 @@ COMMANDS:
         --activate <node-id>   Hydrate the context window for a node's region
         --metrics <node-id>    Flat-vs-region locality comparison (--radius N)
     experiment [--tasks N]     Hypothesis test: regional memory vs RAG/GraphRAG (--json)
+    eval [--tasks N]           Real-LLM eval (set OPENAI_API_KEY or OLLAMA_ENDPOINT)
 
   CCOS v0.3 — Autonomous Context Runtime:
     scan <path>                Scan a real workspace and ingest the delta
@@ -188,7 +189,9 @@ cargo run -- regions src                                   # cluster → region 
 cargo run -- regions src --activate file:src/memory.rs     # hydrate a context window
 cargo run -- regions src --metrics sym:src/memory.rs:MemoryGraph --json  # flat vs region
 bash scripts/region_benchmark.sh src                       # full locality benchmark
-cargo run -- experiment --tasks 800                        # hypothesis test (vs RAG/GraphRAG)
+cargo run -- experiment --tasks 800                        # hypothesis test (oracle, vs RAG/GraphRAG)
+OPENAI_API_KEY=… OPENAI_BASE_URL=https://api.deepseek.com OPENAI_MODEL=… \
+  cargo run -- eval --tasks 40                              # real-LLM eval (needs a model + host allowlisted)
 ```
 
 On CCOS's own tree, region selection covers **97%** of a task's causal
@@ -220,7 +223,7 @@ See [`CCOS_v0.3_REPORT.md`](CCOS_v0.3_REPORT.md) for the full v0.3 report.
 ## Testing
 
 ```bash
-cargo test          # 205 unit + integration tests
+cargo test          # 212 unit + integration tests
 cargo clippy --all-targets   # lint-clean
 cargo test -- --ignored      # opt-in: 1,000,000-cycle long-stability run
 ```

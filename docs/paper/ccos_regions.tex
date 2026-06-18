@@ -416,13 +416,46 @@ region exceeding the budget collapses the advantage (observed, reported).
 tests the \emph{necessary} (retrieval) condition, not the \emph{sufficient}
 (generation) one of \S\ref{sec:protocol}.
 
-\section{Proposed comparative study with real LLMs (not yet run)}\label{sec:protocol}
+\section{Real-LLM evaluation: harness implemented, results pending a model}\label{sec:protocol}
 
 The simulation (\S\ref{sec:sim}) established the necessary condition. The
-sufficient condition --- that an LLM agent then \emph{solves} more long-horizon
-tasks with regional memory than with chunk retrieval --- requires rollouts,
-baselines and datasets we have not run, so we specify a falsifiable protocol and
-\textbf{report no numbers for it}.
+sufficient condition --- that an LLM agent then \emph{solves} more tasks with
+regional memory than with chunk retrieval --- requires model rollouts. We have
+\textbf{implemented the harness} (\code{ccos eval}) but \textbf{report no LLM
+numbers}, because the evaluation environment has no reachable model endpoint; the
+study is one command (and an API key) away for anyone who does.
+
+\paragraph{Implemented harness.} Each task is a tiny multi-file project encoding
+an \emph{arithmetic causal chain}: a base constant in one file is transformed
+through a chain of one-line functions across separate files, and the question
+``what integer does the last function return?'' is answerable \emph{only} by
+reading the whole chain (the distant cause included). Grading is therefore
+exact-match on an integer --- objective and automatable, with no code execution.
+The same six strategies of \S\ref{sec:sim} assemble the context window under a
+token budget (with the clean/noisy query split), the window is sent to a model
+(any OpenAI-compatible or Ollama endpoint), and we record three metrics per
+diameter: \textbf{task success} (correct integer), \textbf{oracle coverage}
+(required chain $\subseteq$ window --- model-independent), and
+\textbf{symbol-hallucination} (the answer cites a function absent from the
+project). Run offline (no model), the harness already reproduces the coverage
+result of Table~\ref{tab:sim} on real file text --- e.g.\ clean coverage
+$\{$rag $0.00$, graphrag-bfs / ccos $1.00\}$, noisy coverage $0.00$ everywhere
+\emph{except} \code{ccos-region} $1.00$ --- so the only missing ingredient is the
+model that turns \emph{coverage} into measured \emph{success}.
+
+\paragraph{Baselines.} (i) \emph{Classical RAG}: embedding retrieval over code
+chunks, top-$k$ by cosine~\cite{lewis2020rag}. (ii) \emph{GraphRAG}: community
+summarisation over a code/entity graph~\cite{edge2024graphrag}. (iii)
+\emph{MemGPT}: OS-style paged agent memory~\cite{packer2023memgpt}. (iv)
+\emph{LangGraph} agent with a vector store~\cite{langgraph}. (v) \emph{CCOS
+regions}: hydrate the target's region under the dynamic policy. All share the same
+base LLM and token budget.
+
+\paragraph{Tasks and data.} Beyond the built-in arithmetic-chain suite, the
+decisive external benchmarks are SWE-bench~\cite{jimenez2023swebench} issue
+resolution (patch passes the hidden tests) and a controlled \emph{multi-file bug}
+suite where the fault site, its cause and its blast radius lie in distinct files
+(so coherent selection matters).
 
 \paragraph{Baselines.} (i) \emph{Classical RAG}: embedding retrieval over code
 chunks, top-$k$ by cosine~\cite{lewis2020rag}. (ii) \emph{GraphRAG}: community

@@ -4,6 +4,7 @@ mod commands_runtime;
 use ccos::adversarial::{AdversarialEngine, AdversarialMode};
 use ccos::context_policy::ContextPolicy;
 use ccos::distributed_event_log::DistributedEventLog;
+use ccos::eval::{run_eval, EvalConfig};
 use ccos::event_log::{EventLog, EventPayload, EventReplayer, EventType, GraphReconstructor};
 use ccos::experiment::{run_experiment, ExperimentConfig};
 use ccos::guard::{GuardConfig, GuardLayer};
@@ -50,6 +51,7 @@ async fn main() {
         "export" => run_export(&ExportOpts::parse(rest)),
         "regions" => run_regions(&RegionsOpts::parse(rest)),
         "experiment" => run_experiment_cmd(rest),
+        "eval" => run_eval_cmd(rest).await,
         // ── CCOS v0.3 — Autonomous Context Runtime ──────────────────
         "scan" => commands_runtime::run_scan(rest).await,
         "agents" => commands_runtime::run_agents(rest).await,
@@ -1273,6 +1275,123 @@ fn run_experiment_cmd(args: &[String]) -> i32 {
     0
 }
 
+/// `ccos eval [--tasks N] [--seed S] [--budget T] [--json]` — the **real-LLM**
+/// evaluation (clean + noisy). Configure a model with `OPENAI_API_KEY`
+/// (+`OPENAI_BASE_URL`, `OPENAI_MODEL`) or `OLLAMA_ENDPOINT`; with neither set it
+/// runs an offline stub (every answer wrong) to exercise the pipeline.
+async fn run_eval_cmd(args: &[String]) -> i32 {
+    let mut cfg = EvalConfig::default();
+    let mut json = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--json" => json = true,
+            "--tasks" => {
+                i += 1;
+                if let Some(n) = args.get(i).and_then(|v| v.parse().ok()) {
+                    cfg.tasks = n;
+                }
+            }
+            "--seed" => {
+                i += 1;
+                if let Some(n) = args.get(i).and_then(|v| v.parse().ok()) {
+                    cfg.seed = n;
+                }
+            }
+            "--budget" => {
+                i += 1;
+                if let Some(n) = args.get(i).and_then(|v| v.parse().ok()) {
+                    cfg.budget_tokens = n;
+                }
+            }
+            other => eprintln!("ccos: ignoring unknown flag '{other}'"),
+        }
+        i += 1;
+    }
+
+    let clean = run_eval(&EvalConfig {
+        noisy: false,
+        ..cfg.clone()
+    })
+    .await;
+    let noisy = run_eval(&EvalConfig {
+        noisy: true,
+        ..cfg.clone()
+    })
+    .await;
+
+    if json {
+        let out = serde_json::json!({ "clean": clean, "noisy": noisy });
+        println!("{}", serde_json::to_string_pretty(&out).unwrap());
+        return 0;
+    }
+
+    let strategies = [
+        "rag-dense",
+        "rag-hybrid",
+        "graphrag-1hop",
+        "graphrag-bfs",
+        "ccos-from-query",
+        "ccos-region",
+    ];
+    let table = |report: &ccos::eval::EvalReport, title: &str| {
+        println!("  ── {title} ──");
+        println!(
+            "    {:<16} {:>6} {:>6} {:>6} {:>6}  {:>6} {:>7} {:>7}",
+            "strategy (success →)", "d=1", "d=2", "d=3", "d=4", "cover", "halluc", "tokens"
+        );
+        for strat in strategies {
+            let cell = |d: u32| -> String {
+                report
+                    .per_diameter
+                    .iter()
+                    .find(|(dd, _)| *dd == d)
+                    .and_then(|(_, row)| row.iter().find(|r| r.strategy == strat))
+                    .map(|r| format!("{:.2}", r.success_rate))
+                    .unwrap_or_else(|| "  – ".into())
+            };
+            let ov = report.overall.iter().find(|r| r.strategy == strat);
+            let (cov, h, t) = ov
+                .map(|r| (r.mean_coverage, r.hallucination_rate, r.mean_input_tokens))
+                .unwrap_or((0.0, 0.0, 0.0));
+            println!(
+                "    {:<16} {:>6} {:>6} {:>6} {:>6}  {:>5.0}% {:>6.0}% {:>7.0}",
+                strat,
+                cell(1),
+                cell(2),
+                cell(3),
+                cell(4),
+                cov * 100.0,
+                h * 100.0,
+                t
+            );
+        }
+    };
+
+    println!("╔══════════════════════════════════════════════╗");
+    println!("║  CCOS eval — real-LLM task success vs RAG    ║");
+    println!("╚══════════════════════════════════════════════╝\n");
+    println!("  provider: {} · model: {}", clean.provider, clean.model);
+    println!(
+        "  seed={}  tasks={}  budget={} tokens   (success = correct integer answer)\n",
+        clean.seed, clean.n_tasks, clean.budget_tokens
+    );
+    if clean.provider.starts_with("none") {
+        println!(
+            "  ⚠  No LLM configured — set OPENAI_API_KEY (+ OPENAI_BASE_URL, OPENAI_MODEL)\n     \
+             or OLLAMA_ENDPOINT, and allowlist the host. Running the offline stub:\n     \
+             every answer is wrong (pipeline check only, NOT a result).\n"
+        );
+    }
+    table(&clean, "CLEAN query (names the target function)");
+    println!();
+    table(
+        &noisy,
+        "NOISY query (a decoy out-matches the target lexically)",
+    );
+    0
+}
+
 /// Recursively collect `.rs` files, skipping `target/`, VCS and hidden dirs.
 fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let entries = match std::fs::read_dir(dir) {
@@ -1332,6 +1451,7 @@ COMMANDS:\n\
         --activate <node-id>   Hydrate the context window for a node's region\n\
         --metrics <node-id>    Flat-vs-region locality comparison (--radius N)\n\
     experiment [--tasks N]     Hypothesis test: regional memory vs RAG/GraphRAG (--json)\n\
+    eval [--tasks N]           Real-LLM eval (set OPENAI_API_KEY or OLLAMA_ENDPOINT)\n\
 \n\
   CCOS v0.3 — Autonomous Context Runtime:\n\
     scan <path>                Scan a real workspace and ingest the delta\n\

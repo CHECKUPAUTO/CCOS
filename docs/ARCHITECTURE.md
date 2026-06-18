@@ -23,6 +23,7 @@ A practical map of the codebase for contributors. For the conceptual write-up se
 | **`context_policy`** (v0.3) | Dynamic context-admission score (replaces the static threshold) | `ContextPolicy` |
 | **`region_metrics`** (v0.3) | Flat-vs-region locality measurement (precision/recall/tokens) | `LocalityReport`, `locality_report`, `causal_neighborhood` |
 | **`experiment`** (v0.3)     | LLM-free hypothesis simulation: regional memory vs RAG/GraphRAG baselines on synthetic causal tasks | `ExperimentConfig`, `ExperimentReport`, `run_experiment` |
+| **`eval`** (v0.3)           | Real-LLM evaluation harness (auto-gradable causal-chain tasks; OpenAI/Ollama) | `EvalConfig`, `EvalReport`, `run_eval` |
 | `util`                      | Shared helpers (`sha256_hex`) | `sha256_hex` |
 | **`scheduler`** (v0.3)      | HOT/WARM/COLD context paging by token budget | `ContextScheduler`, `MemoryZone` |
 | **`workspace`** (v0.3)      | Async real-FS scanner; add/modify/remove delta | `WorkspaceScanner`, `WorkspaceDelta` |
@@ -111,7 +112,7 @@ or loaded from a snapshot (`blame`, `export`):
 
 ```bash
 cargo build --all-targets
-cargo test                    # 205 tests (211 with --features syn-parser)
+cargo test                    # 212 tests (218 with --features syn-parser)
 cargo clippy --all-targets    # warning-clean (CI denies warnings)
 cargo doc --open              # rendered module docs
 ```
