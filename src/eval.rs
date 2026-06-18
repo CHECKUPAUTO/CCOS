@@ -545,7 +545,7 @@ fn hallucinates(reply: &str, task: &Task) -> bool {
 /// Provider abstraction: returns a model reply, or `None` if no LLM is configured.
 async fn ask(prompt: &str) -> Option<String> {
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
+        .timeout(std::time::Duration::from_secs(120))
         .build()
         .ok()?;
     if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
@@ -553,10 +553,13 @@ async fn ask(prompt: &str) -> Option<String> {
             .unwrap_or_else(|_| "https://api.anthropic.com".into());
         let model =
             std::env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| "claude-3-5-sonnet-latest".into());
+        // No `temperature`: reasoning models (e.g. deepseek-v4-pro) emit a
+        // separate thinking block and may reject/ignore it. A generous
+        // max_tokens leaves room to finish the thinking *and* the text answer
+        // (too small a budget is spent entirely on thinking → no answer).
         let body = serde_json::json!({
             "model": model,
-            "max_tokens": 1024,
-            "temperature": 0,
+            "max_tokens": 4096,
             "messages": [{"role": "user", "content": prompt}],
         });
         let resp = client
@@ -570,7 +573,15 @@ async fn ask(prompt: &str) -> Option<String> {
             .json::<serde_json::Value>()
             .await
             .ok()?;
-        return resp["content"][0]["text"].as_str().map(String::from);
+        // The content is an array of blocks; with reasoning models it is
+        // [{type:"thinking",…}, {type:"text",text:…}]. Return the text block.
+        return resp["content"].as_array().and_then(|blocks| {
+            blocks
+                .iter()
+                .find(|b| b["type"] == "text")
+                .and_then(|b| b["text"].as_str())
+                .map(String::from)
+        });
     }
     if let Ok(key) = std::env::var("OPENAI_API_KEY") {
         let base =
