@@ -38,13 +38,28 @@
 use crate::external_memory::{
     CcosMemory, ExternalMemory, IngestReport, MemoryError, Recall, RecallWindow,
 };
+use crate::trace::parse_cargo_test_output;
 
 /// One recorded cognitive operation.
 #[derive(Debug, Clone)]
 enum Op {
-    Ingest { uri: String, source: String },
-    Failure { node: String, depth: u32 },
-    Recall { recall: Recall, budget: usize },
+    Ingest {
+        uri: String,
+        source: String,
+    },
+    Failure {
+        node: String,
+        depth: u32,
+    },
+    Recall {
+        recall: Recall,
+        budget: usize,
+    },
+    /// A compiler/test failure fed back in: pressure injected on the faulting
+    /// files (the "page fault"), then a refreshed recall around them.
+    PageFault {
+        files: Vec<String>,
+    },
 }
 
 /// An event-sourced agent memory session: every operation is recorded so the
@@ -94,6 +109,26 @@ impl AgentSession {
         window
     }
 
+    /// **Context page fault**: feed `cargo test` / compiler output back into the
+    /// session. The faulting source locations are parsed out (a direct symptom→
+    /// cause signal), failure pressure is injected on those in-memory files, and a
+    /// refreshed window is recalled around the fault — the compiler-in-the-loop
+    /// step. It is logged like any other op, so the whole correction loop replays.
+    /// Returns the refreshed context window for the agent's next attempt.
+    pub fn page_fault(&mut self, compiler_output: &str, budget: usize) -> RecallWindow {
+        let files = parse_cargo_test_output(compiler_output).files();
+        for f in &files {
+            let _ = self.live.signal_failure(&format!("file:{f}"), 2);
+        }
+        let recall = files
+            .first()
+            .map(|f| Recall::around(format!("file:{f}")))
+            .unwrap_or(Recall::WorkingSet);
+        let window = self.live.recall(&recall, budget);
+        self.ops.push(Op::PageFault { files });
+        window
+    }
+
     /// Number of recorded operations (timeline length).
     pub fn len(&self) -> usize {
         self.ops.len()
@@ -120,6 +155,11 @@ impl AgentSession {
                 }
                 Op::Failure { node, depth } => {
                     let _ = m.signal_failure(node, *depth);
+                }
+                Op::PageFault { files } => {
+                    for f in files {
+                        let _ = m.signal_failure(&format!("file:{f}"), 2);
+                    }
                 }
                 Op::Recall { .. } => {} // read-only: no state change
             }
@@ -150,6 +190,7 @@ impl AgentSession {
                     Op::Recall { recall, budget } => {
                         format!("t={t}  Recall({recall:?}, budget={budget})")
                     }
+                    Op::PageFault { files } => format!("t={t}  PageFault(files={files:?})"),
                 }
             })
             .collect()
@@ -215,5 +256,21 @@ mod tests {
         assert!(tl[0].contains("Ingest(src/db.rs)"));
         assert!(tl[3].contains("SignalFailure"));
         assert!(tl[4].contains("Recall"));
+    }
+
+    #[test]
+    fn page_fault_pulls_the_faulting_file_in_and_replays() {
+        let mut s = chain_session();
+        // A test failure pointing at the deep cause db.rs.
+        let err = "thread 'main' panicked at src/db.rs:1:14:\nattempt to add with overflow\n";
+        let win = s.page_fault(err, 8000);
+        assert!(
+            win.items.iter().any(|i| i.uri == "file:src/db.rs"),
+            "page fault recalls the faulting file"
+        );
+        // The whole correction loop replays: reconstructed state matches live.
+        let replayed = s.replay_to(s.len());
+        assert_eq!(replayed.stats().nodes, s.memory().stats().nodes);
+        assert!(s.timeline().last().unwrap().contains("PageFault"));
     }
 }
