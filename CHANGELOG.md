@@ -8,6 +8,19 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Phase-4 prototype** (`scripts/phase4_eval.py`) — the *sufficient*-condition
+  harness: for a real single-file fix it builds the agent's context two ways at an
+  equal token budget (CCOS causal region vs lexical-RAG top files), asks a model
+  to rewrite the buggy file, applies it, and runs `cargo test`, comparing CCOS vs
+  RAG resolved-rate. Validated in `--dry-run` offline; the model (Ollama) + test
+  grading run on a machine with a toolchain (the Jetson). Dry-run already shows a
+  caveat: CCOS's region is often *just the target file* (sparse cross-file edges),
+  so it gives a thinner context than RAG at equal budget — the verdict hinges on
+  whether targeted-thin beats broad-lexical for the model.
+- **Thesis check in the validation harness** — measures seed↔target lexical
+  similarity per scenario and reports Δ(CCOS−RAG) for far vs near seeds. On the
+  available data (fd, n=8) it is *unsupportive*: CCOS does worse, not better, when
+  the seed is lexically far from its targets (corr +0.45, thesis predicts −).
 - **Bidirectional failure propagation** — `MemoryGraph::propagate_failure_bidirectional`
   / `ccos failure --bidirectional` spread failure pressure to *upstream causes*
   (callers/importers) as well as downstream dependencies, and `ccos analyze` now
