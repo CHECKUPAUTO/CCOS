@@ -39,10 +39,11 @@ use crate::external_memory::{
     CcosMemory, ExternalMemory, IngestReport, MemoryError, Recall, RecallWindow,
 };
 use crate::trace::parse_cargo_test_output;
-use std::path::Path;
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 /// One recorded cognitive operation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 enum Op {
     Ingest {
         uri: String,
@@ -63,17 +64,30 @@ enum Op {
     },
 }
 
+/// The on-disk timeline sidecar (`<workspace>.oplog`): the replay **baseline**
+/// the session started from, plus the ordered op-log. Persisting both lets the
+/// whole cognitive timeline — not just the memory snapshot — survive a restart,
+/// so [`replay_to`](AgentSession::replay_to) / time-travel work across runs.
+#[derive(Serialize, Deserialize)]
+struct PersistedTimeline {
+    baseline: Option<String>,
+    ops: Vec<Op>,
+}
+
 /// An event-sourced agent memory session: every operation is recorded so the
 /// state is replayable and auditable. See the [module docs](crate::agent_session).
 pub struct AgentSession {
     live: CcosMemory,
     ops: Vec<Op>,
-    /// JSON snapshot of the memory the session was *opened* from, if any. A
+    /// JSON snapshot of the memory the session's timeline replays *on top of*. A
     /// freshly [`new`](Self::new) session has none (the baseline is empty); a
-    /// session [`open`](Self::open)ed from a checkpoint carries the loaded state
-    /// here so [`replay_to`](Self::replay_to) layers this session's timeline on
-    /// top of it instead of on an empty graph.
+    /// session [`open`](Self::open)ed from a checkpoint carries either the state
+    /// it was seeded from (so [`replay_to`](Self::replay_to) layers the timeline
+    /// on top of it) or `None` when the op-log reproduces the memory from empty.
     baseline: Option<String>,
+    /// Where the timeline sidecar lives (`<workspace>.oplog`); `None` for an
+    /// in-memory [`new`](Self::new) session.
+    oplog_path: Option<PathBuf>,
 }
 
 impl Default for AgentSession {
@@ -89,33 +103,84 @@ impl AgentSession {
             live: CcosMemory::new(),
             ops: Vec::new(),
             baseline: None,
+            oplog_path: None,
         }
     }
 
     /// Open a **persistent** session backed by `path`: load the causal memory
     /// from the checkpoint if it exists (otherwise start empty), bind the path
-    /// for [`checkpoint`](Self::checkpoint), and keep the loaded state as the
-    /// replay baseline. The on-disk form is the same snapshot `ccos memory`
-    /// reads/writes, so both transports can share one `workspace.ccos`.
+    /// for [`checkpoint`](Self::checkpoint), and restore the cognitive timeline
+    /// from the sidecar (`<path>.oplog`) when present. The memory snapshot is the
+    /// same form `ccos memory` reads/writes, so both transports can share one
+    /// `workspace.ccos`; the sidecar adds the op-log on top.
     ///
-    /// The cognitive timeline ([`replay_to`](Self::replay_to) / time-travel)
-    /// starts fresh from the reload point, layered on top of the loaded baseline:
-    /// `replay_to(0)` reconstructs the loaded state, not an empty graph.
+    /// With a sidecar, [`replay_to`](Self::replay_to) / time-travel span the whole
+    /// recorded history across restarts. The op-log is trusted only if it
+    /// reproduces the loaded memory exactly; on a mismatch (e.g. the snapshot was
+    /// mutated out-of-band by `ccos memory`) the snapshot wins and the timeline
+    /// restarts from it — the memory is never corrupted by a stale log.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, MemoryError> {
+        let path = path.as_ref();
         let live = CcosMemory::open(path)?;
-        let baseline = Some(live.to_json()?);
-        Ok(AgentSession {
-            live,
-            ops: Vec::new(),
-            baseline,
-        })
+        let oplog_path = oplog_sidecar(path);
+
+        // Restore the timeline from the sidecar if one is there and parses; a
+        // missing/corrupt sidecar just means "no recorded history yet".
+        let restored = std::fs::read_to_string(&oplog_path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<PersistedTimeline>(&s).ok());
+
+        let mut session = match restored {
+            Some(t) => AgentSession {
+                live,
+                ops: t.ops,
+                baseline: t.baseline,
+                oplog_path: Some(oplog_path),
+            },
+            None => {
+                let baseline = Some(live.to_json()?);
+                AgentSession {
+                    live,
+                    ops: Vec::new(),
+                    baseline,
+                    oplog_path: Some(oplog_path),
+                }
+            }
+        };
+
+        // Consistency guard: a restored op-log must reproduce the loaded memory.
+        // If not, trust the snapshot (authoritative state) and reset the timeline.
+        if !session.ops.is_empty() && !session.timeline_reproduces_memory() {
+            session.baseline = Some(session.live.to_json()?);
+            session.ops.clear();
+        }
+        Ok(session)
     }
 
-    /// Persist the live memory to the bound checkpoint path. Returns
-    /// [`MemoryError::NoPath`] for an in-memory [`new`](Self::new) session (the
-    /// caller can treat that as a no-op).
+    /// Persist the live memory **and** the cognitive timeline. The memory snapshot
+    /// goes to the bound checkpoint path (shared with `ccos memory`); the baseline
+    /// and op-log go to the `<path>.oplog` sidecar, so the whole timeline survives
+    /// a restart. Returns [`MemoryError::NoPath`] for an in-memory `new` session
+    /// (the caller can treat that as a no-op).
     pub fn checkpoint(&self) -> Result<(), MemoryError> {
-        self.live.checkpoint()
+        self.live.checkpoint()?;
+        if let Some(p) = &self.oplog_path {
+            let timeline = PersistedTimeline {
+                baseline: self.baseline.clone(),
+                ops: self.ops.clone(),
+            };
+            std::fs::write(p, serde_json::to_string(&timeline)?)?;
+        }
+        Ok(())
+    }
+
+    /// Whether replaying the recorded op-log on top of the baseline reproduces the
+    /// live memory's structure (nodes/edges/files) — the invariant `open` checks
+    /// before trusting a restored timeline.
+    fn timeline_reproduces_memory(&self) -> bool {
+        let replayed = self.replay_to(self.ops.len());
+        let (a, b) = (replayed.stats(), self.live.stats());
+        a.nodes == b.nodes && a.edges == b.edges && a.files == b.files
     }
 
     /// Record and apply an ingest.
@@ -236,6 +301,13 @@ impl AgentSession {
     }
 }
 
+/// The timeline sidecar path for a workspace: `<path>.oplog`.
+fn oplog_sidecar(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(".oplog");
+    PathBuf::from(s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,9 +371,8 @@ mod tests {
 
     #[test]
     fn open_persists_and_reloads_across_sessions() {
-        let path =
-            std::env::temp_dir().join(format!("ccos-sess-reload-{}.json", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+        let path = tmp("ccos-sess-reload");
+        cleanup(&path);
         {
             let mut s = AgentSession::open(&path).unwrap();
             s.ingest("src/db.rs", "pub fn q() -> i64 { 1 }\n");
@@ -318,37 +389,113 @@ mod tests {
             s2.memory().verify().valid,
             "hash chain still verifies after reload"
         );
-        let _ = std::fs::remove_file(&path);
+        cleanup(&path);
     }
 
+    /// A session built entirely through `AgentSession` keeps its **whole** timeline
+    /// across a restart: the op-log makes `replay_to` span the full history.
     #[test]
-    fn replay_after_open_layers_on_the_loaded_baseline() {
-        let path = std::env::temp_dir().join(format!("ccos-sess-base-{}.json", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+    fn timeline_spans_full_history_across_restart() {
+        let path = tmp("ccos-sess-history");
+        cleanup(&path);
         {
             let mut s = AgentSession::open(&path).unwrap();
             s.ingest("src/db.rs", "pub fn q() {}\n");
+            s.ingest("src/api.rs", "use crate::db;\npub fn h() { db::q() }\n");
             s.checkpoint().unwrap();
         }
-        let mut s2 = AgentSession::open(&path).unwrap();
-        let baseline_files = s2.memory().stats().files; // db.rs, loaded from disk
-        assert!(baseline_files >= 1);
-        s2.ingest("src/api.rs", "use crate::db;\npub fn h() { db::q() }\n");
-        // replay_to(0) reconstructs the loaded baseline, not an empty graph.
+        let s2 = AgentSession::open(&path).unwrap();
+        // The recorded timeline came back, not just an empty post-reload tail.
+        assert_eq!(s2.len(), 2, "both ingests were restored");
+        assert!(s2.timeline()[0].contains("Ingest(src/db.rs)"));
+        // Full cross-restart replay: floor is empty, top reproduces the memory.
+        assert_eq!(s2.replay_to(0).stats().files, 0, "replay floor is empty");
+        assert_eq!(s2.replay_to(s2.len()).stats().files, 2);
         assert_eq!(
-            s2.replay_to(0).stats().files,
-            baseline_files,
-            "replay floor is the loaded checkpoint"
+            s2.replay_to(s2.len()).stats().nodes,
+            s2.memory().stats().nodes,
+            "replayed history matches the loaded memory"
         );
-        // replay_to(len) = baseline + this session's ingest.
-        assert_eq!(s2.replay_to(s2.len()).stats().files, baseline_files + 1);
-        let _ = std::fs::remove_file(&path);
+        cleanup(&path);
+    }
+
+    /// Seeding from a `ccos memory` snapshot (a checkpoint with no op-log): the
+    /// timeline starts empty and layers on the seed as its replay baseline, then
+    /// becomes durable once checkpointed.
+    #[test]
+    fn timeline_layers_on_a_ccos_memory_seed() {
+        let path = tmp("ccos-sess-seed");
+        cleanup(&path);
+        // Simulate `ccos memory`: write a snapshot only (no sidecar).
+        {
+            let mut mem = CcosMemory::open(&path).unwrap();
+            mem.ingest_source("src/seed.rs", "pub fn s() {}\n");
+            mem.checkpoint().unwrap();
+        }
+        let mut s = AgentSession::open(&path).unwrap();
+        let seed_files = s.memory().stats().files;
+        assert!(seed_files >= 1);
+        assert!(
+            s.is_empty(),
+            "no recorded timeline yet (seeded from snapshot)"
+        );
+        s.ingest("src/new.rs", "pub fn n() {}\n");
+        // Replay floor is the seed, not empty.
+        assert_eq!(s.replay_to(0).stats().files, seed_files);
+        assert_eq!(s.replay_to(s.len()).stats().files, seed_files + 1);
+        s.checkpoint().unwrap();
+        // The seeded baseline + op survive a reopen.
+        let s2 = AgentSession::open(&path).unwrap();
+        assert_eq!(s2.len(), 1);
+        assert_eq!(s2.replay_to(0).stats().files, seed_files);
+        assert_eq!(s2.replay_to(s2.len()).stats().files, seed_files + 1);
+        cleanup(&path);
+    }
+
+    /// If the snapshot is mutated out-of-band (e.g. by `ccos memory`) so the op-log
+    /// no longer reproduces it, the snapshot wins and the timeline resets — the
+    /// memory is never corrupted by a stale log.
+    #[test]
+    fn stale_oplog_self_heals_to_the_snapshot() {
+        let path = tmp("ccos-sess-heal");
+        cleanup(&path);
+        {
+            let mut s = AgentSession::open(&path).unwrap();
+            s.ingest("src/a.rs", "pub fn a() {}\n");
+            s.checkpoint().unwrap();
+        }
+        // Out-of-band mutation of the snapshot only (the sidecar is left stale).
+        {
+            let mut mem = CcosMemory::open(&path).unwrap();
+            mem.ingest_source("src/b.rs", "pub fn b() {}\n");
+            mem.checkpoint().unwrap();
+        }
+        let s = AgentSession::open(&path).unwrap();
+        assert_eq!(
+            s.memory().stats().files,
+            2,
+            "authoritative snapshot (a + b) wins"
+        );
+        assert!(s.is_empty(), "stale timeline was reset");
+        assert!(s.memory().verify().valid);
+        cleanup(&path);
     }
 
     #[test]
     fn new_session_has_no_checkpoint_path() {
         let s = AgentSession::new();
         assert!(matches!(s.checkpoint(), Err(MemoryError::NoPath)));
+    }
+
+    /// A unique temp path for a persistence test.
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("{tag}-{}.json", std::process::id()))
+    }
+
+    /// Remove a workspace and its `.oplog` sidecar.
+    fn cleanup(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(super::oplog_sidecar(path));
     }
 
     #[test]

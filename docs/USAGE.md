@@ -287,7 +287,8 @@ printf '%s\n' \
 
 Tools: `ingest`, `recall`, `signal_failure`, `page_fault` (feed cargo-test/panic
 output back in), `stats`, `verify`, plus the time-travel pair `timeline` /
-`recall_what_if` (rewind to a past step and re-run a recall). Resources:
+`recall_what_if` (rewind to a past step and re-run a recall — the timeline persists
+in a `<workspace>.oplog` sidecar, so this spans restarts). Resources:
 `ccos://session/context` (the self-bounding working set, ready to inject into a
 system prompt) and `ccos://session/timeline`. Point an MCP client's stdio transport
 at `ccos mcp` (`{"command":"ccos","args":["mcp","workspace.ccos"]}`). Full handshake,

@@ -270,8 +270,16 @@ on start and **re-checkpoints after every memory-changing call** (`ingest`,
 restarts. The on-disk form is the *same snapshot* `ccos memory` reads and writes, so
 the two transports can share one `workspace.ccos`. With no path, the session stays
 purely in-process (nothing is written). Checkpoint failures are reported on stderr;
-stdout is reserved for JSON-RPC. The in-session time-travel timeline starts fresh at
-the reload point, layered on top of the loaded baseline.
+stdout is reserved for JSON-RPC.
+
+The **cognitive timeline persists too**, in a sidecar next to the snapshot
+(`<workspace>.oplog`): it stores the op-log plus the baseline it replays on, so
+`timeline` and `recall_what_if` (time-travel) span the **whole recorded history
+across restarts** — you can rewind to a step that happened in a previous process. The
+op-log is trusted only if it reproduces the loaded snapshot exactly; if the snapshot
+was changed out-of-band (e.g. by a `ccos memory` run that doesn't touch the sidecar),
+the snapshot wins and the timeline resets from it — the memory is never corrupted by
+a stale log.
 
 Point an MCP client's **stdio transport** at the binary. For example, a client
 config entry:
@@ -319,7 +327,8 @@ printf '%s\n' \
   (`ccos memory`) and an **MCP server** (`ccos mcp`, an event-sourced session with
   tools + resources). Both checkpoint to the same `workspace.ccos` snapshot format; a
   network/HTTP server is not included, but would layer on the same trait.
-- Across an MCP restart the causal memory (graph + hash chain) is restored from the
-  checkpoint, but the in-session time-travel timeline begins fresh at the reload
-  point (the loaded state is the replay baseline) — full cross-restart replay would
-  need the op-log persisted too, which is not yet wired.
+- An MCP workspace persists in two files: `workspace.ccos` (the memory snapshot,
+  shared with `ccos memory`) and `workspace.ccos.oplog` (the timeline sidecar, so
+  time-travel spans restarts). The op-log is rewritten in full on each checkpoint
+  (not an incremental append), which is fine for interactive histories but not for an
+  unbounded long-running log; periodic compaction would be the next step.

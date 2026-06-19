@@ -110,7 +110,7 @@ impl From<serde_json::Error> for MemoryError {
 }
 
 /// How a [`recall`](ExternalMemory::recall) selects its context window.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Recall {
     /// The globally hottest nodes by causal score (the default working set).
     WorkingSet,
