@@ -281,23 +281,23 @@ def attempt(repo, sc, strat, ccos_bin, subdir, budget, dry_run, test_timeout, ma
             if strat == "ccos"
             else rag_context(wt, subdir, target, budget)
         )
+        ctx_tokens = sum(len(srcs.get(f, "")) for f in files) // 4
         if dry_run:
-            prompt = build_prompt(sc["subject"], target, files, srcs)
-            print(f"    [{strat}] {len(files)} files, ~{len(prompt) // 4} tok: {files[:6]}")
-            return "skip"
+            print(f"    [{strat}] {len(files)} files, ~{ctx_tokens} tok: {files[:6]}")
+            return "skip", ctx_tokens
 
         error = None
         for att in range(max_attempts):
             prompt = build_prompt(sc["subject"], target, files, srcs, error)
             reply = ask_ollama(prompt)
             if not reply:
-                return "skip"
+                return "skip", ctx_tokens
             (Path(wt) / target).write_text(reply)
             ok, output = cargo_test_output(wt, test_timeout)
             if ok:
                 if att:
                     print(f"    [{strat}] passed on attempt {att + 1}", file=sys.stderr)
-                return "pass"
+                return "pass", ctx_tokens
             # Context page fault: enrich the window from the failure for the retry.
             error = output
             fault = ccos_trace_files(ccos_bin, output)
@@ -310,7 +310,7 @@ def attempt(repo, sc, strat, ccos_bin, subdir, budget, dry_run, test_timeout, ma
             elif fault:
                 files = rag_context(wt, subdir, fault[0], budget)
             srcs = read_sources(wt, subdir)
-        return "fail"
+        return "fail", ctx_tokens
     finally:
         remove_worktree(repo, wt)
 
@@ -335,22 +335,28 @@ def main(argv: list[str]) -> int:
     )
     print(f"[mine] {len(scen)} single-file fix scenario(s)", file=sys.stderr)
     tally = {"ccos": Counter(), "rag": Counter()}
+    toks: dict[str, list[int]] = {"ccos": [], "rag": []}
     for i, sc in enumerate(scen, 1):
         print(f"[{i}/{len(scen)}] {sc['commit'][:8]} {sc['target']}: {sc['subject'][:60]}", file=sys.stderr)
         for strat in ("ccos", "rag"):
             try:
-                tally[strat][attempt(args.repo, sc, strat, args.ccos_bin, args.subdir, args.budget, args.dry_run, args.test_timeout, args.max_attempts)] += 1
+                status, ct = attempt(args.repo, sc, strat, args.ccos_bin, args.subdir,
+                                     args.budget, args.dry_run, args.test_timeout, args.max_attempts)
+                tally[strat][status] += 1
+                toks[strat].append(ct)
             except (RuntimeError, subprocess.TimeoutExpired) as e:
                 print(f"    [{strat}] skip: {e}", file=sys.stderr)
                 tally[strat]["skip"] += 1
 
     if not args.dry_run:
-        print("\n=== Phase 4 — resolved-rate (tests pass after the model's patch) ===")
+        print("\n=== Phase 4 — resolved-rate + context efficiency (equal resolution → fewer tokens?) ===")
         for strat in ("ccos", "rag"):
             t = tally[strat]
             graded = t["pass"] + t["fail"]
             rate = t["pass"] / graded if graded else 0.0
-            print(f"  {strat:5}: {t['pass']}/{graded} pass ({rate:.0%})   skipped {t['skip']}")
+            mean_tok = sum(toks[strat]) / len(toks[strat]) if toks[strat] else 0.0
+            print(f"  {strat:5}: {t['pass']}/{graded} pass ({rate:.0%})   "
+                  f"mean context {mean_tok:.0f} tok   skipped {t['skip']}")
     return 0
 
 
