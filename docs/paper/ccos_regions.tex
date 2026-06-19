@@ -62,11 +62,16 @@ exhibits the same noisy separation --- under a misleading query only the
 workspace-anchored region yields any task success --- while we are explicit that
 the small model's arithmetic reasoning, not selection, caps absolute success. We
 further specify a falsifiable protocol against classical RAG, GraphRAG, MemGPT and
-LangGraph on long-horizon tasks (SWE-bench and a multi-file bug suite). We label
-throughout what is \emph{proven} (formal structure, determinism, locality),
-\emph{measured} (retrieval coverage, in simulation and on a real LLM), and
-\emph{still hypothesised} (large-model and external-benchmark agent gains), so the
-contribution can be evaluated honestly.
+LangGraph on long-horizon tasks (SWE-bench and a multi-file bug suite). Crucially,
+when we run that protocol's retrieval half on \emph{real} bug-fix commits from
+three mature crates, causal selection \textbf{ties a plain lexical TF-IDF baseline}
+and loses to it at a tight budget --- on real bugs a fix's files are lexically
+similar, so the simulation's dissimilar-cause premise does not reproduce, and the
+necessary condition is met by a baseline too. We label throughout what is
+\emph{proven} (formal structure, determinism, locality), \emph{measured}
+(retrieval coverage --- where CCOS does \emph{not} beat lexical RAG on real bugs),
+and \emph{still hypothesised} (any downstream agent gain), so the contribution can
+be evaluated honestly.
 \end{abstract}
 
 \section{Introduction}
@@ -568,11 +573,28 @@ infrastructure.
 
 \section{Limitations}
 
-The parser is a line/AST heuristic, so causal neighbourhoods are shallow; regions
-are file-granular by default and only merge on explicit cross-file edges;
-temperature/policy constants are hand-tuned, not learned; and the agent-level
-claims of \S\ref{sec:protocol} are untested. None of these affect the proven
-properties (partition, determinism, replay) or the measured locality.
+We are deliberately explicit about what is \emph{not} shown.
+\textbf{(1) No coverage advantage over RAG on real bugs.} The headline real-data
+metric ($R_{\mathrm{cov}}$, \S\ref{sec:protocol}) ties a plain lexical TF-IDF
+retriever at a sufficient budget and loses to it at a tight one; on real fix
+commits the files a fix touches are lexically similar, so the simulation's premise
+of a lexically-dissimilar cause does not hold. The strong absolute numbers are a
+\emph{necessary} condition that a baseline also satisfies, not a CCOS win.
+\textbf{(2) Necessary $\neq$ sufficient.} We never measure whether a region
+\emph{helps an agent fix} a bug (Phase 4: a patch passing the hidden tests) ---
+only whether the relevant files are retrievable.
+\textbf{(3) Seed heuristic.} The harness injects the fault at the
+highest-out-degree changed file, not at the genuinely failing test, so it does not
+exercise the regime where a symptom is lexically far from its cause --- the regime
+most favourable to causal selection.
+\textbf{(4) Scale and statistics.} Three single-crate repositories, $n\!\approx\!20$
+each; differences are reported with their standard deviation but not cross-validated.
+\textbf{(5) Engine.} The parser is a line/AST heuristic (shallow neighbourhoods);
+regions are file-granular and merge only on explicit cross-file edges;
+temperature/policy and scoring weights are hand-tuned, not learned. None of these
+affect the \emph{proven} properties (partition, determinism, replay) or the
+measured locality --- but the empirical case for a downstream agent benefit is, at
+this point, \emph{unproven}.
 
 \section{Conclusion}
 
