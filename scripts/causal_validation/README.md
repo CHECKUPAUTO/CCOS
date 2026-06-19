@@ -100,19 +100,44 @@ The same comparison on three established crates — `R_cov` as
 | `bat` (25)       | 0.84 / 0.20 | 0.84 / **1.00** | 0.84 / **1.00** |
 | `hyperfine` (20) | 0.64 / 0.19 | 0.73 / **0.85** | 0.81 / **0.92** |
 
-Across 70 mined fix commits the picture is consistent: with cross-file linking and
-bidirectional propagation, at a sufficient budget (`K≥50`) CCOS recovers **0.85–1.0
-of the files a fix touched** — i.e. the *necessary* condition (the fix's files are
-in the window) holds for the large majority of real bugs — while the tight-budget
-(`K=20`) dilution is systematic (0.19–0.28). Reproduce with:
+Across 70 mined fix commits, at a sufficient budget (`K≥50`) CCOS recovers
+**0.85–1.0 of the files a fix touched**, with a systematic tight-budget (`K=20`)
+dilution (0.19–0.28).
+
+### Is that any good? CCOS vs a lexical-RAG baseline (the honest part)
+
+A high `R_cov` only matters if it beats the obvious baseline. The harness now also
+runs **classical lexical RAG** (TF-IDF cosine over file text, queried by the fault
+file) at the *same file budget*, isolating the selection rule. `R_cov` as
+**CCOS / RAG**:
+
+| Repo (n)         | K=20            | K=50            | K=100           |
+| ---------------- | --------------- | --------------- | --------------- |
+| `fd` (25)        | 0.28 / 0.34     | 0.92 / 0.94     | 0.96 / 0.98     |
+| `bat` (25)       | 0.20 / **0.56** | 1.00 / 0.98     | 1.00 / 1.00     |
+| `hyperfine` (20) | 0.20 / **0.73** | 0.87 / 0.92     | 0.97 / 0.96     |
+
+**The honest conclusion: causal selection has no net coverage advantage over
+lexical similarity here, and is worse at a tight budget.** At `K≥50` the two tie
+(differences are smaller than the per-scenario std ≈ 0.2); at `K=20`, RAG is
+clearly better because bidirectional propagation dilutes a small window. On real
+bugs the files a fix co-touches are *lexically similar to each other*, so TF-IDF
+finds them too — the synthetic premise (a cause that is lexically dissimilar from
+the symptom, `experiment.rs` §8) does **not** reproduce on these repos.
+
+So the strong-looking `0.85–1.0` is real but **not a CCOS win**: it is the
+*necessary* condition (the fix's files are in the window), which a plain
+retriever also satisfies.
 
 ```bash
 git clone https://github.com/sharkdp/bat /tmp/bat
 python scripts/causal_validation/validate.py --repo /tmp/bat \
-    --ccos-bin target/release/ccos --limit 25 --bidirectional
+    --ccos-bin target/release/ccos --limit 25 --bidirectional   # prints CCOS vs RAG
 ```
 
-**Caveat:** three single-crate repos; multi-crate workspaces (e.g. ripgrep) need
-the module-path resolver extended, and this measures the *necessary* (retrieval)
-condition only — the *sufficient* one (an LLM's patch passes the tests, Phase 4)
-remains future work.
+**Where CCOS might still differ (untested here):** robustness when the *query* is
+degraded or absent (the §8 premise), and when the fault *symptom* (a failing test)
+is lexically far from its *cause* — which needs the real Phase-1 (run the tests to
+pick the seed) rather than the highest-degree-changed-file heuristic. And the
+*sufficient* condition (an LLM's patch passes the tests, Phase 4) is still
+untested. Until one of those shows a gap, **CCOS ≈ RAG on this metric.**

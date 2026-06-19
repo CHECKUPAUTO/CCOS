@@ -528,12 +528,23 @@ edges and propagating failure \emph{bidirectionally} fixes this. Across three
 mature crates --- \code{fd}, \code{bat} and \code{hyperfine}, $70$ mined fix
 commits --- the effect is consistent: at a sufficient budget ($K{\ge}50$) the two
 changes lift $R_{\mathrm{cov}}$ to $0.85$--$1.0$ (from $0.50$--$0.84$
-downstream-only) --- e.g.\ \code{fd} $0.50{\to}0.96$ and \code{bat}
-$0.84{\to}1.0$ at $K{=}100$ --- while \emph{diluting} to $0.19$--$0.28$ at a tight
-$K{=}20$ budget, a real and systematic trade-off. So on real bugs the
-\emph{necessary} condition (the files a fix must touch lie in the window) holds for
-the large majority; the \emph{sufficient} condition (an LLM's patch passes the
-hidden tests) and multi-crate workspaces remain future work.
+downstream-only), while \emph{diluting} to $0.19$--$0.28$ at a tight $K{=}20$
+budget. \textbf{But against the obvious baseline, this is not a win.} Running a
+classical lexical RAG (TF-IDF cosine over file text, queried by the fault file) at
+the \emph{same file budget}, $R_{\mathrm{cov}}$ as CCOS\,/\,RAG is $0.92/0.94$,
+$1.00/0.98$, $0.87/0.92$ at $K{=}50$ and ties at $K{=}100$, while at $K{=}20$ RAG
+is clearly ahead ($0.20/0.56$ on \code{bat}, $0.20/0.73$ on \code{hyperfine}).
+Causal selection therefore has \emph{no net coverage advantage} over lexical
+similarity here, and is worse at a tight budget: on real bugs a fix's files are
+lexically similar to one another, so TF-IDF recovers them too --- the §\ref{sec:sim}
+premise of a cause lexically dissimilar from its symptom does not reproduce on
+these repositories. The honest reading is that the \emph{necessary} condition
+holds for the large majority but is \emph{not} CCOS-specific; a real advantage
+would have to come from the regimes this setup does not test --- a degraded/absent
+query (§\ref{sec:sim}), a symptom (failing test) lexically far from its cause
+(needing the real test-driven seed, not the highest-degree heuristic), or the
+\emph{sufficient} condition (Phase 4). Multi-crate workspaces, now linkable, also
+remain to be measured at scale.
 
 \paragraph{Hypotheses.}
 \textbf{H1} (efficiency): CCOS reaches equal task success at fewer input tokens

@@ -18,6 +18,13 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   from `0.50–0.84` downstream-only, while diluting to `0.19–0.28` at a tight
   `K=20` — an honest, systematic trade-off (see
   `scripts/causal_validation/README.md`).
+- **Lexical-RAG baseline in the harness** (TF-IDF cosine, same file budget) — and
+  the honest result it gives: causal selection has **no net coverage advantage**
+  over lexical similarity on these real repos (CCOS/RAG ties at `K≥50`; RAG is
+  clearly better at `K=20`). On real bugs a fix's files are lexically similar to
+  each other, so TF-IDF finds them too; the high `R_cov` is the *necessary*
+  condition, not a CCOS win. Reported, not buried. Also: crate-aware import
+  resolution (multi-crate workspaces + absolute paths).
 - **Cross-file import linking** — `MemoryGraph::link_module_imports()` resolves
   intra-crate imports (`use:<file>:<path>` nodes) into `file→file` dependency
   edges by mapping each file to its module path and longest-prefix-matching the
