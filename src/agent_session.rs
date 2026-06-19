@@ -290,6 +290,12 @@ impl AgentSession {
         self.len() == 0
     }
 
+    /// The compaction floor: the logical step at/below which history has been folded
+    /// into the baseline and is no longer separable (0 when nothing is compacted).
+    pub fn floor(&self) -> usize {
+        self.folded
+    }
+
     /// Read-only access to the live memory.
     pub fn memory(&self) -> &CcosMemory {
         &self.live

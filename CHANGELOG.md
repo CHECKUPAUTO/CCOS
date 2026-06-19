@@ -53,8 +53,11 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   surface how the working set moved: `diff A B` (files that entered/left) and
   `energy A B` (node-level Δscore + failure-pressure — the migration of causal heat
   through the AST as failures propagate, visible even when the file set is stable).
-  Every command reconstructs state deterministically via `recall_what_if`/replay, so
-  it is exact and side-effect free.
+  `missing <node> [budget]` is an **eviction watchpoint**: it finds the first step a
+  node drops out of the budgeted window, with the triggering op, the token gap, and a
+  status strip (`·●●●●●○○●●`); it reports cleanly against the compaction floor when
+  the eviction lies in folded history. Every command reconstructs state
+  deterministically via `recall_what_if`/replay, so it is exact and side-effect free.
 - **Time-travel debugging demo** (`examples/time_travel.rs`, `cargo run --example
   time_travel`) — an agent session that drifts (a tight-budget recall evicts the
   cause two hops away), then is debugged by rewinding to the exact recall and

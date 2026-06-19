@@ -39,6 +39,7 @@ commands:
   task <text…> | t         free-text recall at the cursor
   diff A B | d             which files entered/left the working set between A and B
   energy A B | e           node-level Δscore + failure-pressure between A and B
+  missing <node> [budget] | m   the step a node is first evicted from the budgeted window
   stats | s                memory counts at the cursor
   help | h | ?             this help
   quit | q                 leave";
@@ -129,6 +130,13 @@ impl Debugger {
                     _ => Outcome::Print("usage: energy <step-a> <step-b>".to_string()),
                 }
             }
+            "missing" | "m" => match rest.first() {
+                Some(node) => {
+                    let budget = rest.get(1).and_then(|s| num(s)).unwrap_or(2048);
+                    Outcome::Print(self.render_missing(node, budget))
+                }
+                None => Outcome::Print("usage: missing <node> [budget]".to_string()),
+            },
             other => Outcome::Print(format!("unknown command '{other}' (try 'help')")),
         }
     }
@@ -272,6 +280,142 @@ impl Debugger {
         }
         out.pop();
         out
+    }
+
+    /// **Eviction watchpoint**: scan the timeline for the first step where `node`
+    /// is in the graph but has dropped out of the budgeted working-set window — the
+    /// moment the budget squeezed it out of context. Composes with compaction: if
+    /// the eviction lies in folded history, it says so rather than guessing.
+    fn render_missing(&self, node: &str, budget: usize) -> String {
+        let target = normalize_id(node);
+        let id = NodeId(target.clone());
+        let (floor, len) = (self.session.floor(), self.session.len());
+
+        let mut first_in_graph: Option<usize> = None;
+        let mut first_missing: Option<usize> = None;
+        let mut strip = String::new();
+        for step in floor..=len {
+            let mem = self.session.replay_to(step);
+            let in_graph = mem.graph().nodes.contains_key(&id);
+            let in_window = in_graph
+                && mem
+                    .recall(&Recall::working_set(), budget)
+                    .items
+                    .iter()
+                    .any(|i| i.uri == target);
+            if in_graph && first_in_graph.is_none() {
+                first_in_graph = Some(step);
+            }
+            if in_graph && !in_window && first_missing.is_none() {
+                first_missing = Some(step);
+            }
+            strip.push(if !in_graph {
+                '·'
+            } else if in_window {
+                '●'
+            } else {
+                '○'
+            });
+        }
+
+        let mut out = format!("MISSING scan: {target}   (budget {budget} tokens, working-set)\n");
+        match first_in_graph {
+            None => {
+                out.push_str("  node never appears in the timeline");
+                return out;
+            }
+            Some(j) if j == floor && floor > 0 => {
+                out.push_str(&format!(
+                    "  in graph as of the compaction floor t={floor} (earlier history folded in)\n"
+                ));
+            }
+            Some(j) => out.push_str(&format!("  in graph since t={j}\n")),
+        }
+
+        match first_missing {
+            None => {
+                out.push_str("  ✓ never MISSING — stays in every budgeted window once ingested\n")
+            }
+            Some(k) if k == floor && floor > 0 => {
+                out.push_str(&format!(
+                    "  ⚠ already MISSING at the compaction floor (t≤{floor}) — the eviction is in \
+                     folded history; only the baseline state survives below the floor\n"
+                ));
+            }
+            Some(k) => {
+                out.push_str(&format!("  ⚠ first MISSING at t={k}\n"));
+                if let Some(op) = self.op_at(k) {
+                    out.push_str(&format!("     trigger: {op}\n"));
+                }
+                out.push_str(&self.eviction_detail(k, &target, budget));
+            }
+        }
+
+        out.push_str(&format!("  t{floor}..t{len}:  {}\n", strip_view(&strip)));
+        out.push_str("  legend: ● in window   ○ in graph but MISSING   · not yet ingested");
+        out
+    }
+
+    /// The rank/token detail at the eviction step: how far the node was outranked
+    /// and how many tokens short of the budget it fell.
+    fn eviction_detail(&self, step: usize, target: &str, budget: usize) -> String {
+        let mem = self.session.replay_to(step);
+        let kept = mem.recall(&Recall::working_set(), budget);
+        let full = mem.recall(&Recall::working_set(), usize::MAX);
+        let rank = full
+            .items
+            .iter()
+            .position(|i| i.uri == target)
+            .map(|p| p + 1);
+        // Tokens needed to reach the node in score order (chars/4, as recall counts).
+        let mut needed = 0usize;
+        for it in &full.items {
+            needed += it.content.chars().count() / 4;
+            if it.uri == target {
+                break;
+            }
+        }
+        let gap = needed.saturating_sub(budget);
+        format!(
+            "     ranked #{}/{}; the window kept {} nodes (~{}/{} tok); the node sat at ~{} tok — short by ~{}\n",
+            rank.map(|r| r.to_string()).unwrap_or_else(|| "?".into()),
+            full.items.len(),
+            kept.items.len(),
+            kept.tokens,
+            budget,
+            needed,
+            gap
+        )
+    }
+
+    /// The journal line for a given logical step (e.g. `t=6  SignalFailure(…)`).
+    fn op_at(&self, step: usize) -> Option<String> {
+        self.session.timeline().into_iter().find(|l| {
+            l.strip_prefix("t=")
+                .and_then(|r| r.split_whitespace().next())
+                .and_then(|n| n.parse::<usize>().ok())
+                == Some(step)
+        })
+    }
+}
+
+/// Prefix a bare path with `file:`; leave known node-id prefixes untouched.
+fn normalize_id(s: &str) -> String {
+    const PREFIXES: [&str; 5] = ["file:", "sym:", "mod:", "use:", "dep:"];
+    if PREFIXES.iter().any(|p| s.starts_with(p)) {
+        s.to_string()
+    } else {
+        format!("file:{s}")
+    }
+}
+
+/// Show a status strip, keeping the last 72 steps if it is longer.
+fn strip_view(s: &str) -> String {
+    let n = s.chars().count();
+    if n <= 72 {
+        s.to_string()
+    } else {
+        format!("…{}", s.chars().skip(n - 72).collect::<String>())
     }
 }
 
@@ -419,6 +563,43 @@ mod tests {
         assert!(
             report.contains("fail 0.00→"),
             "pressure column present: {report}"
+        );
+    }
+
+    #[test]
+    fn missing_detects_eviction_under_a_tight_budget() {
+        let mut d = Debugger::new(demo_session());
+        // budget 1 ⇒ only the single hottest node fits; the deep cause is not always
+        // it (early on the scores are flat / dep:crate leads), so it is evicted.
+        let r = out(d.command("missing src/db.rs 1"));
+        assert!(r.contains("in graph since t=1"), "{r}");
+        assert!(
+            r.contains("first MISSING at t="),
+            "tight budget evicts it: {r}"
+        );
+        assert!(r.contains("short by ~"), "reports the token gap: {r}");
+    }
+
+    #[test]
+    fn missing_handles_generous_budget_and_unknown_node() {
+        let mut d = Debugger::new(demo_session());
+        // A budget large enough for the whole graph: never evicted.
+        assert!(out(d.command("missing src/db.rs 100000")).contains("never MISSING"));
+        // A node that was never ingested.
+        assert!(out(d.command("missing nope.rs")).contains("never appears"));
+    }
+
+    #[test]
+    fn missing_composes_with_the_compaction_floor() {
+        let mut s = demo_session();
+        s.compact(2); // fold all but the last 2 ops: floor = len - 2 > 0
+        let mut d = Debugger::new(s);
+        // db.rs was ingested at t=1, far below the floor — the scan must report it
+        // relative to the floor rather than inventing a sub-floor step.
+        let r = out(d.command("missing src/db.rs 1"));
+        assert!(
+            r.contains("compaction floor"),
+            "stays honest about folded history: {r}"
         );
     }
 

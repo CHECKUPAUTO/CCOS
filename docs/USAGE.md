@@ -317,6 +317,13 @@ REPL commands: `timeline`/`tl` (journal, `▸` marks the cursor), `goto N` / `ne
 - `energy A B` — node-level **Δscore + failure-pressure**: the migration of causal
   "heat" through the AST as failures propagate (e.g. the deep cause `db.rs` surging
   `fail 0.00→0.95` after a page-fault, even when the file set itself is unchanged).
+- `missing <node> [budget]` — an **eviction watchpoint**: scan the timeline for the
+  first step a node is in the graph but has dropped out of the budgeted window, with
+  the triggering op and how many tokens short it fell. A status strip shows it at a
+  glance — `·●●●●●○○●●` reads as "the cause was in context until a failure on a
+  neighbour squeezed it out (`○○`), then a page-fault pulled it back". It composes
+  with compaction: an eviction in folded history is reported against the floor rather
+  than guessed.
 
 Every command reconstructs state deterministically from the op-log via
 [`recall_what_if`](MEMORY_INTERFACE.md) / replay — exact and side-effect free.
