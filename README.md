@@ -264,14 +264,18 @@ printf '%s\n' '{"op":"ingest","uri":"src/db.rs","source":"pub fn query() {}"}' \
               '{"op":"recall","strategy":"around","anchor":"file:src/db.rs","budget":2048}' \
   | cargo run -- memory --path workspace.ccos
 
-# Any MCP-compatible agent, via stdio JSON-RPC 2.0 (live event-sourced session):
-cargo run -- mcp        # point a client's stdio transport at this: {"command":"ccos","args":["mcp"]}
+# Any MCP-compatible agent, via stdio JSON-RPC 2.0 (event-sourced, persistent):
+cargo run -- mcp workspace.ccos   # client config: {"command":"ccos","args":["mcp","workspace.ccos"]}
 ```
 
-`ccos mcp` speaks the standard MCP handshake and advertises six tools (`ingest`,
-`recall`, `signal_failure`, `page_fault`, `stats`, `verify`) — dependency-free,
-backed by the event-sourced session, so it stays replayable. Full contract, tool
-schemas and a client-config snippet: [`docs/MEMORY_INTERFACE.md`](docs/MEMORY_INTERFACE.md).
+`ccos mcp` speaks the standard MCP handshake and advertises eight tools (`ingest`,
+`recall`, `signal_failure`, `page_fault`, `stats`, `verify`, plus the time-travel
+pair `timeline` / `recall_what_if`) and two resources — `ccos://session/context`,
+the self-bounding working set ready to inject into a system prompt, and
+`ccos://session/timeline`. Dependency-free, backed by the event-sourced session;
+pass a `workspace.ccos` to persist across restarts (shared with `ccos memory`). Full
+contract, tool schemas and a client-config snippet:
+[`docs/MEMORY_INTERFACE.md`](docs/MEMORY_INTERFACE.md).
 
 ## Testing
 

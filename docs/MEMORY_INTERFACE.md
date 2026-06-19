@@ -223,7 +223,8 @@ new dependency (it is `serde_json` only). The session is event-sourced, so the
 whole interaction stays replayable.
 
 It speaks the standard handshake (`initialize` → `notifications/initialized` →
-`tools/list` / `tools/call`, plus `ping`) and advertises six tools:
+`tools/list` / `tools/call` / `resources/list` / `resources/read`, plus `ping`) and
+advertises eight tools:
 
 | Tool | Arguments | Maps to |
 | ---- | --------- | ------- |
@@ -233,11 +234,44 @@ It speaks the standard handshake (`initialize` → `notifications/initialized` �
 | `page_fault` | `output` (cargo-test/panic text), `budget` | parse trace → signal faulting files → recall |
 | `stats` | — | `stats` |
 | `verify` | — | `verify` |
+| `timeline` | — | the event-sourced cognitive journal (`AgentSession::timeline`) |
+| `recall_what_if` | `step`, `strategy`/`anchor`/`text`, `budget` | **time-travel** — rewind to `step` and re-run a recall (`AgentSession::recall_what_if`) |
+
+The last two expose the capability a RAG stack structurally lacks: `timeline` is the
+ordered record of every memory operation, and `recall_what_if` deterministically
+*replays* the agent's memory to a past step and re-runs a recall under different
+parameters (a larger budget, a different anchor) — debugging an agent's context by
+rewinding it. Both are read-only, so they never trigger a checkpoint.
 
 Each `tools/call` returns the corresponding `Serialize` type (above) as JSON inside
 the MCP `content[0].text` field. Tool-level failures come back as
 `{"content":[…],"isError":true}`; protocol errors use standard JSON-RPC codes
 (`-32601` unknown method, `-32602` bad params, `-32700` parse error).
+
+### Resources — auto-injectable context
+
+Two read-only **resources** let a host pull memory in without an explicit tool call:
+
+| Resource URI | Contents |
+| ------------ | -------- |
+| `ccos://session/context` | the current causally-scored, token-bounded **working set**, linearised as text for direct injection into a system prompt — reflects accumulated failure pressure and recency, and self-bounds at the causal region (no `K` to tune). Budget via `CCOS_MCP_CONTEXT_BUDGET` (default 2048). |
+| `ccos://session/timeline` | the cognitive journal as text (audit / replay). |
+
+A host can read `ccos://session/context` before each turn and drop it straight into
+the model's context — the "self-bounding ~hundreds-of-tokens" window the
+measurements point to, kept current as the agent ingests code and hits failures.
+
+### Persistence
+
+`ccos mcp` takes an **optional workspace path** — `ccos mcp [workspace.ccos]`, or the
+`CCOS_MCP_WORKSPACE` env var. With one bound, the session **reloads** that checkpoint
+on start and **re-checkpoints after every memory-changing call** (`ingest`,
+`signal_failure`, `page_fault`) and once more at EOF, so the causal memory survives
+restarts. The on-disk form is the *same snapshot* `ccos memory` reads and writes, so
+the two transports can share one `workspace.ccos`. With no path, the session stays
+purely in-process (nothing is written). Checkpoint failures are reported on stderr;
+stdout is reserved for JSON-RPC. The in-session time-travel timeline starts fresh at
+the reload point, layered on top of the loaded baseline.
 
 Point an MCP client's **stdio transport** at the binary. For example, a client
 config entry:
@@ -247,11 +281,13 @@ config entry:
   "mcpServers": {
     "ccos-memory": {
       "command": "ccos",
-      "args": ["mcp"]
+      "args": ["mcp", "workspace.ccos"]
     }
   }
 }
 ```
+
+Drop the `"workspace.ccos"` argument for an ephemeral in-memory session.
 
 Or drive it directly over a pipe (one JSON message per line in, one per line out):
 
@@ -260,13 +296,8 @@ printf '%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{}}}' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ingest","arguments":{"uri":"src/db.rs","source":"pub fn query() {}"}}}' \
   '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"recall","arguments":{"strategy":"around","anchor":"file:src/db.rs","budget":2048}}}' \
-  | ccos mcp
+  | ccos mcp workspace.ccos
 ```
-
-Unlike `ccos memory`, the MCP server holds its memory **in-process for the life of
-the connection** (an event-sourced `AgentSession`) rather than checkpointing to a
-file each batch — it is a live session, not a one-shot. Persisting an MCP session
-to disk is not yet wired up.
 
 ## Guarantees
 
@@ -285,6 +316,10 @@ to disk is not yet wired up.
 - `Task` uses a deliberately simple lexical entry point (no embeddings) — it is a
   convenience, not a semantic retriever; prefer `Around` with a real anchor.
 - Two transports ship on top of this façade: a **stdio JSON-Lines CLI**
-  (`ccos memory`, checkpoint-backed) and an **MCP server** (`ccos mcp`, live
-  event-sourced session). A network/HTTP server is not included, but would layer on
-  the same trait. The MCP session is not yet persisted to disk between connections.
+  (`ccos memory`) and an **MCP server** (`ccos mcp`, an event-sourced session with
+  tools + resources). Both checkpoint to the same `workspace.ccos` snapshot format; a
+  network/HTTP server is not included, but would layer on the same trait.
+- Across an MCP restart the causal memory (graph + hash chain) is restored from the
+  checkpoint, but the in-session time-travel timeline begins fresh at the reload
+  point (the loaded state is the replay baseline) — full cross-restart replay would
+  need the op-log persisted too, which is not yet wired.

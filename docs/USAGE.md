@@ -269,24 +269,30 @@ Ops: `ingest`, `failure`, `recall` (`strategy` ∈ `around`/`task`/`working_set`
 `impact`, `causes`, `verify`, `stats`. Full contract and a Python example:
 [`MEMORY_INTERFACE.md`](MEMORY_INTERFACE.md).
 
-### `mcp` — serve memory as MCP tools (stdio JSON-RPC)
+### `mcp [workspace.ccos]` — serve memory as MCP tools + resources (stdio JSON-RPC)
 
 Expose the same memory to any **MCP-compatible agent** (Claude, a local agent on
-the Jetson, …) over stdio JSON-RPC 2.0 — no HTTP server, no extra dependency. The
-memory is a live, event-sourced session for the life of the connection.
+the Jetson, …) over stdio JSON-RPC 2.0 — no HTTP server, no extra dependency. Pass a
+**workspace path** (or set `CCOS_MCP_WORKSPACE`) to reload it on start and checkpoint
+after every memory-changing call, so the memory survives restarts; omit it for an
+ephemeral in-process session. The on-disk form is shared with `ccos memory`.
 
 ```bash
 printf '%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{}}}' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ingest","arguments":{"uri":"src/db.rs","source":"pub fn query() {}"}}}' \
   '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"recall","arguments":{"strategy":"around","anchor":"file:src/db.rs","budget":2048}}}' \
-  | ccos mcp
+  | ccos mcp workspace.ccos
 ```
 
 Tools: `ingest`, `recall`, `signal_failure`, `page_fault` (feed cargo-test/panic
-output back in), `stats`, `verify`. Point an MCP client's stdio transport at
-`ccos mcp` (`{"command":"ccos","args":["mcp"]}`). Full handshake, tool schemas and a
-client-config snippet: [`MEMORY_INTERFACE.md`](MEMORY_INTERFACE.md#serving-over-mcp-ccos-mcp).
+output back in), `stats`, `verify`, plus the time-travel pair `timeline` /
+`recall_what_if` (rewind to a past step and re-run a recall). Resources:
+`ccos://session/context` (the self-bounding working set, ready to inject into a
+system prompt) and `ccos://session/timeline`. Point an MCP client's stdio transport
+at `ccos mcp` (`{"command":"ccos","args":["mcp","workspace.ccos"]}`). Full handshake,
+tool schemas and a client-config snippet:
+[`MEMORY_INTERFACE.md`](MEMORY_INTERFACE.md#serving-over-mcp-ccos-mcp).
 
 ---
 

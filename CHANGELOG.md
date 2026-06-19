@@ -25,10 +25,17 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   as [Model Context Protocol](https://modelcontextprotocol.io) tools over **stdio
   JSON-RPC 2.0**, so any MCP-compatible agent (Claude, a local agent on the Jetson)
   can use CCOS as native working memory. Dependency-free (`serde_json` only); speaks
-  the standard `initialize` / `tools/list` / `tools/call` / `ping` handshake and
-  advertises six tools (`ingest`, `recall`, `signal_failure`, `page_fault`, `stats`,
-  `verify`) backed by a live, event-sourced `AgentSession`. Point a client's stdio
-  transport at it: `{"command":"ccos","args":["mcp"]}`. See
+  the standard `initialize` / `tools/list` / `tools/call` / `resources/list` /
+  `resources/read` / `ping` handshake. Advertises **eight tools** (`ingest`,
+  `recall`, `signal_failure`, `page_fault`, `stats`, `verify`, plus the time-travel
+  pair `timeline` / `recall_what_if` — rewind to a past step and re-run a recall) and
+  **two resources** (`ccos://session/context`, the self-bounding working set
+  linearised for direct system-prompt injection, and `ccos://session/timeline`),
+  backed by an event-sourced `AgentSession`. Optional **persistence**: `ccos mcp
+  [workspace.ccos]` (or `CCOS_MCP_WORKSPACE`) reloads the checkpoint on start and
+  re-checkpoints after every memory-changing call — the same snapshot format as
+  `ccos memory`, so the two transports share one workspace. Point a client's stdio
+  transport at it: `{"command":"ccos","args":["mcp","workspace.ccos"]}`. See
   [`MEMORY_INTERFACE.md`](docs/MEMORY_INTERFACE.md#serving-over-mcp-ccos-mcp).
 - **Time-travel debugging demo** (`examples/time_travel.rs`, `cargo run --example
   time_travel`) — an agent session that drifts (a tight-budget recall evicts the

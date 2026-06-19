@@ -39,6 +39,7 @@ use crate::external_memory::{
     CcosMemory, ExternalMemory, IngestReport, MemoryError, Recall, RecallWindow,
 };
 use crate::trace::parse_cargo_test_output;
+use std::path::Path;
 
 /// One recorded cognitive operation.
 #[derive(Debug, Clone)]
@@ -67,6 +68,12 @@ enum Op {
 pub struct AgentSession {
     live: CcosMemory,
     ops: Vec<Op>,
+    /// JSON snapshot of the memory the session was *opened* from, if any. A
+    /// freshly [`new`](Self::new) session has none (the baseline is empty); a
+    /// session [`open`](Self::open)ed from a checkpoint carries the loaded state
+    /// here so [`replay_to`](Self::replay_to) layers this session's timeline on
+    /// top of it instead of on an empty graph.
+    baseline: Option<String>,
 }
 
 impl Default for AgentSession {
@@ -76,12 +83,39 @@ impl Default for AgentSession {
 }
 
 impl AgentSession {
-    /// A fresh in-memory session.
+    /// A fresh in-memory session with no checkpoint path (nothing is persisted).
     pub fn new() -> Self {
         AgentSession {
             live: CcosMemory::new(),
             ops: Vec::new(),
+            baseline: None,
         }
+    }
+
+    /// Open a **persistent** session backed by `path`: load the causal memory
+    /// from the checkpoint if it exists (otherwise start empty), bind the path
+    /// for [`checkpoint`](Self::checkpoint), and keep the loaded state as the
+    /// replay baseline. The on-disk form is the same snapshot `ccos memory`
+    /// reads/writes, so both transports can share one `workspace.ccos`.
+    ///
+    /// The cognitive timeline ([`replay_to`](Self::replay_to) / time-travel)
+    /// starts fresh from the reload point, layered on top of the loaded baseline:
+    /// `replay_to(0)` reconstructs the loaded state, not an empty graph.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, MemoryError> {
+        let live = CcosMemory::open(path)?;
+        let baseline = Some(live.to_json()?);
+        Ok(AgentSession {
+            live,
+            ops: Vec::new(),
+            baseline,
+        })
+    }
+
+    /// Persist the live memory to the bound checkpoint path. Returns
+    /// [`MemoryError::NoPath`] for an in-memory [`new`](Self::new) session (the
+    /// caller can treat that as a no-op).
+    pub fn checkpoint(&self) -> Result<(), MemoryError> {
+        self.live.checkpoint()
     }
 
     /// Record and apply an ingest.
@@ -145,9 +179,14 @@ impl AgentSession {
     }
 
     /// Deterministically reconstruct the memory state after the first `step`
-    /// operations (replaying only the mutating ones). `step >= len()` replays all.
+    /// operations (replaying only the mutating ones) on top of the session's
+    /// baseline (empty for a [`new`](Self::new) session, the loaded checkpoint
+    /// for an [`open`](Self::open)ed one). `step >= len()` replays all.
     pub fn replay_to(&self, step: usize) -> CcosMemory {
-        let mut m = CcosMemory::new();
+        let mut m = match &self.baseline {
+            Some(snapshot) => CcosMemory::from_json(snapshot).unwrap_or_default(),
+            None => CcosMemory::new(),
+        };
         for op in self.ops.iter().take(step) {
             match op {
                 Op::Ingest { uri, source } => {
@@ -256,6 +295,60 @@ mod tests {
         assert!(tl[0].contains("Ingest(src/db.rs)"));
         assert!(tl[3].contains("SignalFailure"));
         assert!(tl[4].contains("Recall"));
+    }
+
+    #[test]
+    fn open_persists_and_reloads_across_sessions() {
+        let path =
+            std::env::temp_dir().join(format!("ccos-sess-reload-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut s = AgentSession::open(&path).unwrap();
+            s.ingest("src/db.rs", "pub fn q() -> i64 { 1 }\n");
+            s.ingest(
+                "src/api.rs",
+                "use crate::db;\npub fn h() -> i64 { db::q() }\n",
+            );
+            s.checkpoint().unwrap();
+        }
+        // A brand-new session reloads the causal memory straight from disk.
+        let s2 = AgentSession::open(&path).unwrap();
+        assert!(s2.memory().stats().files >= 2, "files survived the reload");
+        assert!(
+            s2.memory().verify().valid,
+            "hash chain still verifies after reload"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn replay_after_open_layers_on_the_loaded_baseline() {
+        let path = std::env::temp_dir().join(format!("ccos-sess-base-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut s = AgentSession::open(&path).unwrap();
+            s.ingest("src/db.rs", "pub fn q() {}\n");
+            s.checkpoint().unwrap();
+        }
+        let mut s2 = AgentSession::open(&path).unwrap();
+        let baseline_files = s2.memory().stats().files; // db.rs, loaded from disk
+        assert!(baseline_files >= 1);
+        s2.ingest("src/api.rs", "use crate::db;\npub fn h() { db::q() }\n");
+        // replay_to(0) reconstructs the loaded baseline, not an empty graph.
+        assert_eq!(
+            s2.replay_to(0).stats().files,
+            baseline_files,
+            "replay floor is the loaded checkpoint"
+        );
+        // replay_to(len) = baseline + this session's ingest.
+        assert_eq!(s2.replay_to(s2.len()).stats().files, baseline_files + 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn new_session_has_no_checkpoint_path() {
+        let s = AgentSession::new();
+        assert!(matches!(s.checkpoint(), Err(MemoryError::NoPath)));
     }
 
     #[test]

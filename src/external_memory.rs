@@ -284,23 +284,42 @@ impl CcosMemory {
     /// start empty with `path` bound as the checkpoint target.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, MemoryError> {
         let p = path.as_ref().to_path_buf();
-        if p.exists() {
-            let data = std::fs::read_to_string(&p)?;
-            let s: Persisted = serde_json::from_str(&data)?;
-            Ok(CcosMemory {
-                graph: s.graph,
-                engine: IncrementalGraphEngine::new(),
-                event_log: s.event_log,
-                dist_log: s.dist_log,
-                sources: s.sources,
-                path: Some(p),
-            })
+        let mut mem = if p.exists() {
+            Self::from_json(&std::fs::read_to_string(&p)?)?
         } else {
-            Ok(CcosMemory {
-                path: Some(p),
-                ..CcosMemory::new()
-            })
-        }
+            Self::new()
+        };
+        mem.path = Some(p);
+        Ok(mem)
+    }
+
+    /// Serialize the whole state to the canonical JSON snapshot string — the same
+    /// on-disk shape [`open`](Self::open) reads and
+    /// [`checkpoint`](ExternalMemory::checkpoint) writes. Lets a higher layer (an
+    /// [`AgentSession`](crate::agent_session::AgentSession)) capture a baseline
+    /// without touching the filesystem.
+    pub fn to_json(&self) -> Result<String, MemoryError> {
+        let persisted = PersistedRef {
+            graph: &self.graph,
+            event_log: &self.event_log,
+            dist_log: &self.dist_log,
+            sources: &self.sources,
+        };
+        Ok(serde_json::to_string(&persisted)?)
+    }
+
+    /// Reconstruct a memory from a JSON snapshot string. No checkpoint path is
+    /// bound and a fresh incremental engine is created (mirroring [`open`](Self::open)).
+    pub fn from_json(s: &str) -> Result<Self, MemoryError> {
+        let p: Persisted = serde_json::from_str(s)?;
+        Ok(CcosMemory {
+            graph: p.graph,
+            engine: IncrementalGraphEngine::new(),
+            event_log: p.event_log,
+            dist_log: p.dist_log,
+            sources: p.sources,
+            path: None,
+        })
     }
 
     /// Persist to an explicit path and bind it for later [`checkpoint`](ExternalMemory::checkpoint).
@@ -332,13 +351,7 @@ impl CcosMemory {
     }
 
     fn write_to(&self, p: &Path) -> Result<(), MemoryError> {
-        let persisted = PersistedRef {
-            graph: &self.graph,
-            event_log: &self.event_log,
-            dist_log: &self.dist_log,
-            sources: &self.sources,
-        };
-        std::fs::write(p, serde_json::to_string(&persisted)?)?;
+        std::fs::write(p, self.to_json()?)?;
         Ok(())
     }
 

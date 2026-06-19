@@ -57,8 +57,20 @@ async fn main() {
         "memory" => run_memory_cmd(rest),
         "trace" => run_trace_cmd(),
         "mcp" => {
-            ccos::mcp::serve();
-            0
+            // Optional positional workspace path (else $CCOS_MCP_WORKSPACE, else
+            // a purely in-memory session).
+            let workspace = rest
+                .first()
+                .filter(|a| !a.starts_with("--"))
+                .map(PathBuf::from)
+                .or_else(|| std::env::var("CCOS_MCP_WORKSPACE").ok().map(PathBuf::from));
+            match ccos::mcp::serve_workspace(workspace) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("ccos mcp: {e}");
+                    1
+                }
+            }
         }
         // ── CCOS v0.3 — Autonomous Context Runtime ──────────────────
         "scan" => commands_runtime::run_scan(rest).await,
@@ -1729,7 +1741,8 @@ COMMANDS:\n\
     eval [--tasks N] [--model M]  Real-LLM eval (ANTHROPIC/OPENAI_API_KEY or OLLAMA_ENDPOINT)\n\
     memory [--path FILE]       External-memory façade over stdin JSON Lines (ingest/recall/verify)\n\
     trace                      Parse cargo-test/panic/backtrace (stdin) into the crash's source files\n\
-    mcp                        Serve memory as MCP tools over stdio JSON-RPC (for MCP-compatible agents)\n\
+    mcp [workspace.ccos]       Serve memory as MCP tools + resources over stdio JSON-RPC\n\
+    \x20                          (persistent if a workspace path is given; for MCP-compatible agents)\n\
 \n\
   CCOS v0.3 — Autonomous Context Runtime:\n\
     scan <path>                Scan a real workspace and ingest the delta\n\
