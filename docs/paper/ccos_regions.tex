@@ -57,10 +57,16 @@ which one can rewind the exact context state at any step and replay it under
 different parameters (\emph{time-travel debugging}). We release the engine, the
 honest validation harness, and this paper, labelling throughout what is
 \emph{proven} (formal structure, determinism, replay), \emph{measured} (retrieval
-coverage --- where CCOS does \emph{not} beat lexical RAG on real bugs), and
-\emph{still open} (any downstream agent benefit). On its own source tree, region
-selection covers a task's $k$-hop neighbourhood with recall $0.97$ vs $0.35$ flat
-at $\approx\!48\%$ fewer tokens; regions are $95.5\%$ internally connected.
+coverage --- where CCOS does \emph{not} beat lexical RAG on real bugs), and the one
+axis where CCOS \emph{does} win: \textbf{efficiency}. Run end-to-end on real
+single-file fixes with a 30B model and a compiler-in-the-loop retry, CCOS and RAG
+resolve \emph{equally} ($2/10$), but CCOS does so on $776$ context tokens against
+the lexical retriever's $5366$ --- a $6.9\times$ reduction, because the causal
+region stops at the working set rather than padding a top-$k$ to budget. CCOS is
+thus not a better retriever or solver, but a more \emph{frugal}, \emph{auditable}
+one. (On its own source tree, region selection covers a task's $k$-hop
+neighbourhood with recall $0.97$ vs $0.35$ flat at $\approx\!48\%$ fewer tokens;
+regions are $95.5\%$ internally connected.)
 \end{abstract}
 
 \section{Introduction}
@@ -570,6 +576,26 @@ query (§\ref{sec:sim}), a symptom (failing test) lexically far from its cause
 (needing the real test-driven seed, not the highest-degree heuristic), or the
 \emph{sufficient} condition (Phase 4). Multi-crate workspaces, now linkable, also
 remain to be measured at scale.
+
+\paragraph{Sufficient condition (Phase 4): resolution ties, efficiency does not.}
+We run the generation half on real single-file fixes from \code{fd}: an agent is
+given an equal-budget context built two ways --- CCOS's causal region vs top-$k$
+lexical RAG --- asked to rewrite the buggy file, and graded by whether
+\code{cargo test} passes, with a \emph{compiler-in-the-loop} retry (on failure, a
+\emph{context page fault} parses the error with the trace layer, injects pressure on
+the faulting files, and re-prompts with a refreshed window). With a weak $7$B model
+and one shot, both resolve $0/15$; with \code{qwen3-coder-30B} and three attempts
+the loop lifts both to $2/10$ ($20\%$) --- the page-fault feedback, not the
+retriever, unlocks resolution, and CCOS shows \textbf{no resolution advantage} over
+RAG, consistent with the retrieval result. The \emph{efficiency} separates them: at
+equal resolution CCOS's auto-bounded region averages $776$ context tokens against
+the lexical retriever's budget-filling $5366$ --- a $\mathbf{6.9\times}$ reduction.
+This is the one axis on which CCOS dominates: not \emph{what} it retrieves (a
+baseline matches that) but \emph{how little} it needs, because the causal region
+stops at the working set instead of padding a top-$k$ to budget. We state the
+caveats: $n{=}10$ with two resolutions, and the baseline fills the budget (a
+carefully tuned-$k$ RAG would also be sparser) --- but CCOS bounds itself with no
+$k$ to choose, which is the point of demand paging.
 
 \paragraph{Hypotheses.}
 \textbf{H1} (efficiency): CCOS reaches equal task success at fewer input tokens

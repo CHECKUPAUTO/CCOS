@@ -11,10 +11,13 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Repositioned, honestly.** Measurements refute "causal regions retrieve better
   than RAG": on 70 real bug-fix commits causal selection ties (and at a tight
   budget loses to) a lexical TF-IDF retriever, and the crash-trace pivot is beaten
-  by RAG-over-the-error-message. CCOS's contribution is relocated from *retrieval*
-  to a **deterministic, replayable, auditable** agent memory. README and the paper
-  (title, abstract, contributions, new time-travel section, conclusion) rewritten
-  accordingly.
+  by RAG-over-the-error-message. End-to-end (Phase 4, 30B + compiler-in-the-loop)
+  CCOS and RAG resolve equally (2/10), **but CCOS uses 6.9× fewer context tokens
+  (776 vs 5366)** — efficiency, not retrieval quality, is its measured advantage.
+  CCOS's contribution is relocated from *retrieval* to a **frugal, deterministic,
+  replayable, auditable** agent memory. README and the paper (title, abstract,
+  contributions, time-travel section, Phase-4 efficiency result, conclusion)
+  rewritten accordingly.
 
 ### Added
 

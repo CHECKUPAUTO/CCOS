@@ -36,17 +36,20 @@ on real bugs — and the bet did not pay off:
   lexical similarity finds them too.
 - A crash-trace pivot (seed CCOS from a panic backtrace) is **beaten by
   RAG-over-the-error-message** — Rust error messages name the cause.
+- End-to-end (Phase 4: 30B model + compiler-in-the-loop), CCOS and RAG **resolve
+  equally** (2/10 real `fd` bugs) — **but CCOS does so on 6.9× fewer context
+  tokens** (776 vs 5366): it stops at the causal working set instead of padding a
+  top-k to budget. **Efficiency is the one axis where CCOS wins.**
 
 We report this rather than bury it (see [`scripts/causal_validation/`](scripts/causal_validation/)
 and the [paper](docs/paper/)). It relocates CCOS's value:
 
-> **Not a better retriever — a _deterministic, replayable, auditable_ agent
-> memory.** Every cognitive operation is event-sourced and hash-chained, so you can
-> **rewind an agent's exact context state** to any step and **replay it under
-> different parameters** (_time-travel debugging_, `agent_session`) — a capability a
-> probabilistic RAG/framework stack structurally lacks. Whether that, or a
-> structured-context advantage at generation time, yields a downstream win is open
-> (Phase 4).
+> **Not a better retriever — a _frugal, deterministic, replayable, auditable_ agent
+> memory.** It reaches the same result on a fraction of the context budget, and
+> every cognitive operation is event-sourced and hash-chained, so you can **rewind
+> an agent's exact context state** to any step and **replay it under different
+> parameters** (_time-travel debugging_, `agent_session`) — a capability a
+> probabilistic RAG/framework stack structurally lacks.
 
 ## Architecture
 
