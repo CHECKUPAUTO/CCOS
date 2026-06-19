@@ -173,8 +173,19 @@ def _budget_files(ordered: list[str], srcs: dict[str, str], budget: int) -> list
     return out
 
 
-def build_prompt(subject: str, target: str, files: list[str], srcs: dict[str, str]) -> str:
-    body = ["You are fixing a bug in a Rust crate.", f"Bug report: {subject}", "", "Relevant files:"]
+def build_prompt(
+    subject: str, target: str, files: list[str], srcs: dict[str, str], error: str | None = None
+) -> str:
+    body = ["You are fixing a bug in a Rust crate.", f"Bug report: {subject}", ""]
+    if error:
+        body += [
+            "Your previous patch did NOT pass `cargo test`. Output (tail):",
+            "```",
+            error[-1500:],
+            "```",
+            "",
+        ]
+    body.append("Relevant files:")
     for f in files:
         body.append(f"\n// ===== {f} =====\n{srcs.get(f, '')}")
     body.append(
@@ -201,30 +212,105 @@ def ask_ollama(prompt: str) -> str | None:
         return None
 
 
-def cargo_tests_pass(worktree: Path, timeout: float) -> bool:
-    p = subprocess.run(["cargo", "test", "--quiet"], cwd=str(worktree), capture_output=True, text=True, timeout=timeout)
-    return p.returncode == 0
+def cargo_test_output(worktree: Path, timeout: float) -> tuple[bool, str]:
+    """Run the crate's tests; return (passed, combined stdout+stderr). RUST_BACKTRACE
+    is on so panics carry their source locations (the page-fault signal)."""
+    try:
+        p = subprocess.run(
+            ["cargo", "test", "--quiet"],
+            cwd=str(worktree),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env={**os.environ, "RUST_BACKTRACE": "1"},
+        )
+        return p.returncode == 0, (p.stdout + "\n" + p.stderr)
+    except subprocess.TimeoutExpired:
+        return False, "cargo test timed out"
 
 
-def attempt(repo, sc, strat, ccos_bin, subdir, budget, dry_run, test_timeout) -> str:
-    """Return 'pass' / 'fail' / 'skip' for one (scenario, strategy)."""
+def ccos_trace_files(ccos_bin: str, output: str) -> list[str]:
+    """The faulting source files of a cargo/panic output, via `ccos trace`."""
+    try:
+        out = subprocess.run(
+            [ccos_bin, "trace"], input=output, capture_output=True, text=True, timeout=30
+        ).stdout
+        return json.loads(out).get("files", [])
+    except (subprocess.SubprocessError, json.JSONDecodeError):
+        return []
+
+
+def ccos_page_fault_context(
+    ccos_bin: str, worktree: Path, subdir: str, fault_files: list[str], budget: int
+) -> list[str]:
+    """A *context page fault*: inject failure pressure on the faulting files and
+    recall a refreshed window around them (via `ccos memory`)."""
+    srcs = read_sources(worktree, subdir)
+    reqs = [{"op": "ingest", "uri": u, "source": s} for u, s in srcs.items()]
+    for ff in fault_files:
+        reqs.append({"op": "failure", "node": f"file:{ff}", "depth": 2})
+    if fault_files:
+        reqs.append({"op": "recall", "strategy": "around",
+                     "anchor": f"file:{fault_files[0]}", "budget": budget})
+    else:
+        reqs.append({"op": "recall", "strategy": "working_set", "budget": budget})
+    inp = "\n".join(json.dumps(r) for r in reqs)
+    path = tempfile.mktemp(suffix=".ccos")
+    try:
+        out = subprocess.run([ccos_bin, "memory", "--path", path],
+                             input=inp, capture_output=True, text=True, timeout=120).stdout
+        win = next((json.loads(x) for x in reversed(out.splitlines()) if '"items"' in x), {"items": []})
+        files = [i["uri"][len("file:"):] for i in win.get("items", []) if i["uri"].startswith("file:")]
+    except (subprocess.SubprocessError, json.JSONDecodeError):
+        files = list(fault_files)
+    finally:
+        Path(path).exists() and os.remove(path)
+    return _budget_files(files, srcs, budget)
+
+
+def attempt(repo, sc, strat, ccos_bin, subdir, budget, dry_run, test_timeout, max_attempts) -> str:
+    """Return 'pass' / 'fail' / 'skip' for one (scenario, strategy), with a
+    compiler-in-the-loop retry: on a failing `cargo test`, a context page fault
+    enriches the window from the error before the next attempt."""
     wt = add_worktree(repo, sc["parent"])
+    target = sc["target"]
     try:
         srcs = read_sources(wt, subdir)
         files = (
-            ccos_context(ccos_bin, wt, subdir, sc["target"], budget)
+            ccos_context(ccos_bin, wt, subdir, target, budget)
             if strat == "ccos"
-            else rag_context(wt, subdir, sc["target"], budget)
+            else rag_context(wt, subdir, target, budget)
         )
-        prompt = build_prompt(sc["subject"], sc["target"], files, srcs)
         if dry_run:
+            prompt = build_prompt(sc["subject"], target, files, srcs)
             print(f"    [{strat}] {len(files)} files, ~{len(prompt) // 4} tok: {files[:6]}")
             return "skip"
-        reply = ask_ollama(prompt)
-        if not reply:
-            return "skip"
-        (Path(wt) / sc["target"]).write_text(reply)
-        return "pass" if cargo_tests_pass(wt, test_timeout) else "fail"
+
+        error = None
+        for att in range(max_attempts):
+            prompt = build_prompt(sc["subject"], target, files, srcs, error)
+            reply = ask_ollama(prompt)
+            if not reply:
+                return "skip"
+            (Path(wt) / target).write_text(reply)
+            ok, output = cargo_test_output(wt, test_timeout)
+            if ok:
+                if att:
+                    print(f"    [{strat}] passed on attempt {att + 1}", file=sys.stderr)
+                return "pass"
+            # Context page fault: enrich the window from the failure for the retry.
+            error = output
+            fault = ccos_trace_files(ccos_bin, output)
+            if strat == "ccos":
+                files = (
+                    ccos_page_fault_context(ccos_bin, wt, subdir, fault, budget)
+                    if fault
+                    else files
+                )
+            elif fault:
+                files = rag_context(wt, subdir, fault[0], budget)
+            srcs = read_sources(wt, subdir)
+        return "fail"
     finally:
         remove_worktree(repo, wt)
 
@@ -238,6 +324,8 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--max-target-tokens", type=int, default=1200, help="skip larger target files")
     ap.add_argument("--ccos-bin", default=str(Path(__file__).resolve().parents[1] / "target/release/ccos"))
     ap.add_argument("--test-timeout", type=float, default=900.0)
+    ap.add_argument("--max-attempts", type=int, default=3,
+                    help="compiler-in-the-loop retries (page fault between attempts)")
     ap.add_argument("--dry-run", action="store_true", help="build + print contexts, no model, no tests")
     args = ap.parse_args(argv)
 
@@ -251,7 +339,7 @@ def main(argv: list[str]) -> int:
         print(f"[{i}/{len(scen)}] {sc['commit'][:8]} {sc['target']}: {sc['subject'][:60]}", file=sys.stderr)
         for strat in ("ccos", "rag"):
             try:
-                tally[strat][attempt(args.repo, sc, strat, args.ccos_bin, args.subdir, args.budget, args.dry_run, args.test_timeout)] += 1
+                tally[strat][attempt(args.repo, sc, strat, args.ccos_bin, args.subdir, args.budget, args.dry_run, args.test_timeout, args.max_attempts)] += 1
             except (RuntimeError, subprocess.TimeoutExpired) as e:
                 print(f"    [{strat}] skip: {e}", file=sys.stderr)
                 tally[strat]["skip"] += 1

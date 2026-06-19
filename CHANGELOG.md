@@ -19,10 +19,17 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 - **Event-sourced agent session** (`agent_session` module) — `AgentSession`
-  records every cognitive op (ingest / failure / recall) as a timeline;
-  `replay_to(step)` reconstructs the exact state, and `recall_what_if(step, q, b)`
-  re-runs a recall under different parameters: **time-travel debugging** for an
-  agent's context, the capability a probabilistic retrieval stack lacks.
+  records every cognitive op (ingest / failure / recall / page-fault) as a
+  timeline; `replay_to(step)` reconstructs the exact state, and
+  `recall_what_if(step, q, b)` re-runs a recall under different parameters:
+  **time-travel debugging** for an agent's context, the capability a probabilistic
+  retrieval stack lacks.
+- **Context page fault** (`AgentSession::page_fault`) — feed `cargo test` /
+  compiler output back in: parse the faulting locations (`trace`), inject failure
+  pressure, recall a refreshed window — the MMU "demand paging on a fault" step,
+  logged and replayable. `scripts/phase4_eval.py` now uses it as a
+  **compiler-in-the-loop** retry (patch → test → page-fault → enriched context →
+  retry, `--max-attempts`).
 - **`ccos trace`** + **module-hierarchy linking** — parse `cargo test` / panic /
   backtrace (stdin) into the crash's source files (`trace` module); and
   `link_module_imports` now adds parent→sub-module edges so sub-modules reached
