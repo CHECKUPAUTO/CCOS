@@ -19,7 +19,7 @@
 \newcommand{\Nk}{\mathcal{N}_k}
 \newcommand{\code}[1]{\texttt{#1}}
 
-\title{\textbf{Causal Context Regions:\\ A Spatial Memory Model for Long-Horizon LLM Coding Agents}}
+\title{\textbf{The Cognitive MMU:\\ Deterministic, Auditable Working Memory for LLM Coding Agents\\ \large (and an honest account of why causal retrieval does not beat RAG)}}
 \author{The CCOS Project\thanks{Causal Context Operating System (CCOS), an open
 research prototype. Source, reproduction scripts and this paper:
 \url{https://github.com/CHECKUPAUTO/CCOS}.}}
@@ -29,49 +29,38 @@ research prototype. Source, reproduction scripts and this paper:
 \maketitle
 
 \begin{abstract}
-Coding agents backed by large language models (LLMs) drown in context: a
-repository is paged into a bounded window as a flat, ranked list of files, and as
-tasks lengthen the window fills with globally ``important'' but locally
-irrelevant material. We argue that the unit of context should not be the file but
-the \emph{region}: a causally coherent neighbourhood of code, dependencies and
-associated faults that is hydrated as a whole, the way an operating system pages
-in a working set rather than a single address. We present the \emph{Context
-Region Engine} (CCOS v0.3), which lifts a 1-D causal memory graph into a spatial
-map of regions with a temperature, a causal density and a dynamic admission
-policy. We give a precise, deterministic definition of a region in terms of
-connected components of a cross-file causal-link graph, and of causal distance as
-a weighted shortest path. We prove that regions are a pure function of the graph
-and therefore reconstruct bit-for-bit on replay, preserving CCOS's auditability
-invariant. On the system's own source tree we measure, \emph{without any LLM
-calls}, that region-based selection covers a task's $k$-hop causal neighbourhood
-with recall $0.97$ versus $0.35$ for the flat top-score strategy, at
-$\approx\!48\%$ fewer tokens for equal coverage, with regions that are
-$95.5\%$ internally connected. In a deterministic, LLM-free \emph{simulation}
-under an explicit retrieval oracle, classical (lexical) RAG solves $0\%$ of
-cross-file causal tasks while structure-aware regional selection solves $100\%$,
-with the gap widening with task diameter --- though a strong graph-traversal
-baseline ties it on a clean query. Under a \emph{misleading} query, however, every
-lexically-seeded method --- including that graph baseline and an ablation of CCOS
-that trusts the query --- collapses to $0\%$, while only the workspace-anchored
-region survives: the differentiator is the \emph{anchor} (a structural workspace
-signal vs.\ a lexical query), not the region machinery. This tests the
-\emph{necessary} (retrieval) condition, not the \emph{sufficient} (generation)
-one; a first on-device real-LLM run (\code{qwen2.5-7B} via Ollama on an NVIDIA
-Jetson AGX Thor) then reproduces the coverage result on real file content and
-exhibits the same noisy separation --- under a misleading query only the
-workspace-anchored region yields any task success --- while we are explicit that
-the small model's arithmetic reasoning, not selection, caps absolute success. We
-further specify a falsifiable protocol against classical RAG, GraphRAG, MemGPT and
-LangGraph on long-horizon tasks (SWE-bench and a multi-file bug suite). Crucially,
-when we run that protocol's retrieval half on \emph{real} bug-fix commits from
-three mature crates, causal selection \textbf{ties a plain lexical TF-IDF baseline}
-and loses to it at a tight budget --- on real bugs a fix's files are lexically
-similar, so the simulation's dissimilar-cause premise does not reproduce, and the
-necessary condition is met by a baseline too. We label throughout what is
-\emph{proven} (formal structure, determinism, locality), \emph{measured}
-(retrieval coverage --- where CCOS does \emph{not} beat lexical RAG on real bugs),
-and \emph{still hypothesised} (any downstream agent gain), so the contribution can
-be evaluated honestly.
+An LLM coding agent's working memory is managed opaquely: a retrieval stack (RAG,
+GraphRAG, agent frameworks) pages a repository into a bounded window and mutates
+that window probabilistically as a session unfolds, so when an agent drifts after
+dozens of steps it is impossible to say \emph{why} or \emph{when} its
+representation of the project corrupted. CCOS treats agent memory the way an
+operating system treats RAM: source is parsed into an \emph{event-sourced} causal
+graph, nodes are scored and paged under a token budget, and every state transition
+is recorded in a hash-chained log that replays bit-for-bit. We give a precise,
+deterministic definition of a \emph{causal region} (a connected component of the
+cross-file causal-link graph) and of causal distance (a weighted shortest path),
+and prove that regions and the paged window are a pure function of the graph,
+reconstructing exactly on replay --- the property that makes an agent's memory
+\emph{auditable} and \emph{time-travel debuggable}. We then ask whether this causal structure makes CCOS a \emph{better retriever}
+than a baseline, and report --- honestly --- that it does not. Measured on $70$
+real bug-fix commits across three mature crates, causal selection \textbf{ties a
+plain lexical TF-IDF retriever} and loses to it at a tight budget; on real bugs a
+fix's files share vocabulary, so lexical similarity finds them too, and a
+proof-of-concept that seeds CCOS from a crash trace is likewise beaten by
+RAG-over-the-error-message (Rust error messages name the cause). An LLM-free
+simulation \emph{does} separate the two when a cause is constructed to be
+lexically dissimilar from its symptom, and a first on-device run with a $7$B model
+reproduces it --- but that regime does not occur on real code. The contribution is
+therefore \emph{not} better retrieval. It is the infrastructure a retrieval stack
+structurally lacks: a \emph{deterministic, replayable, auditable} agent memory in
+which one can rewind the exact context state at any step and replay it under
+different parameters (\emph{time-travel debugging}). We release the engine, the
+honest validation harness, and this paper, labelling throughout what is
+\emph{proven} (formal structure, determinism, replay), \emph{measured} (retrieval
+coverage --- where CCOS does \emph{not} beat lexical RAG on real bugs), and
+\emph{still open} (any downstream agent benefit). On its own source tree, region
+selection covers a task's $k$-hop neighbourhood with recall $0.97$ vs $0.35$ flat
+at $\approx\!48\%$ fewer tokens; regions are $95.5\%$ internally connected.
 \end{abstract}
 
 \section{Introduction}
@@ -92,25 +81,32 @@ Operating systems faced the analogous problem decades ago and answered with the
 resident~\cite{denning1968working}. CCOS adopts the analogy for LLM
 context~\cite{packer2023memgpt}: source is parsed into a causal
 graph, nodes are scored, and a bounded ``context window'' is paged in and out
-like RAM~$\leftrightarrow$~VRAM. CCOS v0.2 keeps this at one dimension: a scalar
-score per node. The present work (v0.3) makes the memory \emph{spatial}. Our
-contributions are:
+like RAM~$\leftrightarrow$~VRAM. Unlike a retrieval stack, every transition is
+recorded in a hash-chained event log, so the memory is not a black box but an
+\emph{auditable, replayable} artefact. Our contributions are:
 
 \begin{enumerate}
-  \item A \textbf{formal model of context regions} (\S\ref{sec:regions}):
-  causal distance as a weighted shortest path, and region membership as a
-  connected component of a cross-file causal-link graph, with external
-  dependency hubs collapsed.
-  \item A \textbf{dynamic admission policy} (\S\ref{sec:policy}) that replaces a
-  global threshold with a per-region score modulated by temperature, causal
-  density, token pressure and task complexity.
-  \item A \textbf{determinism theorem} (\S\ref{sec:determinism}): regions are a
-  pure function of the graph, and a session reconstructs bit-for-bit from its
-  event log, preserving tamper-evident replay.
-  \item An \textbf{LLM-free locality evaluation} (\S\ref{sec:eval}) with real,
-  reproducible numbers, plus a \textbf{falsifiable comparison protocol}
-  (\S\ref{sec:protocol}) against RAG, GraphRAG, MemGPT and LangGraph that we
-  state but do not yet run.
+  \item A \textbf{formal, deterministic model of context regions}
+  (\S\ref{sec:regions}, \S\ref{sec:determinism}): causal distance as a weighted
+  shortest path, region membership as a connected component of the cross-file
+  causal-link graph, and a determinism theorem --- regions and the paged window
+  are a pure function of the graph, so a session reconstructs bit-for-bit from its
+  hash-chained event log (tamper-evident replay).
+  \item \textbf{Event-sourced agent sessions with time-travel debugging}
+  (\S\ref{sec:timetravel}): every cognitive operation (ingest, failure signal,
+  recall) is logged; the exact context state at any step is reconstructible; and a
+  recall can be \emph{replayed under different parameters} to ask whether the agent
+  would have decided better --- the capability a probabilistic retrieval stack
+  structurally lacks.
+  \item An \textbf{honest validation harness and a negative result}
+  (\S\ref{sec:protocol}): on $70$ real bug-fix commits, causal selection
+  \emph{does not} beat a lexical TF-IDF retriever at placing a fix's files in the
+  window (it ties, and loses at a tight budget), and a crash-trace pivot is beaten
+  by RAG-over-the-error-message. We report this plainly --- it relocates CCOS's
+  value from \emph{retrieval} to \emph{auditability}.
+  \item An \textbf{LLM-free locality measurement} (\S\ref{sec:eval}) with real,
+  reproducible numbers, and a falsifiable \emph{sufficient}-condition protocol
+  (Phase~4) we specify but leave open.
 \end{enumerate}
 
 \section{Related Work}\label{sec:related}
@@ -273,6 +269,30 @@ $\mathrm{engine}=\mathrm{replay\_from}(G',L)$ by structural equality. \qed
 This extends CCOS's existing guarantees: the primary event log is hash-chained and
 tamper-evident, so the region history is auditable, and a 10\,000-cycle test
 exhibits no drift in region count or temperatures.
+
+\section{Event-sourced sessions and time-travel debugging}\label{sec:timetravel}
+
+Determinism is not only a correctness property; it is the basis of the capability
+that, our evaluation will argue, distinguishes CCOS from a retrieval stack. An
+\code{AgentSession} records every cognitive operation an agent performs on its
+memory --- \code{Ingest}, \code{SignalFailure}, \code{Recall} --- as an ordered
+timeline. Because each operation is a deterministic function of the prior state,
+the memory after the first $n$ operations is reconstructed exactly by replaying
+the mutating ones (\code{replay\_to(n)}): one can \emph{rewind the agent's mind} to
+any step.
+
+The operation that matters for debugging is the counterfactual. \code{recall\_what\_if($n$,
+$q$, $b$)} replays the memory to step $n$ and re-runs a recall with a different
+query $q$ or token budget $b$, returning the window the agent \emph{would} have
+seen. When an agent emits a bad patch at step 15, an operator can replay its exact
+context at step 14, widen the budget or change the anchor, and observe whether the
+decision improves --- a closed-loop, reproducible debugger for an agent's working
+memory. A RAG or framework stack mutates its store probabilistically across a
+session and keeps no canonical, replayable transition log, so the same question
+(\emph{why, and when, did the representation corrupt?}) has no answer there. We do
+not claim this improves task success; we claim it is a property the alternatives do
+not have, and that it is the honest locus of CCOS's contribution
+(\S\ref{sec:protocol}).
 
 \section{Implementation}\label{sec:impl}
 
@@ -598,15 +618,23 @@ this point, \emph{unproven}.
 
 \section{Conclusion}
 
-We reframed LLM context selection from a 1-D ranked list to a spatial map of
-\emph{causal regions}, gave the construction a precise and deterministic
-definition, proved it reconstructs bit-for-bit on replay, and measured --- without
-any LLM --- that regions cover a task's causal neighbourhood far more completely
-and cheaply than flat ranking. Whether this locality translates into better
-long-horizon agent behaviour is an empirical question we have framed as a
-falsifiable protocol against RAG, GraphRAG, MemGPT and LangGraph. We release the
-engine, the metrics and this paper so the claim can be tested rather than
-asserted.
+We set out to show that organising an agent's memory by \emph{causal regions}
+retrieves long-horizon context better than chunk retrieval, gave the construction
+a precise and deterministic definition, and proved it reconstructs bit-for-bit on
+replay. We then tested the retrieval claim against the obvious baseline on real
+data --- and it did not hold: across $70$ real bug-fix commits a plain lexical
+TF-IDF retriever ties causal selection and beats it at a tight budget, and a
+crash-trace pivot loses to RAG-over-the-error-message, because on real code a
+fix's files and its error messages share vocabulary. We report the negative result
+rather than bury it. What survives is not a better retriever but a different kind
+of object: a \emph{deterministic, replayable, auditable} working memory in which an
+agent's exact context state can be rewound and replayed under different
+parameters --- time-travel debugging that a probabilistic retrieval stack cannot
+offer. Whether that auditability, or a structured-context advantage at
+\emph{generation} time (Phase 4), yields a measurable downstream gain remains open.
+We release the engine, the honest validation harness and this paper so the
+distinction between what is proven, what is measured, and what is refuted can be
+checked rather than asserted.
 
 \begin{thebibliography}{99}
 \bibitem{lewis2020rag} P.~Lewis et al. Retrieval-Augmented Generation for
