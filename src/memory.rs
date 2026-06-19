@@ -382,6 +382,53 @@ impl MemoryGraph {
         self.edges.len()
     }
 
+    /// Resolve intra-crate imports into `file → file` dependency edges.
+    ///
+    /// The parser records imports as `use:<file>:<path>` nodes but does not link
+    /// the importing file to the file that *defines* the imported module, so
+    /// causally-related files end up connected only through shared `dep:` hubs.
+    /// This pass maps each file to its module path (`src/a/b.rs` → `a::b`,
+    /// `…/mod.rs|lib.rs|main.rs` to the parent) and, for every `use:` node,
+    /// links the importer to the file whose module is the longest matching
+    /// prefix of the import path. Idempotent (duplicate edges are rejected);
+    /// returns the number of edges added. Opt-in — callers invoke it after
+    /// ingesting a set of files (see [`crate::external_memory`]).
+    pub fn link_module_imports(&mut self) -> usize {
+        let mut module_to_file: HashMap<String, NodeId> = HashMap::new();
+        for id in self.nodes.keys() {
+            if let Some(path) = id.0.strip_prefix("file:") {
+                if let Some(m) = module_path_of(path) {
+                    module_to_file.insert(m, id.clone());
+                }
+            }
+        }
+        let mut to_add: Vec<(NodeId, NodeId)> = Vec::new();
+        for id in self.nodes.keys() {
+            let Some(rest) = id.0.strip_prefix("use:") else {
+                continue;
+            };
+            let Some((file, usepath)) = rest.split_once(':') else {
+                continue;
+            };
+            let importer = NodeId(format!("file:{file}"));
+            if !self.nodes.contains_key(&importer) {
+                continue;
+            }
+            if let Some(target) = resolve_use(usepath, &module_to_file) {
+                if target != importer {
+                    to_add.push((importer, target));
+                }
+            }
+        }
+        let mut added = 0;
+        for (s, t) in to_add {
+            if self.add_edge(s, t, 0.85, EdgeType::DependsOn) {
+                added += 1;
+            }
+        }
+        added
+    }
+
     /// Detect directed dependency cycles via an iterative (stack-safe) DFS.
     /// Each returned vector lists the nodes forming one cycle, in order.
     pub fn find_cycles(&self) -> Vec<Vec<NodeId>> {
@@ -580,9 +627,76 @@ pub struct GraphDiff {
     pub common_nodes: usize,
 }
 
+/// The `::`-joined module path of a source file, used by
+/// [`MemoryGraph::link_module_imports`]. `src/a/b.rs` → `a::b`; a leading `src/`
+/// is stripped; `mod.rs`/`lib.rs`/`main.rs` resolve to the parent module (the
+/// crate root, i.e. `None`, when there is no parent).
+fn module_path_of(file_path: &str) -> Option<String> {
+    let p = file_path.strip_prefix("src/").unwrap_or(file_path);
+    let p = p.strip_suffix(".rs")?;
+    let segs: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
+    let last = *segs.last()?;
+    let module = if matches!(last, "mod" | "lib" | "main") {
+        segs[..segs.len() - 1].join("::")
+    } else {
+        segs.join("::")
+    };
+    (!module.is_empty()).then_some(module)
+}
+
+/// Resolve an import path to the defining file's node id by longest-prefix match
+/// against the known module paths (external paths like `std::io` match nothing).
+fn resolve_use(usepath: &str, module_to_file: &HashMap<String, NodeId>) -> Option<NodeId> {
+    let mut p = usepath;
+    for q in ["crate::", "self::", "super::"] {
+        p = p.strip_prefix(q).unwrap_or(p);
+    }
+    let segs: Vec<&str> = p.split("::").filter(|s| !s.is_empty()).collect();
+    (1..=segs.len()).rev().find_map(|len| {
+        let cand = segs[..len].join("::");
+        module_to_file.get(&cand).cloned()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn link_module_imports_connects_cross_file_uses() {
+        let mut g = MemoryGraph::new(0.0, usize::MAX);
+        for f in ["src/api.rs", "src/repo.rs", "src/db.rs"] {
+            g.upsert_node(
+                format!("file:{f}").into(),
+                f.into(),
+                "".into(),
+                NodeType::Module,
+            );
+        }
+        g.upsert_node(
+            "use:src/api.rs:crate::repo".into(),
+            "".into(),
+            "".into(),
+            NodeType::Unknown,
+        );
+        g.upsert_node(
+            "use:src/repo.rs:crate::db::connect".into(),
+            "".into(),
+            "".into(),
+            NodeType::Unknown,
+        );
+        let added = g.link_module_imports();
+        assert_eq!(added, 2, "two cross-file imports resolved");
+        assert!(g
+            .edges
+            .iter()
+            .any(|e| e.source.0 == "file:src/api.rs" && e.target.0 == "file:src/repo.rs"));
+        assert!(g
+            .edges
+            .iter()
+            .any(|e| e.source.0 == "file:src/repo.rs" && e.target.0 == "file:src/db.rs"));
+        assert_eq!(g.link_module_imports(), 0, "idempotent");
+    }
 
     #[test]
     fn test_upsert_node() {

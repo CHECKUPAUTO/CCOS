@@ -456,6 +456,9 @@ impl ExternalMemory for CcosMemory {
             .engine
             .process_delta(uri, prev.as_deref(), source, &mut self.graph);
         self.sources.insert(file_key, source.to_string());
+        // Resolve intra-crate imports into file→file edges so recall, failure
+        // propagation and regions see the real cross-file causal structure.
+        let cross_edges = self.graph.link_module_imports();
         let file_hash = sha256_hex(source);
         self.event_log.append(
             EventType::Parsing,
@@ -473,7 +476,7 @@ impl ExternalMemory for CcosMemory {
             uri: uri.to_string(),
             nodes_added: delta.nodes_added,
             nodes_removed: delta.nodes_removed,
-            edges_added: delta.edges_added,
+            edges_added: delta.edges_added + cross_edges,
         }
     }
 
@@ -551,6 +554,36 @@ impl ExternalMemory for CcosMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recall_around_reaches_cross_file_cause() {
+        let mut mem = CcosMemory::new();
+        mem.ingest_source("src/db.rs", "pub fn connect() -> i32 { 5 }\n");
+        mem.ingest_source(
+            "src/repo.rs",
+            "use crate::db;\npub fn load() -> i32 { db::connect() }\n",
+        );
+        mem.ingest_source(
+            "src/api.rs",
+            "use crate::repo;\npub fn handler() -> i32 { repo::load() }\n",
+        );
+        mem.ingest_source("src/unrelated.rs", "pub fn fmt_date() {}\n");
+        let win = mem.recall(&Recall::around("file:src/api.rs"), 8000);
+        let files: Vec<&str> = win
+            .items
+            .iter()
+            .map(|i| i.uri.as_str())
+            .filter(|u| u.starts_with("file:"))
+            .collect();
+        assert!(
+            files.contains(&"file:src/db.rs"),
+            "recall reaches the cross-file cause db.rs: {files:?}"
+        );
+        assert!(
+            !files.contains(&"file:src/unrelated.rs"),
+            "recall excludes unrelated code: {files:?}"
+        );
+    }
 
     #[test]
     fn ingest_recall_verify_roundtrip() {
