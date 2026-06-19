@@ -21,6 +21,15 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Self-analysis dogfood loop** (`.mcp.json`, `scripts/ccos_self_feed.py`,
+  `docs/SELF_ANALYSIS.md`) — wires CCOS into a coding agent (Claude Code) as its
+  causal memory. A project `.mcp.json` registers `ccos mcp` so the agent gets the
+  memory tools natively (Mode A), and a **PostToolUse hook** is the transparent
+  "hardware intercept" (Mode B): every source file the agent reads/writes becomes an
+  `ingest` and every failed `cargo test/build` becomes a `page_fault`, with zero
+  cognitive overhead — so `workspace.ccos` + `.oplog` accumulate a replayable record
+  you then debug with `ccos postmortem`. Verified end-to-end: simulated tool events
+  feed the memory and the session is walkable post-mortem.
 - **MCP server** (`ccos mcp`, `mcp` module) — exposes the external-memory façade
   as [Model Context Protocol](https://modelcontextprotocol.io) tools over **stdio
   JSON-RPC 2.0**, so any MCP-compatible agent (Claude, a local agent on the Jetson)

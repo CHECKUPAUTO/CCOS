@@ -321,6 +321,9 @@ Heavier stress/chaos harnesses live in [`scripts/`](scripts/) (multi-day chaos,
 - [`docs/MEMORY_INTERFACE.md`](docs/MEMORY_INTERFACE.md) — the **external-memory
   interface**: the documented façade an agent uses to treat CCOS as working memory,
   plus its two transports (`ccos memory` stdio JSON, and the `ccos mcp` MCP server).
+- [`docs/SELF_ANALYSIS.md`](docs/SELF_ANALYSIS.md) — **dogfooding**: wire CCOS into a
+  coding agent (`.mcp.json` + a PostToolUse "hardware intercept" hook) so its runs
+  feed a causal memory you debug post-mortem when it drifts.
 - [`docs/context_regions.md`](docs/context_regions.md) — the **Context Region
   Engine** (v0.3): spatial memory model, formal region definition, dynamic
   admission policy, determinism, and measured locality.
