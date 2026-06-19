@@ -89,7 +89,28 @@ budget**, at the cost of **diluting** it at a very tight one (`K=20`): marking
 neighbours on both sides floods a small working set and can evict a target. A
 real, falsifiable trade-off — exactly what the harness is for.
 
-**Caveat, unchanged:** `n ≈ 3` is far too small to conclude anything. This
-methodology is SWE-bench-shaped; it only becomes meaningful on a large, mature
-codebase with many fix commits. Point `--repo` at one and re-run with and without
-`--bidirectional`.
+### On a mature external repo (`fd`, n = 25)
+
+The same comparison on [`sharkdp/fd`](https://github.com/sharkdp/fd) (1942 commits,
+25 mined fix scenarios) — a meaningful sample — makes the effect unmistakable:
+
+| K | downstream-only | bidirectional |
+| --- | --- | --- |
+| 20  | 0.50 (48% perfect) | 0.28 (28% perfect) |
+| 50  | 0.50 (48% perfect) | **0.92 (88% perfect)** |
+| 100 | 0.50 (48% perfect) | **0.96 (92% perfect, geo 0.95)** |
+
+With a sufficient budget (`K≥50`), cross-file linking + bidirectional propagation
+let CCOS recover **92–96% of the files a fix touched**, on 25 real bugs — up from
+50% downstream-only. The `K=20` dilution reproduces. Reproduce with:
+
+```bash
+git clone https://github.com/sharkdp/fd /tmp/fd
+python scripts/causal_validation/validate.py --repo /tmp/fd \
+    --ccos-bin target/release/ccos --limit 25 --bidirectional
+```
+
+**Caveat:** this is one repository; the protocol should be run across several
+(and against the LLM end-to-end of Phase 4) before any general claim. But on a
+real, mature codebase the necessary condition — *the fix's files are in the
+window* — now holds for the large majority of bugs.
