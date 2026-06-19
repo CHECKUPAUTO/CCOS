@@ -15,6 +15,7 @@ use ccos::persist::KernelSnapshot;
 use ccos::query;
 use ccos::region_engine::{ContextRegionEngine, RegionQuery};
 use ccos::region_metrics;
+use ccos::trace::parse_cargo_test_output;
 use ccos::util::sha256_hex;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -54,6 +55,7 @@ async fn main() {
         "experiment" => run_experiment_cmd(rest),
         "eval" => run_eval_cmd(rest).await,
         "memory" => run_memory_cmd(rest),
+        "trace" => run_trace_cmd(),
         // ── CCOS v0.3 — Autonomous Context Runtime ──────────────────
         "scan" => commands_runtime::run_scan(rest).await,
         "agents" => commands_runtime::run_agents(rest).await,
@@ -1364,6 +1366,33 @@ fn run_experiment_cmd(args: &[String]) -> i32 {
     0
 }
 
+/// `ccos trace` — read `cargo test` / panic / backtrace text on **stdin** and
+/// emit the project source locations the crash touched as JSON (`message`,
+/// `files`, `hits`). The seed set for a trace-driven context page fault.
+fn run_trace_cmd() -> i32 {
+    use std::io::Read;
+    let mut input = String::new();
+    if std::io::stdin().read_to_string(&mut input).is_err() {
+        eprintln!("ccos: failed to read stdin");
+        return 1;
+    }
+    let trace = parse_cargo_test_output(&input);
+    let hits: Vec<_> = trace
+        .hits
+        .iter()
+        .map(
+            |h| serde_json::json!({ "file": h.file, "line": h.line, "frame_depth": h.frame_depth }),
+        )
+        .collect();
+    let report = serde_json::json!({
+        "message": trace.message,
+        "files": trace.files(),
+        "hits": hits,
+    });
+    println!("{}", serde_json::to_string_pretty(&report).unwrap());
+    0
+}
+
 /// `ccos memory [--path FILE]` — drive the [`CcosMemory`] external-memory façade
 /// over **stdin JSON Lines**: one request object per line, one JSON response per
 /// line. Loads `FILE` (default `workspace.ccos`), applies each request, and
@@ -1695,6 +1724,7 @@ COMMANDS:\n\
     experiment [--tasks N]     Hypothesis test: regional memory vs RAG/GraphRAG (--json)\n\
     eval [--tasks N] [--model M]  Real-LLM eval (ANTHROPIC/OPENAI_API_KEY or OLLAMA_ENDPOINT)\n\
     memory [--path FILE]       External-memory façade over stdin JSON Lines (ingest/recall/verify)\n\
+    trace                      Parse cargo-test/panic/backtrace (stdin) into the crash's source files\n\
 \n\
   CCOS v0.3 — Autonomous Context Runtime:\n\
     scan <path>                Scan a real workspace and ingest the delta\n\

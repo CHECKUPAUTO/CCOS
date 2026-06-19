@@ -457,7 +457,9 @@ impl MemoryGraph {
                 }
             }
         }
-        let mut to_add: Vec<(NodeId, NodeId)> = Vec::new();
+        let mut to_add: Vec<(NodeId, NodeId, EdgeType)> = Vec::new();
+
+        // (a) imports: importer → defining file.
         for id in self.nodes.keys() {
             let Some(rest) = id.0.strip_prefix("use:") else {
                 continue;
@@ -472,13 +474,35 @@ impl MemoryGraph {
             let importer_crate = crate_and_module(file).map(|(c, _)| c).unwrap_or_default();
             if let Some(target) = resolve_use(&importer_crate, usepath, &index) {
                 if target != importer {
-                    to_add.push((importer, target));
+                    to_add.push((importer, target, EdgeType::DependsOn));
                 }
             }
         }
+
+        // (b) module hierarchy: a parent module's file → its sub-module's file
+        // (e.g. `filter/mod.rs → filter/owner.rs`). The parser records `pub mod x;`
+        // only as a node, so without this a sub-module reached through a re-export
+        // is orphaned and failure pressure can never flow into it.
+        let entries: Vec<((String, String), NodeId)> =
+            index.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        for ((krate, module), child) in &entries {
+            if module.is_empty() {
+                continue;
+            }
+            let parent_module = match module.rsplit_once("::") {
+                Some((p, _)) => p.to_string(),
+                None => String::new(), // top-level module → crate root (lib/main)
+            };
+            if let Some(parent) = index.get(&(krate.clone(), parent_module)) {
+                if parent != child {
+                    to_add.push((parent.clone(), child.clone(), EdgeType::Contains));
+                }
+            }
+        }
+
         let mut added = 0;
-        for (s, t) in to_add {
-            if self.add_edge(s, t, 0.85, EdgeType::DependsOn) {
+        for (s, t, ty) in to_add {
+            if self.add_edge(s, t, 0.85, ty) {
                 added += 1;
             }
         }
