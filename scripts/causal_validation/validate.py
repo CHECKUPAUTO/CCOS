@@ -220,15 +220,19 @@ def pick_origin(target_ids: list[str], nodes: set[str], outdeg: Counter) -> str 
 
 
 def failure_working_set(
-    ccos_bin: str, snap: Path, origin: str, k: int, depth: int, env: dict, timeout: float
+    ccos_bin: str,
+    snap: Path,
+    origin: str,
+    k: int,
+    depth: int,
+    env: dict,
+    timeout: float,
+    bidirectional: bool = False,
 ) -> dict:
-    proc = run_ccos(
-        ccos_bin,
-        ["failure", str(snap), origin, "--depth", str(depth), "--max-nodes", str(k), "--json"],
-        cwd=None,
-        env=env,
-        timeout=timeout,
-    )
+    args = ["failure", str(snap), origin, "--depth", str(depth), "--max-nodes", str(k), "--json"]
+    if bidirectional:
+        args.append("--bidirectional")
+    proc = run_ccos(ccos_bin, args, cwd=None, env=env, timeout=timeout)
     if proc.returncode != 0:
         raise StepError(f"failure failed: {proc.stderr.strip()[:200]}")
     return json.loads(proc.stdout)
@@ -266,6 +270,7 @@ class Args:
     ccos_bin: str
     out: Path | None
     dry_run: bool
+    bidirectional: bool = False
     weights: dict = field(default_factory=dict)
 
 
@@ -326,7 +331,14 @@ def run(args: Args) -> list[dict]:
             present = sum(1 for t in target_ids if t in nodes)
             for k in args.ks:
                 res = failure_working_set(
-                    args.ccos_bin, snap, origin, k, args.depth, env, args.timeout
+                    args.ccos_bin,
+                    snap,
+                    origin,
+                    k,
+                    args.depth,
+                    env,
+                    args.timeout,
+                    bidirectional=args.bidirectional,
                 )
                 cov = r_cov(target_ids, res["working_set"])
                 rec = {
@@ -395,6 +407,11 @@ def parse_args(argv: list[str]) -> Args:
     p.add_argument("--no-build", action="store_true")
     p.add_argument("--out", type=Path, default=None, help="write per-scenario JSONL here")
     p.add_argument("--dry-run", action="store_true", help="process a single commit, verbosely")
+    p.add_argument(
+        "--bidirectional",
+        action="store_true",
+        help="propagate failure in both edge directions (reach upstream causes)",
+    )
     # Optional weight overrides (also useful for a Phase-3 wrapper).
     for name in ("w_base", "w_failure", "w_recency", "w_access", "failure_decay"):
         p.add_argument(f"--{name.replace('_', '-')}", type=float, default=None)
@@ -417,6 +434,7 @@ def parse_args(argv: list[str]) -> Args:
         ccos_bin=ccos_bin,
         out=ns.out,
         dry_run=ns.dry_run,
+        bidirectional=ns.bidirectional,
         weights=weights,
     )
 

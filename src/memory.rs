@@ -374,6 +374,60 @@ impl MemoryGraph {
         }
     }
 
+    /// Like [`propagate_failure`](Self::propagate_failure) but **bidirectional**:
+    /// pressure flows to neighbours in *both* edge directions, so an injected
+    /// fault reaches its upstream causes (callers/importers) as well as its
+    /// downstream dependencies. Recursion only continues into a neighbour whose
+    /// failure relevance actually grew, which (with the `depth ≤ max_depth` bound)
+    /// keeps it terminating on cyclic graphs. Use when the failing node's *cause*
+    /// may lie either side of it — e.g. bug-fix localisation.
+    pub fn propagate_failure_bidirectional(
+        &mut self,
+        origin_id: &NodeId,
+        depth: u32,
+        max_depth: u32,
+    ) {
+        if depth > max_depth {
+            return;
+        }
+        let base_value = self
+            .nodes
+            .get(origin_id)
+            .map(|n| n.failure_relevance)
+            .unwrap_or(0.0);
+
+        // Neighbours via edges in either direction.
+        let neighbours: Vec<(NodeId, f64)> = self
+            .edges
+            .iter()
+            .filter_map(|e| {
+                if &e.source == origin_id {
+                    Some((e.target.clone(), e.weight))
+                } else if &e.target == origin_id {
+                    Some((e.source.clone(), e.weight))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let decay = self.scoring_weights.failure_decay;
+        for (nb, weight) in neighbours {
+            let propagation = base_value * weight * decay.powi(depth as i32);
+            let mut grew = false;
+            if let Some(node) = self.nodes.get_mut(&nb) {
+                let before = node.failure_relevance;
+                node.failure_relevance = (before + propagation).clamp(0.0, 1.0);
+                node.recency = 1.0;
+                node.last_accessed = self.clock;
+                grew = node.failure_relevance > before + 1e-9;
+            }
+            if grew {
+                self.propagate_failure_bidirectional(&nb, depth + 1, max_depth);
+            }
+        }
+    }
+
     pub fn node_count(&self) -> usize {
         self.nodes.len()
     }
@@ -696,6 +750,22 @@ mod tests {
             .iter()
             .any(|e| e.source.0 == "file:src/repo.rs" && e.target.0 == "file:src/db.rs"));
         assert_eq!(g.link_module_imports(), 0, "idempotent");
+    }
+
+    #[test]
+    fn bidirectional_failure_reaches_upstream_causes() {
+        let mut g = MemoryGraph::new(0.0, usize::MAX);
+        g.upsert_node("a".into(), "a".into(), "".into(), NodeType::Module);
+        g.upsert_node("b".into(), "b".into(), "".into(), NodeType::Module);
+        // a depends on b (a → b); b is upstream of nothing, a is upstream of b.
+        g.add_edge("a".into(), "b".into(), 1.0, EdgeType::DependsOn);
+        // Inject at b: downstream-only propagation cannot reach a.
+        g.set_failure_relevance(&"b".into(), 1.0);
+        g.propagate_failure(&"b".into(), 0, 3);
+        assert_eq!(g.nodes.get(&"a".into()).unwrap().failure_relevance, 0.0);
+        // Bidirectional propagation reaches the upstream cause a.
+        g.propagate_failure_bidirectional(&"b".into(), 0, 3);
+        assert!(g.nodes.get(&"a".into()).unwrap().failure_relevance > 0.0);
     }
 
     #[test]

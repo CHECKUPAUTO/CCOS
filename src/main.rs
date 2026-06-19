@@ -200,6 +200,10 @@ fn run_analyze(opts: &AnalyzeOpts) -> i32 {
         }
     }
 
+    // Resolve intra-crate imports into file→file edges so failure propagation,
+    // regions and the working set see the real cross-file causal structure.
+    let cross_edges = graph.link_module_imports();
+
     // Integrity: the graph must never hold edges to evicted/absent nodes.
     let dangling = graph.prune_dangling_edges();
     let cycles = if opts.cycles || opts.json {
@@ -233,6 +237,7 @@ fn run_analyze(opts: &AnalyzeOpts) -> i32 {
             "files_ingested": files.len() - read_errors,
             "nodes": graph.node_count(),
             "edges": graph.edge_count(),
+            "cross_file_edges": cross_edges,
             "dangling_edges": dangling,
             "orphan_nodes": orphans,
             "dependency_cycles": cycles.len(),
@@ -245,6 +250,7 @@ fn run_analyze(opts: &AnalyzeOpts) -> i32 {
         println!("  Files ingested:  {}", files.len() - read_errors);
         println!("  Graph nodes:     {}", graph.node_count());
         println!("  Graph edges:     {}", graph.edge_count());
+        println!("  Cross-file edges:{cross_edges} (resolved imports)");
         println!("  Mutations:       {}", engine.total_mutations());
         println!("  Events logged:   {}", event_log.event_count());
         println!("  Dangling edges:  {dangling} (must be 0)");
@@ -504,6 +510,9 @@ struct FailureOpts {
     max_nodes: Option<usize>,
     /// Emit a machine-readable working set instead of the human report.
     json: bool,
+    /// Propagate failure pressure in both edge directions (reach upstream causes
+    /// as well as downstream dependencies).
+    bidirectional: bool,
 }
 
 impl FailureOpts {
@@ -511,6 +520,7 @@ impl FailureOpts {
         let (mut snapshot, mut node, mut depth) = (None, None, 3u32);
         let mut max_nodes = None;
         let mut json = false;
+        let mut bidirectional = false;
         let mut positional = 0;
         let mut i = 0;
         while i < args.len() {
@@ -526,6 +536,7 @@ impl FailureOpts {
                     max_nodes = args.get(i).and_then(|v| v.parse().ok());
                 }
                 "--json" => json = true,
+                "--bidirectional" => bidirectional = true,
                 s if !s.starts_with("--") => {
                     if positional == 0 {
                         snapshot = Some(s.to_string());
@@ -544,6 +555,7 @@ impl FailureOpts {
             depth,
             max_nodes,
             json,
+            bidirectional,
         }
     }
 }
@@ -586,7 +598,11 @@ fn run_failure(opts: &FailureOpts) -> i32 {
 
     let nodes_before = graph.node_count();
     graph.set_failure_relevance(&origin, 0.95);
-    graph.propagate_failure(&origin, 0, opts.depth);
+    if opts.bidirectional {
+        graph.propagate_failure_bidirectional(&origin, 0, opts.depth);
+    } else {
+        graph.propagate_failure(&origin, 0, opts.depth);
+    }
 
     // Optionally constrain the working set to the top-K by score (failure
     // pressure has just lifted the causally-relevant subgraph, so eviction keeps
