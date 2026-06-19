@@ -30,6 +30,9 @@
 //!   logs) to JSON for cross-session replay and verification.
 //! - [`query`] — read-only causal queries (impact/cause walks, hot set, GraphML
 //!   export) behind the `top`, `blame` and `export` subcommands.
+//! - [`trace`] — the dynamic layer: parse `cargo test` / panic / backtrace output
+//!   into the source locations a crash touched (a direct symptom→cause path), to
+//!   seed a *context page fault* instead of a diffuse structural walk.
 //! - [`external_memory`] — a documented façade ([`external_memory::ExternalMemory`]
 //!   / [`external_memory::CcosMemory`]) an agent uses to treat CCOS as external
 //!   working memory: ingest source, signal failures, recall a bounded causal
@@ -59,6 +62,7 @@ pub mod memory;
 pub mod parser;
 pub mod persist;
 pub mod query;
+pub mod trace;
 pub mod util;
 
 // ── CCOS v0.3 — Autonomous Context Runtime ──────────────────────────
