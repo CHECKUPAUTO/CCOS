@@ -448,11 +448,12 @@ impl MemoryGraph {
     /// returns the number of edges added. Opt-in — callers invoke it after
     /// ingesting a set of files (see [`crate::external_memory`]).
     pub fn link_module_imports(&mut self) -> usize {
-        let mut module_to_file: HashMap<String, NodeId> = HashMap::new();
+        // (crate, intra-module path) → file node.
+        let mut index: HashMap<(String, String), NodeId> = HashMap::new();
         for id in self.nodes.keys() {
             if let Some(path) = id.0.strip_prefix("file:") {
-                if let Some(m) = module_path_of(path) {
-                    module_to_file.insert(m, id.clone());
+                if let Some(km) = crate_and_module(path) {
+                    index.insert(km, id.clone());
                 }
             }
         }
@@ -468,7 +469,8 @@ impl MemoryGraph {
             if !self.nodes.contains_key(&importer) {
                 continue;
             }
-            if let Some(target) = resolve_use(usepath, &module_to_file) {
+            let importer_crate = crate_and_module(file).map(|(c, _)| c).unwrap_or_default();
+            if let Some(target) = resolve_use(&importer_crate, usepath, &index) {
                 if target != importer {
                     to_add.push((importer, target));
                 }
@@ -681,13 +683,11 @@ pub struct GraphDiff {
     pub common_nodes: usize,
 }
 
-/// The `::`-joined module path of a source file, used by
-/// [`MemoryGraph::link_module_imports`]. `src/a/b.rs` → `a::b`; a leading `src/`
-/// is stripped; `mod.rs`/`lib.rs`/`main.rs` resolve to the parent module (the
-/// crate root, i.e. `None`, when there is no parent).
-fn module_path_of(file_path: &str) -> Option<String> {
-    let p = file_path.strip_prefix("src/").unwrap_or(file_path);
-    let p = p.strip_suffix(".rs")?;
+/// The `::`-joined intra-crate module path of a source file below a `src/` root.
+/// `a/b.rs` → `a::b`; `mod.rs`/`lib.rs`/`main.rs` → the parent (empty at the
+/// crate root). Used by [`crate_and_module`].
+fn module_of(after: &str) -> Option<String> {
+    let p = after.strip_suffix(".rs")?;
     let segs: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
     let last = *segs.last()?;
     let module = if matches!(last, "mod" | "lib" | "main") {
@@ -695,20 +695,61 @@ fn module_path_of(file_path: &str) -> Option<String> {
     } else {
         segs.join("::")
     };
-    (!module.is_empty()).then_some(module)
+    Some(module)
 }
 
-/// Resolve an import path to the defining file's node id by longest-prefix match
-/// against the known module paths (external paths like `std::io` match nothing).
-fn resolve_use(usepath: &str, module_to_file: &HashMap<String, NodeId>) -> Option<NodeId> {
-    let mut p = usepath;
-    for q in ["crate::", "self::", "super::"] {
-        p = p.strip_prefix(q).unwrap_or(p);
-    }
-    let segs: Vec<&str> = p.split("::").filter(|s| !s.is_empty()).collect();
-    (1..=segs.len()).rev().find_map(|len| {
-        let cand = segs[..len].join("::");
-        module_to_file.get(&cand).cloned()
+/// Split a file path into `(crate, intra-module)` for import resolution, robust to
+/// relative, absolute, and multi-crate-workspace layouts:
+/// `src/a/b.rs` → `("", "a::b")`; `/repo/src/a.rs` → `("repo", "a")`;
+/// `crates/grep-matcher/src/lib.rs` → `("grep_matcher", "")`. The crate is the
+/// directory name immediately above `src/` (`-` normalised to `_`), or `""` for a
+/// path that simply starts with `src/`.
+fn crate_and_module(file_path: &str) -> Option<(String, String)> {
+    let (krate, after) = if let Some(idx) = file_path.find("/src/") {
+        let krate = file_path[..idx]
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .replace('-', "_");
+        (krate, &file_path[idx + 5..])
+    } else if let Some(after) = file_path.strip_prefix("src/") {
+        (String::new(), after)
+    } else {
+        (String::new(), file_path)
+    };
+    Some((krate, module_of(after)?))
+}
+
+/// Resolve an import to the defining file's node id. `crate::`/`self::`/`super::`
+/// stay in the importer's crate (and require a real sub-module match); a leading
+/// crate name (e.g. `grep_matcher::…`) targets that crate and may resolve to its
+/// root (`lib.rs`). External paths like `std::io` match nothing.
+fn resolve_use(
+    importer_crate: &str,
+    usepath: &str,
+    index: &HashMap<(String, String), NodeId>,
+) -> Option<NodeId> {
+    let (target_crate, rest): (String, &str) = if let Some(r) = usepath
+        .strip_prefix("crate::")
+        .or_else(|| usepath.strip_prefix("self::"))
+        .or_else(|| usepath.strip_prefix("super::"))
+    {
+        (importer_crate.to_string(), r)
+    } else if matches!(usepath, "crate" | "self" | "super") {
+        (importer_crate.to_string(), "")
+    } else {
+        match usepath.split_once("::") {
+            Some((c, r)) => (c.to_string(), r),
+            None => (usepath.to_string(), ""),
+        }
+    };
+    let segs: Vec<&str> = rest.split("::").filter(|s| !s.is_empty()).collect();
+    // Same-crate imports must hit a real sub-module (len ≥ 1); cross-crate imports
+    // may resolve to the crate root (len 0) — depending on the crate as a whole.
+    let min_len = usize::from(target_crate == importer_crate);
+    (min_len..=segs.len()).rev().find_map(|len| {
+        let module = segs[..len].join("::");
+        index.get(&(target_crate.clone(), module)).cloned()
     })
 }
 
@@ -750,6 +791,36 @@ mod tests {
             .iter()
             .any(|e| e.source.0 == "file:src/repo.rs" && e.target.0 == "file:src/db.rs"));
         assert_eq!(g.link_module_imports(), 0, "idempotent");
+    }
+
+    #[test]
+    fn link_module_imports_handles_multi_crate_and_absolute_paths() {
+        let mut g = MemoryGraph::new(0.0, usize::MAX);
+        let node = |g: &mut MemoryGraph, id: &str| {
+            g.upsert_node(id.into(), "".into(), "".into(), NodeType::Module);
+        };
+        // Multi-crate workspace: core imports a sibling crate `util` (dir uses `-`).
+        node(&mut g, "file:crates/core/src/api.rs");
+        node(&mut g, "file:crates/grep-util/src/lib.rs");
+        node(&mut g, "use:crates/core/src/api.rs:grep_util::helper");
+        // Absolute-path mono-crate with an intra-crate import.
+        node(&mut g, "file:/repo/src/a.rs");
+        node(&mut g, "file:/repo/src/b.rs");
+        node(&mut g, "use:/repo/src/a.rs:crate::b");
+        g.link_module_imports();
+        assert!(
+            g.edges
+                .iter()
+                .any(|e| e.source.0 == "file:crates/core/src/api.rs"
+                    && e.target.0 == "file:crates/grep-util/src/lib.rs"),
+            "cross-crate import (grep_util ← grep-util dir) resolves to the crate root"
+        );
+        assert!(
+            g.edges
+                .iter()
+                .any(|e| e.source.0 == "file:/repo/src/a.rs" && e.target.0 == "file:/repo/src/b.rs"),
+            "absolute-path intra-crate import resolves"
+        );
     }
 
     #[test]
