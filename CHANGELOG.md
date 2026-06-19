@@ -8,6 +8,20 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Cross-file import linking** — `MemoryGraph::link_module_imports()` resolves
+  intra-crate imports (`use:<file>:<path>` nodes) into `file→file` dependency
+  edges by mapping each file to its module path and longest-prefix-matching the
+  import. The kernel previously connected causally-related files only through
+  shared `dep:` hubs, so failure propagation and region recall could not reach a
+  fix's cross-file cause; now they do (opt-in, idempotent; called by the external
+  memory façade on ingest). On a `db→repo→api` workspace, `recall(Around api.rs)`
+  returns the cause `db.rs` and excludes unrelated files, and injected failure
+  attenuates along the chain (0.85 → 0.78 → 0.65) above the 0.375 noise floor.
+- **Agent-loop demo** (`scripts/agent_demo.py`) — a runnable, stdlib-only demo of
+  CCOS as an agent's external memory: a bug whose cause is two lexically-distant
+  files away is recalled by the causal region (not by a top-k/lexical retriever).
+  Runs offline; uses a local Ollama model for the fix step if `OLLAMA_ENDPOINT` is
+  set.
 - **External memory interface** (`external_memory` module) — a single, documented
   façade (`ExternalMemory` trait + `CcosMemory`) an agent uses to treat CCOS as
   its external working memory, unifying the kernel's separate pieces (causal

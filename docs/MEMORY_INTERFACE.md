@@ -166,6 +166,12 @@ periodically:            checkpoint(); assert verify().valid
 file *and the causally-related files the fix is likely to touch*, within the token
 budget — the thing a flat top-k retriever misses.
 
+A runnable version of this loop is [`scripts/agent_demo.py`](../scripts/agent_demo.py):
+it ingests a small workspace whose bug's cause is two files away and lexically
+dissimilar, recalls the causal region, signals the failure, and (if
+`OLLAMA_ENDPOINT` is set) asks a local model to propose a fix. It runs offline —
+the value is observable without a model.
+
 ## Driving it from any language (`ccos memory`)
 
 The same façade is exposed as a **stdio JSON-Lines** command, so any language can
