@@ -262,6 +262,17 @@ def stdev(xs: list[float]) -> float:
     return math.sqrt(sum((x - m) ** 2 for x in xs) / (len(xs) - 1))
 
 
+def correlation(xs: list[float], ys: list[float]) -> float:
+    n = len(xs)
+    if n < 2:
+        return 0.0
+    mx, my = sum(xs) / n, sum(ys) / n
+    num = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    dx = math.sqrt(sum((x - mx) ** 2 for x in xs))
+    dy = math.sqrt(sum((y - my) ** 2 for y in ys))
+    return num / (dx * dy) if dx and dy else 0.0
+
+
 # --------------------------------------------------------------------------- #
 # Baseline: classical lexical RAG (TF-IDF cosine over file text). Same budget
 # (number of files) as the CCOS working set, so the comparison is apples-to-apples
@@ -399,6 +410,14 @@ def run(args: Args) -> list[dict]:
             # Lexical-RAG baseline over the same files, queried by the fault file.
             vecs = tfidf_vectors(read_sources(wt, args.subdir))
             origin_path = origin[len("file:") :]
+            # Lexical similarity of the seed to its targets: the thesis predicts
+            # CCOS's advantage should grow as this falls (a cause RAG can't see).
+            tgt_paths = [p for p in sc.target_files if f"file:{p}" != origin and p in vecs]
+            seed_sim = (
+                sum(_cosine(vecs[origin_path], vecs[p]) for p in tgt_paths) / len(tgt_paths)
+                if tgt_paths and origin_path in vecs
+                else None
+            )
             for k in args.ks:
                 res = failure_working_set(
                     args.ccos_bin,
@@ -426,6 +445,7 @@ def run(args: Args) -> list[dict]:
                     "depth": args.depth,
                     "r_cov": round(cov, 4),
                     "r_cov_rag": round(cov_rag, 4),
+                    "seed_target_sim": (round(seed_sim, 4) if seed_sim is not None else None),
                     "files_in_window": len(ccos_files),
                     "working_set_size": res["working_set_size"],
                     "nodes_before": res["nodes_before"],
@@ -474,7 +494,27 @@ def summarise(records: list[dict], ks: list[int]) -> None:
             f"{gm:>6.3f} ±{stdev(g):.3f} (±{gse:.3f})  {cm - gm:>+7.3f}  {win:>4.0%}"
         )
     print("\n(equal file budget per scenario; Δ>0 means causal selection covers")
-    print(" the fix's files better than lexical similarity. End.)")
+    print(" the fix's files better than lexical similarity.)")
+
+    # Thesis check: does CCOS's advantage grow when the seed is lexically far from
+    # its targets (a cause RAG cannot see)? Use the largest budget per scenario.
+    kmax = max(ks)
+    rows = [
+        r
+        for r in records
+        if r["k"] == kmax and r.get("seed_target_sim") is not None
+    ]
+    if len(rows) >= 4:
+        sims = [r["seed_target_sim"] for r in rows]
+        deltas = [r["r_cov"] - r.get("r_cov_rag", 0.0) for r in rows]
+        med = sorted(sims)[len(sims) // 2]
+        lo = [d for s, d in zip(sims, deltas) if s < med]
+        hi = [d for s, d in zip(sims, deltas) if s >= med]
+        print(f"\nThesis check (K={kmax}, n={len(rows)}): Δ(CCOS−RAG) vs seed↔target lexical sim")
+        print(f"  seed FAR  from targets (sim<{med:.3f}, n={len(lo)}):  mean Δ = {sum(lo) / max(len(lo), 1):+.3f}")
+        print(f"  seed NEAR to  targets (sim≥{med:.3f}, n={len(hi)}):  mean Δ = {sum(hi) / max(len(hi), 1):+.3f}")
+        print(f"  corr(sim, Δ) = {correlation(sims, deltas):+.3f}  (thesis predicts negative)")
+    print("End.")
 
 
 def parse_args(argv: list[str]) -> Args:
