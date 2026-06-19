@@ -61,26 +61,35 @@ Robustness: every subprocess is timed out and captured; a scenario that fails to
 analyze, or whose changed files aren't graph nodes, is skipped (not fatal);
 worktrees are always cleaned up.
 
-## First findings (and caveats)
+## First findings — and the improvement they drove
 
-Run against **this** repository (a young prototype) the harness finds only a
-handful of qualifying commits, and reports `R_cov ≈ 0.30` (geometric mean),
-**flat across K** — in every scenario only the seed file is recovered.
+Run against **this** repository (a young prototype), the harness finds only a
+handful of qualifying commits. The first run exposed a real limitation and the
+fix for it is itself measured here — the loop earning its keep.
 
-That is a genuine, non-trivial result, not a rigged one:
+**Baseline (downstream-only propagation):** `R_cov ≈ 0.30`, **flat across K** —
+in every scenario only the seed file is recovered (`R_cov = 1/|F_target|`). The
+cause was structural: co-changed files are typically *upstream importers* of the
+fault node, linked only through `dep:` hubs, whereas `propagate_failure` walked
+`source → target` only, so the pressure never reached them.
 
-* **It is honest.** Coverage equals `1/|F_target|` every time — CCOS recovers
-  the fault file but **none** of its co-changed siblings within budget.
-* **It localises a real limitation.** Co-changed files are typically *upstream
-  importers* linked only through dependency hubs (`dep:crate`), whereas failure
-  pressure currently flows **downstream only** (`propagate_failure` walks
-  `source → target`). So the metric is measuring a direction mismatch, and it
-  hands Phase 3 a concrete hypothesis to test: propagate (or also propagate)
-  *upstream* toward causes — the direction `ccos blame`'s `source_set` already
-  walks.
-* **The sample is far too small to conclude anything** (`n ≈ 3`). This
-  methodology is SWE-bench-shaped: it only becomes meaningful on a large, mature
-  codebase with many real fix commits. Point `--repo` at one.
+**Fix:** (a) `ccos analyze` now resolves intra-crate imports into `file→file`
+edges (`link_module_imports`), and (b) `ccos failure --bidirectional` propagates
+pressure in both directions (`propagate_failure_bidirectional`). Re-running with
+`--bidirectional`:
 
-In other words: the loop works, the measurement is falsifiable, and it already
-earns its keep by surfacing a testable improvement instead of a vanity number.
+| K | downstream-only | bidirectional |
+| --- | --- | --- |
+| 20  | 0.333 | 0.278 |
+| 50  | 0.333 | **0.444** |
+| 100 | 0.333 | **0.611** (33% fully covered) |
+
+So bidirectional propagation roughly **doubles coverage at a moderate/large
+budget**, at the cost of **diluting** it at a very tight one (`K=20`): marking
+neighbours on both sides floods a small working set and can evict a target. A
+real, falsifiable trade-off — exactly what the harness is for.
+
+**Caveat, unchanged:** `n ≈ 3` is far too small to conclude anything. This
+methodology is SWE-bench-shaped; it only becomes meaningful on a large, mature
+codebase with many fix commits. Point `--repo` at one and re-run with and without
+`--bidirectional`.

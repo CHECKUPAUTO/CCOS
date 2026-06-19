@@ -560,9 +560,10 @@ impl FailureOpts {
     }
 }
 
-/// `ccos failure <snapshot.json> <node-id> [--depth N] [--max-nodes K] [--json]`
-/// — inject a fault at a node and propagate it across the causal graph, reporting
-/// the affected neighborhood ranked by resulting failure relevance.
+/// `ccos failure <snapshot.json> <node-id> [--depth N] [--max-nodes K]
+/// [--bidirectional] [--json]` — inject a fault at a node and propagate it across
+/// the causal graph, reporting the affected neighborhood ranked by failure
+/// relevance. `--bidirectional` also reaches upstream causes (callers/importers).
 ///
 /// With `--max-nodes K` the graph is re-paged to the budget *after* injection,
 /// so the survivors are the bounded **WorkingSet_K**; with `--json` that working
@@ -573,7 +574,7 @@ impl FailureOpts {
 fn run_failure(opts: &FailureOpts) -> i32 {
     let (Some(file), Some(node_id)) = (opts.snapshot.as_deref(), opts.node.as_deref()) else {
         eprintln!(
-            "usage: ccos failure <snapshot.json> <node-id> [--depth N] [--max-nodes K] [--json]"
+            "usage: ccos failure <snapshot.json> <node-id> [--depth N] [--max-nodes K] [--bidirectional] [--json]"
         );
         return 2;
     };
@@ -1679,7 +1680,7 @@ COMMANDS:\n\
     replay <snapshot.json>     Deterministically replay a saved event log\n\
     diff <a.json> <b.json>     Structural diff between two snapshots (+ score drift)\n\
     failure <snap> <node-id>   Inject a fault at a node and propagate it (--depth N,\n\
-    \x20                          --max-nodes K for the bounded WorkingSet_K, --json)\n\
+    \x20                          --max-nodes K, --bidirectional, --json)\n\
     chaos [--iters N]          Fuzz the guard with adversarial payloads\n\
 \n\
   Inspection & export:\n\

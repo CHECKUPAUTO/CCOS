@@ -8,6 +8,14 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Bidirectional failure propagation** — `MemoryGraph::propagate_failure_bidirectional`
+  / `ccos failure --bidirectional` spread failure pressure to *upstream causes*
+  (callers/importers) as well as downstream dependencies, and `ccos analyze` now
+  links cross-file imports into the snapshot it writes. Measured on the
+  causal-validation harness over this repo's Git history, `R_cov` rose from a flat
+  `0.33` (downstream-only) to `0.44` (`K=50`) / `0.61` (`K=100`, a third of
+  scenarios fully covered), while diluting to `0.28` at a tight `K=20` — an honest
+  trade-off (see `scripts/causal_validation/README.md`).
 - **Cross-file import linking** — `MemoryGraph::link_module_imports()` resolves
   intra-crate imports (`use:<file>:<path>` nodes) into `file→file` dependency
   edges by mapping each file to its module path and longest-prefix-matching the

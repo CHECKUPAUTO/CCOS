@@ -516,9 +516,18 @@ RAG~\cite{lewis2020rag} (top-$k$ cosine over chunks), GraphRAG~\cite{edge2024gra
 paged memory), a LangGraph~\cite{langgraph} agent with a vector store, and CCOS
 regions. Metrics: resolved-rate, input tokens to success, and a citation-grounding
 hallucination rate checked against the ground-truth graph. We have begun this on
-real history: \code{scripts/causal\_validation} mines fix commits, injects each
-fault, and scores the bounded working set's coverage of the files the fix touched
-(\S\ref{sec:eval}).
+real history: \code{scripts/causal\_validation} mines fix commits, checks out the
+pre-fix tree, injects the fault, and scores $R_{\mathrm{cov}} = |F_{\mathrm{target}}
+\cap \mathrm{WorkingSet}_K| / |F_{\mathrm{target}}|$ --- the fraction of the files
+a fix touched that the bounded working set recovers. On this repository's history
+the first run exposed a limitation and its fix, both measured: with downstream-only
+failure propagation $R_{\mathrm{cov}}$ was flat at $0.33$ (only the seed file
+recovered, as co-changed files are \emph{upstream} importers reached only through
+dependency hubs); resolving intra-crate imports into file$\to$file edges and
+propagating failure \emph{bidirectionally} raised it to $0.44$ ($K{=}50$) and
+$0.61$ ($K{=}100$, a third of scenarios fully covered), while \emph{diluting} it
+at a tight budget ($0.28$ at $K{=}20$) --- a real trade-off on $n{=}3$ mined
+commits (too few to generalise; the protocol is built to run on a mature repo).
 
 \paragraph{Hypotheses.}
 \textbf{H1} (efficiency): CCOS reaches equal task success at fewer input tokens
