@@ -24,6 +24,30 @@ Coding agents drown in context. CCOS reframes context management as an operating
 | Fault handling        | Failure detection → weighted propagation across edges    |
 | Syscall validation    | `GuardLayer` over every LLM response                     |
 
+## What the research found — honestly
+
+CCOS began as a bet that organising memory by **causal regions** would retrieve
+long-horizon context *better than RAG*. We built a validation harness to test that
+on real bugs — and the bet did not pay off:
+
+- On **70 real bug-fix commits** across `fd`, `bat`, `hyperfine`, causal selection
+  **ties a plain lexical TF-IDF retriever** at putting a fix's files in the window,
+  and **loses at a tight budget**. On real code a fix's files share vocabulary, so
+  lexical similarity finds them too.
+- A crash-trace pivot (seed CCOS from a panic backtrace) is **beaten by
+  RAG-over-the-error-message** — Rust error messages name the cause.
+
+We report this rather than bury it (see [`scripts/causal_validation/`](scripts/causal_validation/)
+and the [paper](docs/paper/)). It relocates CCOS's value:
+
+> **Not a better retriever — a _deterministic, replayable, auditable_ agent
+> memory.** Every cognitive operation is event-sourced and hash-chained, so you can
+> **rewind an agent's exact context state** to any step and **replay it under
+> different parameters** (_time-travel debugging_, `agent_session`) — a capability a
+> probabilistic RAG/framework stack structurally lacks. Whether that, or a
+> structured-context advantage at generation time, yields a downstream win is open
+> (Phase 4).
+
 ## Architecture
 
 ```

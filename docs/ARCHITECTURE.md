@@ -19,6 +19,8 @@ A practical map of the codebase for contributors. For the conceptual write-up se
 | `persist`                   | Save/load a kernel snapshot (one file) | `KernelSnapshot` |
 | `query`                     | Read-only causal queries: impact/cause walks, hot set, GraphML export | `Reached`, `Direction`, `impact_set`, `source_set`, `hot_set`, `to_graphml` |
 | **`external_memory`**       | Documented façade: agent-facing external working memory (ingest / recall / signal-failure / checkpoint) over the kernel. See [`MEMORY_INTERFACE.md`](MEMORY_INTERFACE.md) | `ExternalMemory`, `CcosMemory`, `Recall`, `RecallWindow`, `MemoryError` |
+| **`agent_session`**         | Event-sourced cognitive timeline: record ops, `replay_to(step)` (deterministic), `recall_what_if(…)` (time-travel debugging) | `AgentSession` |
+| **`trace`**                 | Parse `cargo test`/panic/backtrace into the crash's source locations (dynamic layer) | `parse_cargo_test_output`, `ExecutionTrace`, `TraceHit` |
 | **`region_engine`** (v0.3)  | Clusters the graph into spatial regions; activation → context window; deterministic replay | `ContextRegionEngine`, `ContextWindow`, `RegionQuery` |
 | **`context_region`** (v0.3) | Spatial-memory data model (3-D embedding, temperature, density) | `ContextRegion`, `ContextPoint` |
 | **`context_policy`** (v0.3) | Dynamic context-admission score (replaces the static threshold) | `ContextPolicy` |

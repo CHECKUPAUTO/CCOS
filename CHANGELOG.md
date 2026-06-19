@@ -6,8 +6,28 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Repositioned, honestly.** Measurements refute "causal regions retrieve better
+  than RAG": on 70 real bug-fix commits causal selection ties (and at a tight
+  budget loses to) a lexical TF-IDF retriever, and the crash-trace pivot is beaten
+  by RAG-over-the-error-message. CCOS's contribution is relocated from *retrieval*
+  to a **deterministic, replayable, auditable** agent memory. README and the paper
+  (title, abstract, contributions, new time-travel section, conclusion) rewritten
+  accordingly.
+
 ### Added
 
+- **Event-sourced agent session** (`agent_session` module) — `AgentSession`
+  records every cognitive op (ingest / failure / recall) as a timeline;
+  `replay_to(step)` reconstructs the exact state, and `recall_what_if(step, q, b)`
+  re-runs a recall under different parameters: **time-travel debugging** for an
+  agent's context, the capability a probabilistic retrieval stack lacks.
+- **`ccos trace`** + **module-hierarchy linking** — parse `cargo test` / panic /
+  backtrace (stdin) into the crash's source files (`trace` module); and
+  `link_module_imports` now adds parent→sub-module edges so sub-modules reached
+  only via a re-export aren't orphaned. (Both from the crash-trace pivot PoC, whose
+  verdict was that RAG-over-the-error-message still wins.)
 - **Phase-4 prototype** (`scripts/phase4_eval.py`) — the *sufficient*-condition
   harness: for a real single-file fix it builds the agent's context two ways at an
   equal token budget (CCOS causal region vs lexical-RAG top files), asks a model
