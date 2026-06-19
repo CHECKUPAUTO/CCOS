@@ -316,7 +316,7 @@ fn serve_session(mut session: AgentSession) {
                 let mutated = is_mutating_call(&msg);
                 let resp = handle(&mut session, &msg);
                 if mutated {
-                    persist(&session);
+                    persist(&mut session);
                 }
                 resp
             }
@@ -331,7 +331,7 @@ fn serve_session(mut session: AgentSession) {
             let _ = out.flush();
         }
     }
-    persist(&session); // final checkpoint at close (no-op when no path is bound)
+    persist(&mut session); // final checkpoint at close (no-op when no path is bound)
 }
 
 /// True iff the message is a `tools/call` to a state-changing tool.
@@ -349,7 +349,7 @@ fn is_mutating_call(msg: &Value) -> bool {
 
 /// Checkpoint the session, best-effort: silent when no path is bound, a stderr
 /// line on a real IO/serialisation error (stdout is reserved for JSON-RPC).
-fn persist(session: &AgentSession) {
+fn persist(session: &mut AgentSession) {
     use crate::external_memory::MemoryError;
     match session.checkpoint() {
         Ok(()) | Err(MemoryError::NoPath) => {}

@@ -65,13 +65,17 @@ enum Op {
 }
 
 /// The on-disk timeline sidecar (`<workspace>.oplog`): the replay **baseline**
-/// the session started from, plus the ordered op-log. Persisting both lets the
+/// the session started from, the ordered op-log, and the number of older ops
+/// already folded into the baseline by compaction. Persisting these lets the
 /// whole cognitive timeline — not just the memory snapshot — survive a restart,
 /// so [`replay_to`](AgentSession::replay_to) / time-travel work across runs.
 #[derive(Serialize, Deserialize)]
 struct PersistedTimeline {
     baseline: Option<String>,
     ops: Vec<Op>,
+    /// Ops folded into `baseline` by compaction (absent in pre-compaction logs).
+    #[serde(default)]
+    folded: usize,
 }
 
 /// An event-sourced agent memory session: every operation is recorded so the
@@ -84,7 +88,13 @@ pub struct AgentSession {
     /// session [`open`](Self::open)ed from a checkpoint carries either the state
     /// it was seeded from (so [`replay_to`](Self::replay_to) layers the timeline
     /// on top of it) or `None` when the op-log reproduces the memory from empty.
+    /// Compaction also folds older ops into this baseline.
     baseline: Option<String>,
+    /// Number of older ops folded into `baseline` by [`compact`](Self::compact).
+    /// Timeline indices stay absolute: logical length is `folded + ops.len()`, and
+    /// a `replay_to(step)` for `step <= folded` collapses to the baseline (the
+    /// compaction floor). Keeps the op-log bounded for a long-running daemon.
+    folded: usize,
     /// Where the timeline sidecar lives (`<workspace>.oplog`); `None` for an
     /// in-memory [`new`](Self::new) session.
     oplog_path: Option<PathBuf>,
@@ -103,6 +113,7 @@ impl AgentSession {
             live: CcosMemory::new(),
             ops: Vec::new(),
             baseline: None,
+            folded: 0,
             oplog_path: None,
         }
     }
@@ -135,6 +146,7 @@ impl AgentSession {
                 live,
                 ops: t.ops,
                 baseline: t.baseline,
+                folded: t.folded,
                 oplog_path: Some(oplog_path),
             },
             None => {
@@ -143,6 +155,7 @@ impl AgentSession {
                     live,
                     ops: Vec::new(),
                     baseline,
+                    folded: 0,
                     oplog_path: Some(oplog_path),
                 }
             }
@@ -153,32 +166,69 @@ impl AgentSession {
         if !session.ops.is_empty() && !session.timeline_reproduces_memory() {
             session.baseline = Some(session.live.to_json()?);
             session.ops.clear();
+            session.folded = 0;
         }
         Ok(session)
     }
 
-    /// Persist the live memory **and** the cognitive timeline. The memory snapshot
-    /// goes to the bound checkpoint path (shared with `ccos memory`); the baseline
-    /// and op-log go to the `<path>.oplog` sidecar, so the whole timeline survives
-    /// a restart. Returns [`MemoryError::NoPath`] for an in-memory `new` session
-    /// (the caller can treat that as a no-op).
-    pub fn checkpoint(&self) -> Result<(), MemoryError> {
+    /// Persist the live memory **and** the cognitive timeline. First **compacts**
+    /// the op-log if it has grown past the threshold (so a long-running daemon
+    /// stays bounded), then writes the memory snapshot to the bound checkpoint path
+    /// (shared with `ccos memory`) and the baseline + op-log to the `<path>.oplog`
+    /// sidecar. Returns [`MemoryError::NoPath`] for an in-memory `new` session (the
+    /// caller can treat that as a no-op).
+    pub fn checkpoint(&mut self) -> Result<(), MemoryError> {
+        self.compact_if_needed();
         self.live.checkpoint()?;
         if let Some(p) = &self.oplog_path {
             let timeline = PersistedTimeline {
                 baseline: self.baseline.clone(),
                 ops: self.ops.clone(),
+                folded: self.folded,
             };
             std::fs::write(p, serde_json::to_string(&timeline)?)?;
         }
         Ok(())
     }
 
+    /// Fold all but the most recent `keep` operations into the baseline snapshot,
+    /// bounding the op-log. The live memory is unchanged — only the *representation*
+    /// of the timeline (a newer baseline plus a shorter tail). Recent rewind depth
+    /// (the last `keep` ops) is preserved; [`replay_to`](Self::replay_to) below the
+    /// new floor collapses to the baseline. A no-op when `ops.len() <= keep`.
+    pub fn compact(&mut self, keep: usize) {
+        if self.ops.len() <= keep {
+            return;
+        }
+        let fold = self.ops.len() - keep;
+        let floor = self.replay_to(self.folded + fold);
+        if let Ok(snapshot) = floor.to_json() {
+            self.baseline = Some(snapshot);
+            self.ops.drain(0..fold);
+            self.folded += fold;
+        }
+    }
+
+    /// Compact when the op-log exceeds `CCOS_OPLOG_MAX` (default 512), folding down
+    /// to `CCOS_OPLOG_KEEP` (default 128) retained ops. `CCOS_OPLOG_MAX=0` disables.
+    fn compact_if_needed(&mut self) {
+        let env = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+        };
+        let (max, keep) = (env("CCOS_OPLOG_MAX", 512), env("CCOS_OPLOG_KEEP", 128));
+        if max > 0 && self.ops.len() > max {
+            self.compact(keep);
+        }
+    }
+
     /// Whether replaying the recorded op-log on top of the baseline reproduces the
     /// live memory's structure (nodes/edges/files) — the invariant `open` checks
     /// before trusting a restored timeline.
     fn timeline_reproduces_memory(&self) -> bool {
-        let replayed = self.replay_to(self.ops.len());
+        let replayed = self.replay_to(self.len());
         let (a, b) = (replayed.stats(), self.live.stats());
         a.nodes == b.nodes && a.edges == b.edges && a.files == b.files
     }
@@ -228,14 +278,16 @@ impl AgentSession {
         window
     }
 
-    /// Number of recorded operations (timeline length).
+    /// Logical timeline length: ops recorded **plus** those already folded into the
+    /// baseline by compaction. Stays stable across a compaction (the floor rises,
+    /// the tail shrinks), so absolute `step` indices keep their meaning.
     pub fn len(&self) -> usize {
-        self.ops.len()
+        self.folded + self.ops.len()
     }
 
     /// Whether nothing has been recorded yet.
     pub fn is_empty(&self) -> bool {
-        self.ops.is_empty()
+        self.len() == 0
     }
 
     /// Read-only access to the live memory.
@@ -244,15 +296,20 @@ impl AgentSession {
     }
 
     /// Deterministically reconstruct the memory state after the first `step`
-    /// operations (replaying only the mutating ones) on top of the session's
-    /// baseline (empty for a [`new`](Self::new) session, the loaded checkpoint
-    /// for an [`open`](Self::open)ed one). `step >= len()` replays all.
+    /// (logical) operations, replaying the mutating ones on top of the session's
+    /// baseline (empty for a [`new`](Self::new) session, the loaded checkpoint or a
+    /// compaction floor for an [`open`](Self::open)ed one). `step` is clamped to
+    /// [`len`](Self::len); a `step` at or below the compaction floor returns the
+    /// baseline (older history has been folded in and is no longer separable).
     pub fn replay_to(&self, step: usize) -> CcosMemory {
         let mut m = match &self.baseline {
             Some(snapshot) => CcosMemory::from_json(snapshot).unwrap_or_default(),
             None => CcosMemory::new(),
         };
-        for op in self.ops.iter().take(step) {
+        // Map the logical step onto the retained tail (everything <= folded is the
+        // baseline already).
+        let tail = step.min(self.len()).saturating_sub(self.folded);
+        for op in self.ops.iter().take(tail) {
             match op {
                 Op::Ingest { uri, source } => {
                     m.ingest_source(uri, source);
@@ -271,33 +328,38 @@ impl AgentSession {
         m
     }
 
-    /// **Time-travel what-if**: rewind to just before operation `step`, then run a
-    /// recall with (possibly) different parameters — does the agent get a better
-    /// window? `step` is clamped to the timeline length.
+    /// **Time-travel what-if**: rewind to just before (logical) operation `step`,
+    /// then run a recall with (possibly) different parameters — does the agent get
+    /// a better window? `step` is clamped to the timeline length.
     pub fn recall_what_if(&self, step: usize, recall: &Recall, budget: usize) -> RecallWindow {
-        self.replay_to(step.min(self.ops.len()))
-            .recall(recall, budget)
+        self.replay_to(step).recall(recall, budget)
     }
 
-    /// A human-readable journal of the cognitive timeline.
+    /// A human-readable journal of the cognitive timeline. If compaction has folded
+    /// older ops into the baseline, a leading marker stands in for them (their
+    /// details are no longer retained); the live tail follows at its absolute step.
     pub fn timeline(&self) -> Vec<String> {
-        self.ops
-            .iter()
-            .enumerate()
-            .map(|(i, op)| {
-                let t = i + 1;
-                match op {
-                    Op::Ingest { uri, .. } => format!("t={t}  Ingest({uri})"),
-                    Op::Failure { node, depth } => {
-                        format!("t={t}  SignalFailure({node}, depth={depth})")
-                    }
-                    Op::Recall { recall, budget } => {
-                        format!("t={t}  Recall({recall:?}, budget={budget})")
-                    }
-                    Op::PageFault { files } => format!("t={t}  PageFault(files={files:?})"),
+        let mut out = Vec::new();
+        if self.folded > 0 {
+            out.push(format!(
+                "t≤{}  «{} earlier operation(s) compacted into the baseline»",
+                self.folded, self.folded
+            ));
+        }
+        out.extend(self.ops.iter().enumerate().map(|(i, op)| {
+            let t = self.folded + i + 1;
+            match op {
+                Op::Ingest { uri, .. } => format!("t={t}  Ingest({uri})"),
+                Op::Failure { node, depth } => {
+                    format!("t={t}  SignalFailure({node}, depth={depth})")
                 }
-            })
-            .collect()
+                Op::Recall { recall, budget } => {
+                    format!("t={t}  Recall({recall:?}, budget={budget})")
+                }
+                Op::PageFault { files } => format!("t={t}  PageFault(files={files:?})"),
+            }
+        }));
+        out
     }
 }
 
@@ -483,8 +545,70 @@ mod tests {
 
     #[test]
     fn new_session_has_no_checkpoint_path() {
-        let s = AgentSession::new();
+        let mut s = AgentSession::new();
         assert!(matches!(s.checkpoint(), Err(MemoryError::NoPath)));
+    }
+
+    /// Compaction bounds the op-log by folding older ops into the baseline, while
+    /// keeping logical indices, recent rewind depth, and the live memory intact.
+    #[test]
+    fn compaction_bounds_the_log_and_preserves_recent_replay() {
+        let mut s = AgentSession::new();
+        for i in 0..10 {
+            s.ingest(&format!("src/f{i}.rs"), &format!("pub fn f{i}() {{}}\n"));
+        }
+        let (full_files, len_before, at7) = (
+            s.memory().stats().files,
+            s.len(),
+            s.replay_to(7).stats().files,
+        );
+
+        s.compact(4); // fold the oldest 6, keep the last 4
+
+        assert_eq!(s.len(), len_before, "logical length is stable");
+        assert_eq!(s.ops.len(), 4, "op-log bounded to the retained tail");
+        assert_eq!(s.folded, 6);
+        assert_eq!(
+            s.memory().stats().files,
+            full_files,
+            "live memory untouched"
+        );
+        // Replays in the retained tail are exact; the full replay matches live.
+        assert_eq!(s.replay_to(7).stats().files, at7);
+        assert_eq!(s.replay_to(s.len()).stats().nodes, s.memory().stats().nodes);
+        // A step below the floor collapses to the floor (the folded baseline).
+        assert_eq!(s.replay_to(2).stats().files, s.replay_to(6).stats().files);
+        assert!(
+            s.timeline()[0].contains("compacted"),
+            "journal notes the fold"
+        );
+    }
+
+    /// A compacted timeline (folded count + tail) survives a restart.
+    #[test]
+    fn compaction_survives_restart() {
+        let path = tmp("ccos-sess-compact");
+        cleanup(&path);
+        {
+            let mut s = AgentSession::open(&path).unwrap();
+            for i in 0..8 {
+                s.ingest(&format!("src/f{i}.rs"), &format!("pub fn f{i}() {{}}\n"));
+            }
+            s.compact(3); // folded = 5, tail = 3
+            assert_eq!(s.len(), 8);
+            s.checkpoint().unwrap();
+        }
+        let s2 = AgentSession::open(&path).unwrap();
+        assert_eq!(s2.len(), 8, "logical length survives compaction + restart");
+        assert_eq!(s2.memory().stats().files, 8);
+        assert!(s2.memory().verify().valid);
+        assert_eq!(
+            s2.replay_to(s2.len()).stats().nodes,
+            s2.memory().stats().nodes,
+            "restored timeline still reproduces the memory"
+        );
+        assert!(s2.timeline()[0].contains("compacted"));
+        cleanup(&path);
     }
 
     /// A unique temp path for a persistence test.

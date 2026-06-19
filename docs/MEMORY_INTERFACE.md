@@ -281,6 +281,15 @@ was changed out-of-band (e.g. by a `ccos memory` run that doesn't touch the side
 the snapshot wins and the timeline resets from it — the memory is never corrupted by
 a stale log.
 
+To keep a long-running daemon bounded, the op-log **compacts**: once it grows past
+`CCOS_OPLOG_MAX` operations (default 512) the oldest are folded into the baseline,
+keeping the most recent `CCOS_OPLOG_KEEP` (default 128) individually replayable
+(`CCOS_OPLOG_MAX=0` disables it). Compaction is index-stable — logical step numbers
+never shift, so `recall_what_if(step=…)` keeps referring to the same moment — and
+lossless for the *memory* (the live state is untouched); it only trades away the
+ability to rewind *below the floor* (steps older than the retained tail collapse to
+the baseline). So time-travel depth is bounded, memory and replay-to-now are not.
+
 Point an MCP client's **stdio transport** at the binary. For example, a client
 config entry:
 
@@ -329,6 +338,11 @@ printf '%s\n' \
   network/HTTP server is not included, but would layer on the same trait.
 - An MCP workspace persists in two files: `workspace.ccos` (the memory snapshot,
   shared with `ccos memory`) and `workspace.ccos.oplog` (the timeline sidecar, so
-  time-travel spans restarts). The op-log is rewritten in full on each checkpoint
-  (not an incremental append), which is fine for interactive histories but not for an
-  unbounded long-running log; periodic compaction would be the next step.
+  time-travel spans restarts). The op-log compacts to stay bounded in operation count
+  (`CCOS_OPLOG_MAX`/`CCOS_OPLOG_KEEP`); its baseline is a workspace-sized snapshot, so
+  the sidecar is ~the snapshot's size, not the history's. The whole sidecar is still
+  rewritten on each checkpoint (not an incremental append) — fine at interactive
+  cadence, not for a very high-frequency write loop.
+- Compaction discards the *details* of folded ops to bound storage, so you cannot
+  rewind below the floor (older than the retained tail). The memory and replay-to-now
+  are unaffected; only deep historical time-travel is traded away.

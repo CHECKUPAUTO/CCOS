@@ -38,9 +38,13 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   persists too** in a `<workspace>.oplog` sidecar (the op-log plus its replay
   baseline), so `timeline` / `recall_what_if` time-travel spans the whole recorded
   history **across restarts**; a stale sidecar that no longer reproduces the snapshot
-  self-heals to the snapshot (the memory is never corrupted by a stale log). Point a
-  client's stdio transport at it: `{"command":"ccos","args":["mcp","workspace.ccos"]}`.
-  See [`MEMORY_INTERFACE.md`](docs/MEMORY_INTERFACE.md#serving-over-mcp-ccos-mcp).
+  self-heals to the snapshot (the memory is never corrupted by a stale log). The
+  op-log **compacts** to stay bounded for a long-running daemon — older ops fold into
+  the baseline past `CCOS_OPLOG_MAX` (default 512), keeping the last `CCOS_OPLOG_KEEP`
+  (default 128) replayable; compaction is index-stable and never touches the live
+  memory (only deep historical rewind is traded away). Point a client's stdio
+  transport at it: `{"command":"ccos","args":["mcp","workspace.ccos"]}`. See
+  [`MEMORY_INTERFACE.md`](docs/MEMORY_INTERFACE.md#serving-over-mcp-ccos-mcp).
 - **Time-travel debugging demo** (`examples/time_travel.rs`, `cargo run --example
   time_travel`) — an agent session that drifts (a tight-budget recall evicts the
   cause two hops away), then is debugged by rewinding to the exact recall and
