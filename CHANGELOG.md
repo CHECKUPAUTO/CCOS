@@ -16,7 +16,9 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`WorkingSet` / `Around` region-anchored / `Task` lexical), `verify`, `stats`,
   `checkpoint` (+ inherent `open`, `impact`/`causes`, `tick`). Deterministic
   recall, tamper-evident persistence that round-trips, all result types
-  `Serialize` (ready for a server/CLI layer). Reference guide in
+  `Serialize`. Also exposed as **`ccos memory`** — a stdio JSON-Lines command
+  (one request per line → one JSON response) so any language can use CCOS as
+  memory via a subprocess, no server required. Reference guide in
   [`docs/MEMORY_INTERFACE.md`](docs/MEMORY_INTERFACE.md); 5 tests + a doctest.
 - **`ccos eval --model M`** + live progress — override the active provider's model
   from the CLI (defaults to a local Ollama server if no provider env is set), and

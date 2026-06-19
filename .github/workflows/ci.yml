@@ -75,4 +75,5 @@ jobs:
           cargo run --locked -- regions src --metrics file:src/lib.rs --json
           cargo run --locked -- experiment --tasks 60
           cargo run --locked -- eval --tasks 4
+          printf '%s\n' '{"op":"ingest","uri":"src/x.rs","source":"pub fn x() {}"}' '{"op":"recall","strategy":"working_set","budget":512}' '{"op":"verify"}' | cargo run --locked -- memory --path /tmp/mem.ccos
           cargo run --locked -- chaos --iters 500

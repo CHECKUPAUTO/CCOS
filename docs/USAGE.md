@@ -250,6 +250,25 @@ cargo run -- runtime src --state data --budget 2048
 
 See [`../CCOS_v0.3_REPORT.md`](../CCOS_v0.3_REPORT.md) for the full v0.3 report.
 
+### `memory` — external-memory façade (stdio JSON)
+
+Use CCOS as an agent's external working memory from any language: one JSON
+request per line on stdin, one JSON response per line on stdout. The workspace is
+loaded from `--path` (default `workspace.ccos`) and checkpointed back on mutation.
+
+```bash
+printf '%s\n' \
+  '{"op":"ingest","uri":"src/db.rs","source":"pub fn query() {}"}' \
+  '{"op":"failure","node":"file:src/db.rs","depth":3}' \
+  '{"op":"recall","strategy":"around","anchor":"file:src/db.rs","budget":2048}' \
+  '{"op":"verify"}' \
+  | ccos memory --path workspace.ccos
+```
+
+Ops: `ingest`, `failure`, `recall` (`strategy` ∈ `around`/`task`/`working_set`),
+`impact`, `causes`, `verify`, `stats`. Full contract and a Python example:
+[`MEMORY_INTERFACE.md`](MEMORY_INTERFACE.md).
+
 ---
 
 ## End-to-end walkthrough

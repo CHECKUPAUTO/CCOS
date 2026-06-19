@@ -7,6 +7,7 @@ use ccos::distributed_event_log::DistributedEventLog;
 use ccos::eval::{run_eval, EvalConfig};
 use ccos::event_log::{EventLog, EventPayload, EventReplayer, EventType, GraphReconstructor};
 use ccos::experiment::{run_experiment, ExperimentConfig};
+use ccos::external_memory::{CcosMemory, ExternalMemory, Recall};
 use ccos::guard::{GuardConfig, GuardLayer};
 use ccos::incremental::IncrementalGraphEngine;
 use ccos::memory::{MemoryGraph, NodeId, ScoringWeights};
@@ -52,6 +53,7 @@ async fn main() {
         "regions" => run_regions(&RegionsOpts::parse(rest)),
         "experiment" => run_experiment_cmd(rest),
         "eval" => run_eval_cmd(rest).await,
+        "memory" => run_memory_cmd(rest),
         // ── CCOS v0.3 — Autonomous Context Runtime ──────────────────
         "scan" => commands_runtime::run_scan(rest).await,
         "agents" => commands_runtime::run_agents(rest).await,
@@ -1345,6 +1347,135 @@ fn run_experiment_cmd(args: &[String]) -> i32 {
     0
 }
 
+/// `ccos memory [--path FILE]` — drive the [`CcosMemory`] external-memory façade
+/// over **stdin JSON Lines**: one request object per line, one JSON response per
+/// line. Loads `FILE` (default `workspace.ccos`), applies each request, and
+/// checkpoints back if any mutation occurred — scriptable from any language.
+///
+/// Requests: `{"op":"ingest","uri":..,"source":..}`,
+/// `{"op":"failure","node":..,"depth":N}`,
+/// `{"op":"recall","strategy":"around|task|working_set",..,"budget":N}`,
+/// `{"op":"impact|causes","node":..,"depth":N}`, `{"op":"verify"}`,
+/// `{"op":"stats"}`.
+fn run_memory_cmd(args: &[String]) -> i32 {
+    use std::io::BufRead;
+    let mut path = "workspace.ccos".to_string();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--path" => {
+                i += 1;
+                if let Some(p) = args.get(i) {
+                    path = p.clone();
+                }
+            }
+            other => eprintln!("ccos: ignoring unknown flag '{other}'"),
+        }
+        i += 1;
+    }
+
+    let mut mem = match CcosMemory::open(&path) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("ccos: cannot open memory '{path}': {e}");
+            return 1;
+        }
+    };
+
+    let err = |msg: String| serde_json::json!({ "error": msg });
+    let mut dirty = false;
+    let mut had_error = false;
+    let stdin = std::io::stdin();
+    for line in stdin.lock().lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let req: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(e) => {
+                println!("{}", err(format!("invalid JSON: {e}")));
+                had_error = true;
+                continue;
+            }
+        };
+        let s = |k: &str| req[k].as_str().unwrap_or("").to_string();
+        let op = req["op"].as_str().unwrap_or("").to_string();
+        let resp: serde_json::Value = match op.as_str() {
+            "ingest" => {
+                let (uri, src) = (s("uri"), s("source"));
+                if uri.is_empty() {
+                    had_error = true;
+                    err("ingest requires 'uri' and 'source'".into())
+                } else {
+                    dirty = true;
+                    serde_json::to_value(mem.ingest_source(&uri, &src)).unwrap()
+                }
+            }
+            "failure" => {
+                let depth = req["depth"].as_u64().unwrap_or(3) as u32;
+                match mem.signal_failure(&s("node"), depth) {
+                    Ok(n) => {
+                        dirty = true;
+                        serde_json::json!({ "affected": n })
+                    }
+                    Err(e) => {
+                        had_error = true;
+                        err(e.to_string())
+                    }
+                }
+            }
+            "recall" => {
+                let budget = req["budget"].as_u64().unwrap_or(2048) as usize;
+                let recall = match req["strategy"].as_str().unwrap_or("working_set") {
+                    "around" => Recall::around(s("anchor")),
+                    "task" => Recall::task(s("text")),
+                    _ => Recall::working_set(),
+                };
+                serde_json::to_value(mem.recall(&recall, budget)).unwrap()
+            }
+            "impact" | "causes" => {
+                let depth = req["depth"].as_u64().unwrap_or(2) as u32;
+                let reached = if op == "impact" {
+                    mem.impact(&s("node"), depth)
+                } else {
+                    mem.causes(&s("node"), depth)
+                };
+                let arr: Vec<_> = reached
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({ "id": r.id.0, "distance": r.distance, "score": r.score })
+                    })
+                    .collect();
+                serde_json::json!({ "reached": arr })
+            }
+            "verify" => serde_json::to_value(mem.verify()).unwrap(),
+            "stats" => serde_json::to_value(mem.stats()).unwrap(),
+            "" => {
+                had_error = true;
+                err("missing 'op'".into())
+            }
+            other => {
+                had_error = true;
+                err(format!("unknown op '{other}'"))
+            }
+        };
+        println!("{}", serde_json::to_string(&resp).unwrap());
+    }
+
+    if dirty {
+        if let Err(e) = mem.checkpoint() {
+            eprintln!("ccos: checkpoint failed: {e}");
+            return 1;
+        }
+    }
+    i32::from(had_error)
+}
+
 /// `ccos eval [--tasks N] [--seed S] [--budget T] [--model M] [--json]` — the
 /// **real-LLM** evaluation (clean + noisy). Configure a model with
 /// `ANTHROPIC_API_KEY` (+`ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL`), `OPENAI_API_KEY`
@@ -1546,6 +1677,7 @@ COMMANDS:\n\
         --metrics <node-id>    Flat-vs-region locality comparison (--radius N)\n\
     experiment [--tasks N]     Hypothesis test: regional memory vs RAG/GraphRAG (--json)\n\
     eval [--tasks N] [--model M]  Real-LLM eval (ANTHROPIC/OPENAI_API_KEY or OLLAMA_ENDPOINT)\n\
+    memory [--path FILE]       External-memory façade over stdin JSON Lines (ingest/recall/verify)\n\
 \n\
   CCOS v0.3 — Autonomous Context Runtime:\n\
     scan <path>                Scan a real workspace and ingest the delta\n\

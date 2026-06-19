@@ -166,6 +166,46 @@ periodically:            checkpoint(); assert verify().valid
 file *and the causally-related files the fix is likely to touch*, within the token
 budget — the thing a flat top-k retriever misses.
 
+## Driving it from any language (`ccos memory`)
+
+The same façade is exposed as a **stdio JSON-Lines** command, so any language can
+use CCOS as memory via a subprocess — no server to run:
+
+```bash
+printf '%s\n' \
+  '{"op":"ingest","uri":"src/db.rs","source":"pub fn query() {}"}' \
+  '{"op":"failure","node":"file:src/db.rs","depth":3}' \
+  '{"op":"recall","strategy":"around","anchor":"file:src/db.rs","budget":2048}' \
+  '{"op":"verify"}' \
+  | ccos memory --path workspace.ccos
+```
+
+One request object per line in, one JSON response per line out. The workspace is
+loaded from `--path` (default `workspace.ccos`) and checkpointed back if any
+request mutated it. Operations: `ingest` (`uri`, `source`), `failure` (`node`,
+`depth`), `recall` (`strategy` ∈ `around` / `task` / `working_set`, plus
+`anchor` / `text`, `budget`), `impact` / `causes` (`node`, `depth`), `verify`,
+`stats`. Responses are the `Serialize` types above verbatim; errors are
+`{"error":"…"}`.
+
+From Python:
+
+```python
+import subprocess, json
+
+def mem(reqs, path="workspace.ccos"):
+    inp = "\n".join(json.dumps(r) for r in reqs)
+    out = subprocess.run(["ccos", "memory", "--path", path],
+                         input=inp, capture_output=True, text=True).stdout
+    return [json.loads(l) for l in out.splitlines()]
+
+mem([{"op": "ingest", "uri": "src/db.rs", "source": open("src/db.rs").read()}])
+win = mem([{"op": "recall", "strategy": "around",
+            "anchor": "file:src/db.rs", "budget": 2048}])[0]
+for it in win["items"]:
+    print(it["score"], it["uri"])
+```
+
 ## Guarantees
 
 - **Deterministic recall** — a total order on `(score, uri)`; same memory, same
@@ -182,6 +222,5 @@ budget — the thing a flat top-k retriever misses.
   fine for interactive use, not for tight inner loops on huge graphs.
 - `Task` uses a deliberately simple lexical entry point (no embeddings) — it is a
   convenience, not a semantic retriever; prefer `Around` with a real anchor.
-- A network server / stdio CLI on top of this façade is intentionally **not**
-  included here (see the interface design notes); the façade is the reusable base
-  for either.
+- A **stdio JSON CLI** (`ccos memory`) ships on top of this façade (see above); a
+  network/HTTP server is not included, but would layer on the same trait.
