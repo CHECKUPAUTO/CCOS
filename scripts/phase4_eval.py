@@ -357,6 +357,17 @@ def main(argv: list[str]) -> int:
             mean_tok = sum(toks[strat]) / len(toks[strat]) if toks[strat] else 0.0
             print(f"  {strat:5}: {t['pass']}/{graded} pass ({rate:.0%})   "
                   f"mean context {mean_tok:.0f} tok   skipped {t['skip']}")
+
+    # Efficiency report — works in --dry-run too (tokens need no model).
+    print("\n=== Context efficiency (mean tokens of the assembled window) ===")
+    means = {}
+    for strat in ("ccos", "rag"):
+        ts = toks[strat]
+        means[strat] = sum(ts) / len(ts) if ts else 0.0
+        print(f"  {strat:5}: mean {means[strat]:.0f} tok over {len(ts)} scenarios")
+    if means["ccos"] and means["rag"]:
+        print(f"  → CCOS assembles {means['rag'] / means['ccos']:.1f}x fewer context tokens "
+              f"than the budget-filling RAG (it stops at the causal region).")
     return 0
 
 
