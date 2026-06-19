@@ -89,28 +89,30 @@ budget**, at the cost of **diluting** it at a very tight one (`K=20`): marking
 neighbours on both sides floods a small working set and can evict a target. A
 real, falsifiable trade-off — exactly what the harness is for.
 
-### On a mature external repo (`fd`, n = 25)
+### Across mature external repos (70 real bugs)
 
-The same comparison on [`sharkdp/fd`](https://github.com/sharkdp/fd) (1942 commits,
-25 mined fix scenarios) — a meaningful sample — makes the effect unmistakable:
+The same comparison on three established crates — `R_cov` as
+*downstream-only* / **bidirectional**:
 
-| K | downstream-only | bidirectional |
-| --- | --- | --- |
-| 20  | 0.50 (48% perfect) | 0.28 (28% perfect) |
-| 50  | 0.50 (48% perfect) | **0.92 (88% perfect)** |
-| 100 | 0.50 (48% perfect) | **0.96 (92% perfect, geo 0.95)** |
+| Repo (n)         | K=20        | K=50          | K=100         |
+| ---------------- | ----------- | ------------- | ------------- |
+| `fd` (25)        | 0.50 / 0.28 | 0.50 / **0.92** | 0.50 / **0.96** |
+| `bat` (25)       | 0.84 / 0.20 | 0.84 / **1.00** | 0.84 / **1.00** |
+| `hyperfine` (20) | 0.64 / 0.19 | 0.73 / **0.85** | 0.81 / **0.92** |
 
-With a sufficient budget (`K≥50`), cross-file linking + bidirectional propagation
-let CCOS recover **92–96% of the files a fix touched**, on 25 real bugs — up from
-50% downstream-only. The `K=20` dilution reproduces. Reproduce with:
+Across 70 mined fix commits the picture is consistent: with cross-file linking and
+bidirectional propagation, at a sufficient budget (`K≥50`) CCOS recovers **0.85–1.0
+of the files a fix touched** — i.e. the *necessary* condition (the fix's files are
+in the window) holds for the large majority of real bugs — while the tight-budget
+(`K=20`) dilution is systematic (0.19–0.28). Reproduce with:
 
 ```bash
-git clone https://github.com/sharkdp/fd /tmp/fd
-python scripts/causal_validation/validate.py --repo /tmp/fd \
+git clone https://github.com/sharkdp/bat /tmp/bat
+python scripts/causal_validation/validate.py --repo /tmp/bat \
     --ccos-bin target/release/ccos --limit 25 --bidirectional
 ```
 
-**Caveat:** this is one repository; the protocol should be run across several
-(and against the LLM end-to-end of Phase 4) before any general claim. But on a
-real, mature codebase the necessary condition — *the fix's files are in the
-window* — now holds for the large majority of bugs.
+**Caveat:** three single-crate repos; multi-crate workspaces (e.g. ripgrep) need
+the module-path resolver extended, and this measures the *necessary* (retrieval)
+condition only — the *sufficient* one (an LLM's patch passes the tests, Phase 4)
+remains future work.

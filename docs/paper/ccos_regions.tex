@@ -524,14 +524,16 @@ the first run exposed a limitation and its fix, both measured: with
 downstream-only failure propagation $R_{\mathrm{cov}}$ was flat at $0.33$ (only the
 seed file recovered, as co-changed files are \emph{upstream} importers reached
 only through dependency hubs). Resolving intra-crate imports into file$\to$file
-edges and propagating failure \emph{bidirectionally} fixes this. On a mature
-external codebase --- \code{sharkdp/fd}, $n{=}25$ mined fix commits --- the effect
-is unmistakable: $R_{\mathrm{cov}}$ rises from $0.50$ (downstream-only) to $0.92$
-($K{=}50$) and $0.96$ ($K{=}100$, geometric mean $0.95$, $92\%$ of bugs fully
-covered), while \emph{diluting} to $0.28$ at a tight $K{=}20$ budget --- a real,
-falsifiable trade-off. So on real bugs the \emph{necessary} condition (the files a
-fix must touch lie in the window) now holds for the large majority; running the
-protocol across several repositories, and end-to-end with the LLM, is future work.
+edges and propagating failure \emph{bidirectionally} fixes this. Across three
+mature crates --- \code{fd}, \code{bat} and \code{hyperfine}, $70$ mined fix
+commits --- the effect is consistent: at a sufficient budget ($K{\ge}50$) the two
+changes lift $R_{\mathrm{cov}}$ to $0.85$--$1.0$ (from $0.50$--$0.84$
+downstream-only) --- e.g.\ \code{fd} $0.50{\to}0.96$ and \code{bat}
+$0.84{\to}1.0$ at $K{=}100$ --- while \emph{diluting} to $0.19$--$0.28$ at a tight
+$K{=}20$ budget, a real and systematic trade-off. So on real bugs the
+\emph{necessary} condition (the files a fix must touch lie in the window) holds for
+the large majority; the \emph{sufficient} condition (an LLM's patch passes the
+hidden tests) and multi-crate workspaces remain future work.
 
 \paragraph{Hypotheses.}
 \textbf{H1} (efficiency): CCOS reaches equal task success at fewer input tokens
