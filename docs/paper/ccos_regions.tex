@@ -61,10 +61,11 @@ coverage --- where CCOS does \emph{not} beat lexical RAG on real bugs), and the 
 axis where CCOS \emph{does} win: \textbf{efficiency}. Run end-to-end on real
 single-file fixes with a 30B model and a compiler-in-the-loop retry, CCOS and RAG
 resolve \emph{equally} ($2/10$), but CCOS does so on $776$ context tokens against
-the lexical retriever's $5366$ --- a $6.9\times$ reduction, because the causal
-region stops at the working set rather than padding a top-$k$ to budget. CCOS is
-thus not a better retriever or solver, but a more \emph{frugal}, \emph{auditable}
-one. (On its own source tree, region selection covers a task's $k$-hop
+the lexical retriever's $5366$ --- a $6.9\times$ reduction (and $4.1$--$9.1\times$
+across $51$ fixes from three crates, model-free), because the causal region stops
+at the working set rather than padding a top-$k$ to budget. CCOS is thus not a
+better retriever or solver, but a more \emph{frugal}, \emph{auditable} one --- it
+self-calibrates, with no $k$ to tune. (On its own source tree, region selection covers a task's $k$-hop
 neighbourhood with recall $0.97$ vs $0.35$ flat at $\approx\!48\%$ fewer tokens;
 regions are $95.5\%$ internally connected.)
 \end{abstract}
@@ -590,12 +591,17 @@ retriever, unlocks resolution, and CCOS shows \textbf{no resolution advantage} o
 RAG, consistent with the retrieval result. The \emph{efficiency} separates them: at
 equal resolution CCOS's auto-bounded region averages $776$ context tokens against
 the lexical retriever's budget-filling $5366$ --- a $\mathbf{6.9\times}$ reduction.
-This is the one axis on which CCOS dominates: not \emph{what} it retrieves (a
-baseline matches that) but \emph{how little} it needs, because the causal region
-stops at the working set instead of padding a top-$k$ to budget. We state the
-caveats: $n{=}10$ with two resolutions, and the baseline fills the budget (a
-carefully tuned-$k$ RAG would also be sparser) --- but CCOS bounds itself with no
-$k$ to choose, which is the point of demand paging.
+The same holds at scale without a model: across $51$ single-file fix scenarios from
+\code{fd}, \code{bat} and \code{hyperfine}, CCOS assembles $700$--$1600$ context
+tokens against RAG's $\approx\!6000$, a $\mathbf{4.1}$--$\mathbf{9.1\times}$
+reduction. This is the one axis on which CCOS dominates: not \emph{what} it
+retrieves (a baseline matches that) but \emph{how little} it needs, because the
+causal region stops at the working set instead of padding a top-$k$ to budget. We
+state the caveats: the \emph{resolution} sample is tiny ($n{=}10$, two passes), and
+the baseline fills the budget by construction (a carefully tuned-$k$ RAG would also
+be sparser). The defensible claim is narrower but real: CCOS \emph{self-calibrates}
+--- it bounds itself at the causal region with no $k$ or budget to tune --- so it
+never wastes the window, which is precisely the point of demand paging.
 
 \paragraph{Hypotheses.}
 \textbf{H1} (efficiency): CCOS reaches equal task success at fewer input tokens

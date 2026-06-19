@@ -38,8 +38,13 @@ on real bugs — and the bet did not pay off:
   RAG-over-the-error-message** — Rust error messages name the cause.
 - End-to-end (Phase 4: 30B model + compiler-in-the-loop), CCOS and RAG **resolve
   equally** (2/10 real `fd` bugs) — **but CCOS does so on 6.9× fewer context
-  tokens** (776 vs 5366): it stops at the causal working set instead of padding a
-  top-k to budget. **Efficiency is the one axis where CCOS wins.**
+  tokens** (776 vs 5366), and **4–9× fewer across 51 fixes from 3 crates**
+  (model-free): it stops at the causal working set instead of padding a top-k to
+  budget, and **self-calibrates with no k to tune**. **Efficiency is the one axis
+  where CCOS wins** (the baseline fills the budget by construction — a tuned-k RAG
+  would be sparser too; the point is CCOS bounds itself). See
+  [`cargo run --example time_travel`](examples/time_travel.rs) for the
+  time-travel debugging demo.
 
 We report this rather than bury it (see [`scripts/causal_validation/`](scripts/causal_validation/)
 and the [paper](docs/paper/)). It relocates CCOS's value:

@@ -21,6 +21,15 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Time-travel debugging demo** (`examples/time_travel.rs`, `cargo run --example
+  time_travel`) — an agent session that drifts (a tight-budget recall evicts the
+  cause two hops away), then is debugged by rewinding to the exact recall and
+  replaying it under a larger budget; `replay_to` reconstructs the state exactly.
+- **Robust efficiency number** — `phase4_eval.py` prints a context-efficiency
+  report (works in `--dry-run`, no model). Across 51 single-file fixes from
+  `fd`/`bat`/`hyperfine`, CCOS assembles 700–1600 context tokens vs RAG's
+  budget-filling ~6000 — a **4.1–9.1× reduction** (it self-bounds at the causal
+  region; the baseline fills the budget by construction).
 - **Event-sourced agent session** (`agent_session` module) — `AgentSession`
   records every cognitive op (ingest / failure / recall / page-fault) as a
   timeline; `replay_to(step)` reconstructs the exact state, and
