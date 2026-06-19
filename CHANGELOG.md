@@ -8,6 +8,24 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **External memory interface** (`external_memory` module) — a single, documented
+  façade (`ExternalMemory` trait + `CcosMemory`) an agent uses to treat CCOS as
+  its external working memory, unifying the kernel's separate pieces (causal
+  graph, incremental parser, hash-chained logs, causal queries, region engine)
+  behind a handful of verbs: `ingest_source`, `signal_failure`, `recall`
+  (`WorkingSet` / `Around` region-anchored / `Task` lexical), `verify`, `stats`,
+  `checkpoint` (+ inherent `open`, `impact`/`causes`, `tick`). Deterministic
+  recall, tamper-evident persistence that round-trips, all result types
+  `Serialize` (ready for a server/CLI layer). Reference guide in
+  [`docs/MEMORY_INTERFACE.md`](docs/MEMORY_INTERFACE.md); 5 tests + a doctest.
+- **`ccos eval --model M`** + live progress — override the active provider's model
+  from the CLI (defaults to a local Ollama server if no provider env is set), and
+  a live `[scenario] i/N tasks…` counter on stderr so long cloud-model runs no
+  longer look hung.
+- **Anthropic reasoning-model support in `ccos eval`** — read the `text` content
+  block past a `<thinking>` block, larger `max_tokens`, no `temperature`; the
+  grader also strips inline `<think>…</think>` blocks. Lets reasoning models
+  (deepseek-v4-pro, qwen3.x, …) be graded on their final answer.
 - **Causal-validation harness** (`scripts/causal_validation/`) — a closed-loop,
   LLM-free harness that tests CCOS's failure-propagation claim against the
   repository's **own Git history**. Phase 1 mines fix commits, reconstructs the

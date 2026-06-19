@@ -30,6 +30,10 @@
 //!   logs) to JSON for cross-session replay and verification.
 //! - [`query`] — read-only causal queries (impact/cause walks, hot set, GraphML
 //!   export) behind the `top`, `blame` and `export` subcommands.
+//! - [`external_memory`] — a documented façade ([`external_memory::ExternalMemory`]
+//!   / [`external_memory::CcosMemory`]) an agent uses to treat CCOS as external
+//!   working memory: ingest source, signal failures, recall a bounded causal
+//!   window, verify, and checkpoint.
 //! - [`region_engine`] — the **Context Region Engine** (v0.3): clusters the
 //!   graph into spatial [`region_engine::ContextRegionEngine`] regions that are
 //!   hydrated as context windows, with a dynamic [`context_policy`] admission
@@ -47,6 +51,7 @@ pub mod adversarial;
 pub mod consensus;
 pub mod distributed_event_log;
 pub mod event_log;
+pub mod external_memory;
 pub mod guard;
 pub mod incremental;
 pub mod llm;
