@@ -46,6 +46,7 @@ import argparse
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -254,6 +255,72 @@ def geomean(xs: list[float], eps: float = 1e-6) -> float:
     return math.exp(sum(math.log(max(x, eps)) for x in xs) / len(xs))
 
 
+def stdev(xs: list[float]) -> float:
+    if len(xs) < 2:
+        return 0.0
+    m = sum(xs) / len(xs)
+    return math.sqrt(sum((x - m) ** 2 for x in xs) / (len(xs) - 1))
+
+
+# --------------------------------------------------------------------------- #
+# Baseline: classical lexical RAG (TF-IDF cosine over file text). Same budget
+# (number of files) as the CCOS working set, so the comparison is apples-to-apples
+# and isolates the *selection rule* (causal propagation vs lexical similarity).
+# --------------------------------------------------------------------------- #
+def _tokens(text: str) -> list[str]:
+    return re.findall(r"[A-Za-z_][A-Za-z0-9_]+", text)
+
+
+def read_sources(worktree: Path, subdir: str) -> dict[str, str]:
+    """Each `.rs` file's text, keyed by path relative to the worktree (so the key
+    matches a `file:<path>` node id)."""
+    base = Path(worktree)
+    out: dict[str, str] = {}
+    for p in (base / subdir).rglob("*.rs"):
+        try:
+            out[str(p.relative_to(base))] = p.read_text(errors="ignore")
+        except OSError:
+            pass
+    return out
+
+
+def tfidf_vectors(sources: dict[str, str]) -> dict[str, tuple[dict[str, float], float]]:
+    docs = {p: Counter(_tokens(t)) for p, t in sources.items()}
+    n = max(len(docs), 1)
+    df: Counter = Counter()
+    for c in docs.values():
+        df.update(c.keys())
+    idf = {tok: math.log((n + 1) / (d + 1)) + 1.0 for tok, d in df.items()}
+    vecs: dict[str, tuple[dict[str, float], float]] = {}
+    for p, c in docs.items():
+        v = {tok: (1.0 + math.log(cnt)) * idf[tok] for tok, cnt in c.items()}
+        norm = math.sqrt(sum(x * x for x in v.values())) or 1.0
+        vecs[p] = (v, norm)
+    return vecs
+
+
+def _cosine(a: tuple[dict, float], b: tuple[dict, float]) -> float:
+    (va, na), (vb, nb) = a, b
+    small, large = (va, vb) if len(va) <= len(vb) else (vb, va)
+    dot = sum(w * large.get(tok, 0.0) for tok, w in small.items())
+    return dot / (na * nb) if na and nb else 0.0
+
+
+def rag_topk(query_path: str, vecs: dict, m: int) -> set[str]:
+    """Top-`m` files by TF-IDF cosine to the query file (query included), returned
+    as `file:` node ids — a classical lexical-RAG retriever at the same file
+    budget as CCOS."""
+    if query_path not in vecs or m <= 0:
+        return set()
+    q = vecs[query_path]
+    ranked = sorted(
+        ((_cosine(q, vecs[p]), p) for p in vecs if p != query_path),
+        key=lambda x: (-x[0], x[1]),
+    )
+    chosen = [query_path] + [p for _, p in ranked[: m - 1]]
+    return {f"file:{p}" for p in chosen}
+
+
 # --------------------------------------------------------------------------- #
 # Orchestrator.
 # --------------------------------------------------------------------------- #
@@ -329,6 +396,9 @@ def run(args: Args) -> list[dict]:
                 print(f"[skip] {tag}: no changed file is a graph node", file=sys.stderr)
                 continue
             present = sum(1 for t in target_ids if t in nodes)
+            # Lexical-RAG baseline over the same files, queried by the fault file.
+            vecs = tfidf_vectors(read_sources(wt, args.subdir))
+            origin_path = origin[len("file:") :]
             for k in args.ks:
                 res = failure_working_set(
                     args.ccos_bin,
@@ -341,6 +411,10 @@ def run(args: Args) -> list[dict]:
                     bidirectional=args.bidirectional,
                 )
                 cov = r_cov(target_ids, res["working_set"])
+                # RAG at the same file budget as CCOS's working set.
+                ccos_files = [w for w in res["working_set"] if w.startswith("file:")]
+                rag_files = rag_topk(origin_path, vecs, len(ccos_files))
+                cov_rag = r_cov(target_ids, list(rag_files))
                 rec = {
                     "commit": sc.commit,
                     "parent": sc.parent,
@@ -351,6 +425,8 @@ def run(args: Args) -> list[dict]:
                     "k": k,
                     "depth": args.depth,
                     "r_cov": round(cov, 4),
+                    "r_cov_rag": round(cov_rag, 4),
+                    "files_in_window": len(ccos_files),
                     "working_set_size": res["working_set_size"],
                     "nodes_before": res["nodes_before"],
                     "weights": res["weights"],
@@ -376,19 +452,29 @@ def run(args: Args) -> list[dict]:
 
 
 def summarise(records: list[dict], ks: list[int]) -> None:
-    print("\n=== Phase 2 — Constraint-Coverage Ratio (CCOS) ===")
+    print("\n=== Phase 2 — CCOS (causal) vs RAG (lexical TF-IDF), equal file budget ===")
     n_scen = len({r["commit"] for r in records})
-    print(f"scenarios scored: {n_scen}   measurements: {len(records)}\n")
-    print(f"  {'K':>6}  {'n':>4}  {'mean R_cov':>11}  {'geo R_cov':>10}  {'perfect':>8}")
+    print(f"scenarios scored: {n_scen}   measurements: {len(records)}")
+    print("R_cov = |F_target ∩ window| / |F_target|; mean ± std (std err); win = CCOS ≥ RAG\n")
+    print(
+        f"  {'K':>5}  {'n':>4}  {'CCOS R_cov':>16}  {'RAG R_cov':>16}  {'Δ':>7}  {'win':>5}"
+    )
     for k in ks:
-        rs = [r["r_cov"] for r in records if r["k"] == k]
+        rs = [r for r in records if r["k"] == k]
         if not rs:
             continue
-        amean = sum(rs) / len(rs)
-        gmean = geomean(rs)
-        perfect = sum(1 for x in rs if x >= 0.999) / len(rs)
-        print(f"  {k:>6}  {len(rs):>4}  {amean:>11.3f}  {gmean:>10.3f}  {perfect:>7.0%}")
-    print("\n(geo R_cov is the Phase-3 optimisation objective.)")
+        c = [r["r_cov"] for r in rs]
+        g = [r.get("r_cov_rag", 0.0) for r in rs]
+        n = len(rs)
+        cm, gm = sum(c) / n, sum(g) / n
+        cse, gse = stdev(c) / math.sqrt(n), stdev(g) / math.sqrt(n)
+        win = sum(1 for r in rs if r["r_cov"] >= r.get("r_cov_rag", 0.0)) / n
+        print(
+            f"  {k:>5}  {n:>4}  {cm:>6.3f} ±{stdev(c):.3f} (±{cse:.3f})  "
+            f"{gm:>6.3f} ±{stdev(g):.3f} (±{gse:.3f})  {cm - gm:>+7.3f}  {win:>4.0%}"
+        )
+    print("\n(equal file budget per scenario; Δ>0 means causal selection covers")
+    print(" the fix's files better than lexical similarity. End.)")
 
 
 def parse_args(argv: list[str]) -> Args:
