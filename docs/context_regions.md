@@ -159,6 +159,52 @@ Region selection covers **97%** of a task's causal neighbourhood vs **35%** for
 flat, using **≈48% fewer tokens** to reach equal coverage. Absolute precision is
 low because the v0.2 parser emits only containment/import edges (shallow
 neighbourhoods); richer **semantic edges** (call graph / data flow, roadmap
-P1.3) would tighten `N_k` and amplify the precision gain. See
-[`paper/`](paper/) for the formal treatment, the determinism proof and the
-proposed comparison against RAG / GraphRAG / MemGPT / LangGraph.
+P1.3) would tighten `N_k` and amplify the precision gain.
+
+## Testing the hypothesis
+
+> *Does an agent with regional causal memory solve long, multi-file tasks better
+> than a classical RAG agent?*
+
+The full answer needs LLM rollouts, but its **necessary condition** is testable
+now, deterministically, without an LLM: *an agent cannot solve a task whose
+required causal context is absent from its window.* `ccos experiment` runs that
+test — modular synthetic repos, cross-file causal tasks of growing **diameter**,
+six strategies at equal budget, oracle success = "required causal set ⊆ window".
+Crucially it runs **two scenarios**: a **clean** query (points at the target) and
+a **noisy** query (a decoy out-scores the target lexically — the realistic case
+where the task description doesn't name the distant cause). RAG/GraphRAG locate
+code from the *query*; CCOS anchors on the *workspace signal* (the active file).
+
+```bash
+cargo run -- experiment --tasks 800
+```
+
+| strategy | clean (d=1·2·3·4) | **noisy (d=1·2·3·4)** |
+| -------- | ----------------- | --------------------- |
+| `rag-dense` (lexical RAG) | 0 · 0 · 0 · 0 | 0 · 0 · 0 · 0 |
+| `rag-hybrid` | 1 · 0 · 0 · 0 | 1 · 0 · 0 · 0 |
+| `graphrag-1hop` | 1 · 0 · 0 · 0 | 0 · 0 · 0 · 0 |
+| `graphrag-bfs` (strong graph baseline) | 1 · 1 · 1 · 1 | **0 · 0 · 0 · 0** |
+| `ccos-from-query` (ablation: CCOS trusts the query) | 1 · 1 · 1 · 1 | **0 · 0 · 0 · 0** |
+| **`ccos-region`** (anchored on workspace) | **1 · 1 · 1 · 1** | **1 · 1 · 1 · 1** |
+
+**Honest reading:**
+
+1. Lexical RAG *fails entirely* on cross-file causal tasks (0%) — the hypothesis's
+   premise validated.
+2. **Clean query:** `graphrag-bfs`, `ccos-from-query` and `ccos-region` all reach
+   100% — the lever is causal **structure**, *not CCOS specifically*.
+3. **Noisy query:** everything that locates code lexically collapses to **0%** —
+   including the strong `graphrag-bfs` *and* the `ccos-from-query` ablation. Only
+   **`ccos-region`**, anchored on the workspace signal rather than the query,
+   survives. The ablation isolates the differentiator: it is the **anchor source**
+   (a structural workspace signal vs. a lexical query), not the region machinery.
+4. **Assumptions:** this credits CCOS with a reliable anchor (active file / failing
+   test) — which an OS-style memory has but a retrieval pipeline doesn't — and
+   needs **modular** repos (a giant region over budget collapses it).
+
+This is a **simulation under a stated oracle** (necessary condition), not an LLM
+evaluation (sufficient condition). See [`paper/`](paper/) for the formal model,
+the determinism proof, and the proposed real-LLM comparison against RAG / GraphRAG
+/ MemGPT / LangGraph.

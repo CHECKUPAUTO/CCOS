@@ -65,6 +65,63 @@ pub enum EdgeType {
     RelatedTo,
 }
 
+/// Tunable coefficients of the causal score and failure-propagation decay.
+///
+/// A node's score is
+/// `clamp(w_base·imp + w_failure·fail + w_recency·rec + w_access·ln(1+acc), 0, 1)`,
+/// and injected failure pressure attenuates by `failure_decay^depth` per hop.
+/// [`Default`] reproduces the constants CCOS shipped with; [`ScoringWeights::from_env`]
+/// lets an external optimiser (the causal-validation harness) override them per
+/// run without recompiling — the knobs Phase 3 of that harness searches over.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct ScoringWeights {
+    /// Weight on a node's intrinsic importance.
+    pub w_base: f64,
+    /// Weight on propagated failure relevance (the dominant term by default).
+    pub w_failure: f64,
+    /// Weight on recency.
+    pub w_recency: f64,
+    /// Weight on `ln(access_count)`.
+    pub w_access: f64,
+    /// Geometric attenuation of failure pressure per propagation hop.
+    pub failure_decay: f64,
+}
+
+impl Default for ScoringWeights {
+    fn default() -> Self {
+        Self {
+            w_base: 0.15,
+            w_failure: 0.50,
+            w_recency: 0.30,
+            w_access: 0.05,
+            failure_decay: 0.8,
+        }
+    }
+}
+
+impl ScoringWeights {
+    /// Read overrides from the environment, falling back to [`Default`] for any
+    /// variable that is unset or unparsable. Recognised variables: `CCOS_W_BASE`,
+    /// `CCOS_W_FAILURE`, `CCOS_W_RECENCY`, `CCOS_W_ACCESS`, `CCOS_FAILURE_DECAY`.
+    pub fn from_env() -> Self {
+        let d = Self::default();
+        let get = |key: &str, fallback: f64| -> f64 {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .filter(|x| x.is_finite())
+                .unwrap_or(fallback)
+        };
+        Self {
+            w_base: get("CCOS_W_BASE", d.w_base),
+            w_failure: get("CCOS_W_FAILURE", d.w_failure),
+            w_recency: get("CCOS_W_RECENCY", d.w_recency),
+            w_access: get("CCOS_W_ACCESS", d.w_access),
+            failure_decay: get("CCOS_FAILURE_DECAY", d.failure_decay),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryGraph {
     pub nodes: HashMap<NodeId, GraphNode>,
@@ -72,6 +129,11 @@ pub struct MemoryGraph {
     pub paging_threshold: f64,
     pub max_in_memory_nodes: usize,
     pub clock: u64,
+    /// Scoring/decay coefficients (see [`ScoringWeights`]). Serialised so a
+    /// snapshot records the weights it was scored under; `serde(default)` keeps
+    /// older snapshots (written before this field existed) loadable.
+    #[serde(default)]
+    pub scoring_weights: ScoringWeights,
 }
 
 impl MemoryGraph {
@@ -82,7 +144,14 @@ impl MemoryGraph {
             paging_threshold,
             max_in_memory_nodes,
             clock: 0,
+            scoring_weights: ScoringWeights::default(),
         }
+    }
+
+    /// Replace the scoring/decay coefficients (see [`ScoringWeights`]). Set these
+    /// before ingesting or re-paging so the new weights drive eviction.
+    pub fn set_scoring_weights(&mut self, weights: ScoringWeights) {
+        self.scoring_weights = weights;
     }
 
     pub fn tick(&mut self) {
@@ -175,10 +244,11 @@ impl MemoryGraph {
     }
 
     pub fn compute_node_score(&self, node: &GraphNode) -> f64 {
-        let base = node.base_importance * 0.15;
-        let failure = node.failure_relevance * 0.50;
-        let recency = node.recency * 0.30;
-        let access = (node.access_count.max(1) as f64).ln() * 0.05;
+        let w = &self.scoring_weights;
+        let base = node.base_importance * w.w_base;
+        let failure = node.failure_relevance * w.w_failure;
+        let recency = node.recency * w.w_recency;
+        let access = (node.access_count.max(1) as f64).ln() * w.w_access;
         (base + failure + recency + access).clamp(0.0, 1.0)
     }
 
@@ -292,8 +362,9 @@ impl MemoryGraph {
             .map(|e| (e.target.clone(), e.weight))
             .collect();
 
+        let decay = self.scoring_weights.failure_decay;
         for (target, weight) in targets {
-            let propagation = base_value * weight * 0.8_f64.powi(depth as i32);
+            let propagation = base_value * weight * decay.powi(depth as i32);
             if let Some(node) = self.nodes.get_mut(&target) {
                 node.failure_relevance = (node.failure_relevance + propagation).clamp(0.0, 1.0);
                 node.recency = 1.0;
@@ -303,12 +374,139 @@ impl MemoryGraph {
         }
     }
 
+    /// Like [`propagate_failure`](Self::propagate_failure) but **bidirectional**:
+    /// pressure flows to neighbours in *both* edge directions, so an injected
+    /// fault reaches its upstream causes (callers/importers) as well as its
+    /// downstream dependencies. Recursion only continues into a neighbour whose
+    /// failure relevance actually grew, which (with the `depth ≤ max_depth` bound)
+    /// keeps it terminating on cyclic graphs. Use when the failing node's *cause*
+    /// may lie either side of it — e.g. bug-fix localisation.
+    pub fn propagate_failure_bidirectional(
+        &mut self,
+        origin_id: &NodeId,
+        depth: u32,
+        max_depth: u32,
+    ) {
+        if depth > max_depth {
+            return;
+        }
+        let base_value = self
+            .nodes
+            .get(origin_id)
+            .map(|n| n.failure_relevance)
+            .unwrap_or(0.0);
+
+        // Neighbours via edges in either direction.
+        let neighbours: Vec<(NodeId, f64)> = self
+            .edges
+            .iter()
+            .filter_map(|e| {
+                if &e.source == origin_id {
+                    Some((e.target.clone(), e.weight))
+                } else if &e.target == origin_id {
+                    Some((e.source.clone(), e.weight))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let decay = self.scoring_weights.failure_decay;
+        for (nb, weight) in neighbours {
+            let propagation = base_value * weight * decay.powi(depth as i32);
+            let mut grew = false;
+            if let Some(node) = self.nodes.get_mut(&nb) {
+                let before = node.failure_relevance;
+                node.failure_relevance = (before + propagation).clamp(0.0, 1.0);
+                node.recency = 1.0;
+                node.last_accessed = self.clock;
+                grew = node.failure_relevance > before + 1e-9;
+            }
+            if grew {
+                self.propagate_failure_bidirectional(&nb, depth + 1, max_depth);
+            }
+        }
+    }
+
     pub fn node_count(&self) -> usize {
         self.nodes.len()
     }
 
     pub fn edge_count(&self) -> usize {
         self.edges.len()
+    }
+
+    /// Resolve intra-crate imports into `file → file` dependency edges.
+    ///
+    /// The parser records imports as `use:<file>:<path>` nodes but does not link
+    /// the importing file to the file that *defines* the imported module, so
+    /// causally-related files end up connected only through shared `dep:` hubs.
+    /// This pass maps each file to its module path (`src/a/b.rs` → `a::b`,
+    /// `…/mod.rs|lib.rs|main.rs` to the parent) and, for every `use:` node,
+    /// links the importer to the file whose module is the longest matching
+    /// prefix of the import path. Idempotent (duplicate edges are rejected);
+    /// returns the number of edges added. Opt-in — callers invoke it after
+    /// ingesting a set of files (see [`crate::external_memory`]).
+    pub fn link_module_imports(&mut self) -> usize {
+        // (crate, intra-module path) → file node.
+        let mut index: HashMap<(String, String), NodeId> = HashMap::new();
+        for id in self.nodes.keys() {
+            if let Some(path) = id.0.strip_prefix("file:") {
+                if let Some(km) = crate_and_module(path) {
+                    index.insert(km, id.clone());
+                }
+            }
+        }
+        let mut to_add: Vec<(NodeId, NodeId, EdgeType)> = Vec::new();
+
+        // (a) imports: importer → defining file.
+        for id in self.nodes.keys() {
+            let Some(rest) = id.0.strip_prefix("use:") else {
+                continue;
+            };
+            let Some((file, usepath)) = rest.split_once(':') else {
+                continue;
+            };
+            let importer = NodeId(format!("file:{file}"));
+            if !self.nodes.contains_key(&importer) {
+                continue;
+            }
+            let importer_crate = crate_and_module(file).map(|(c, _)| c).unwrap_or_default();
+            if let Some(target) = resolve_use(&importer_crate, usepath, &index) {
+                if target != importer {
+                    to_add.push((importer, target, EdgeType::DependsOn));
+                }
+            }
+        }
+
+        // (b) module hierarchy: a parent module's file → its sub-module's file
+        // (e.g. `filter/mod.rs → filter/owner.rs`). The parser records `pub mod x;`
+        // only as a node, so without this a sub-module reached through a re-export
+        // is orphaned and failure pressure can never flow into it.
+        let entries: Vec<((String, String), NodeId)> =
+            index.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        for ((krate, module), child) in &entries {
+            if module.is_empty() {
+                continue;
+            }
+            let parent_module = match module.rsplit_once("::") {
+                Some((p, _)) => p.to_string(),
+                None => String::new(), // top-level module → crate root (lib/main)
+            };
+            if let Some(parent) = index.get(&(krate.clone(), parent_module)) {
+                if parent != child {
+                    to_add.push((parent.clone(), child.clone(), EdgeType::Contains));
+                }
+            }
+        }
+
+        let mut added = 0;
+        for (s, t, ty) in to_add {
+            if self.add_edge(s, t, 0.85, ty) {
+                added += 1;
+            }
+        }
+        added
     }
 
     /// Detect directed dependency cycles via an iterative (stack-safe) DFS.
@@ -509,9 +707,161 @@ pub struct GraphDiff {
     pub common_nodes: usize,
 }
 
+/// The `::`-joined intra-crate module path of a source file below a `src/` root.
+/// `a/b.rs` → `a::b`; `mod.rs`/`lib.rs`/`main.rs` → the parent (empty at the
+/// crate root). Used by [`crate_and_module`].
+fn module_of(after: &str) -> Option<String> {
+    let p = after.strip_suffix(".rs")?;
+    let segs: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
+    let last = *segs.last()?;
+    let module = if matches!(last, "mod" | "lib" | "main") {
+        segs[..segs.len() - 1].join("::")
+    } else {
+        segs.join("::")
+    };
+    Some(module)
+}
+
+/// Split a file path into `(crate, intra-module)` for import resolution, robust to
+/// relative, absolute, and multi-crate-workspace layouts:
+/// `src/a/b.rs` → `("", "a::b")`; `/repo/src/a.rs` → `("repo", "a")`;
+/// `crates/grep-matcher/src/lib.rs` → `("grep_matcher", "")`. The crate is the
+/// directory name immediately above `src/` (`-` normalised to `_`), or `""` for a
+/// path that simply starts with `src/`.
+fn crate_and_module(file_path: &str) -> Option<(String, String)> {
+    let (krate, after) = if let Some(idx) = file_path.find("/src/") {
+        let krate = file_path[..idx]
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .replace('-', "_");
+        (krate, &file_path[idx + 5..])
+    } else if let Some(after) = file_path.strip_prefix("src/") {
+        (String::new(), after)
+    } else {
+        (String::new(), file_path)
+    };
+    Some((krate, module_of(after)?))
+}
+
+/// Resolve an import to the defining file's node id. `crate::`/`self::`/`super::`
+/// stay in the importer's crate (and require a real sub-module match); a leading
+/// crate name (e.g. `grep_matcher::…`) targets that crate and may resolve to its
+/// root (`lib.rs`). External paths like `std::io` match nothing.
+fn resolve_use(
+    importer_crate: &str,
+    usepath: &str,
+    index: &HashMap<(String, String), NodeId>,
+) -> Option<NodeId> {
+    let (target_crate, rest): (String, &str) = if let Some(r) = usepath
+        .strip_prefix("crate::")
+        .or_else(|| usepath.strip_prefix("self::"))
+        .or_else(|| usepath.strip_prefix("super::"))
+    {
+        (importer_crate.to_string(), r)
+    } else if matches!(usepath, "crate" | "self" | "super") {
+        (importer_crate.to_string(), "")
+    } else {
+        match usepath.split_once("::") {
+            Some((c, r)) => (c.to_string(), r),
+            None => (usepath.to_string(), ""),
+        }
+    };
+    let segs: Vec<&str> = rest.split("::").filter(|s| !s.is_empty()).collect();
+    // Same-crate imports must hit a real sub-module (len ≥ 1); cross-crate imports
+    // may resolve to the crate root (len 0) — depending on the crate as a whole.
+    let min_len = usize::from(target_crate == importer_crate);
+    (min_len..=segs.len()).rev().find_map(|len| {
+        let module = segs[..len].join("::");
+        index.get(&(target_crate.clone(), module)).cloned()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn link_module_imports_connects_cross_file_uses() {
+        let mut g = MemoryGraph::new(0.0, usize::MAX);
+        for f in ["src/api.rs", "src/repo.rs", "src/db.rs"] {
+            g.upsert_node(
+                format!("file:{f}").into(),
+                f.into(),
+                "".into(),
+                NodeType::Module,
+            );
+        }
+        g.upsert_node(
+            "use:src/api.rs:crate::repo".into(),
+            "".into(),
+            "".into(),
+            NodeType::Unknown,
+        );
+        g.upsert_node(
+            "use:src/repo.rs:crate::db::connect".into(),
+            "".into(),
+            "".into(),
+            NodeType::Unknown,
+        );
+        let added = g.link_module_imports();
+        assert_eq!(added, 2, "two cross-file imports resolved");
+        assert!(g
+            .edges
+            .iter()
+            .any(|e| e.source.0 == "file:src/api.rs" && e.target.0 == "file:src/repo.rs"));
+        assert!(g
+            .edges
+            .iter()
+            .any(|e| e.source.0 == "file:src/repo.rs" && e.target.0 == "file:src/db.rs"));
+        assert_eq!(g.link_module_imports(), 0, "idempotent");
+    }
+
+    #[test]
+    fn link_module_imports_handles_multi_crate_and_absolute_paths() {
+        let mut g = MemoryGraph::new(0.0, usize::MAX);
+        let node = |g: &mut MemoryGraph, id: &str| {
+            g.upsert_node(id.into(), "".into(), "".into(), NodeType::Module);
+        };
+        // Multi-crate workspace: core imports a sibling crate `util` (dir uses `-`).
+        node(&mut g, "file:crates/core/src/api.rs");
+        node(&mut g, "file:crates/grep-util/src/lib.rs");
+        node(&mut g, "use:crates/core/src/api.rs:grep_util::helper");
+        // Absolute-path mono-crate with an intra-crate import.
+        node(&mut g, "file:/repo/src/a.rs");
+        node(&mut g, "file:/repo/src/b.rs");
+        node(&mut g, "use:/repo/src/a.rs:crate::b");
+        g.link_module_imports();
+        assert!(
+            g.edges
+                .iter()
+                .any(|e| e.source.0 == "file:crates/core/src/api.rs"
+                    && e.target.0 == "file:crates/grep-util/src/lib.rs"),
+            "cross-crate import (grep_util ← grep-util dir) resolves to the crate root"
+        );
+        assert!(
+            g.edges
+                .iter()
+                .any(|e| e.source.0 == "file:/repo/src/a.rs" && e.target.0 == "file:/repo/src/b.rs"),
+            "absolute-path intra-crate import resolves"
+        );
+    }
+
+    #[test]
+    fn bidirectional_failure_reaches_upstream_causes() {
+        let mut g = MemoryGraph::new(0.0, usize::MAX);
+        g.upsert_node("a".into(), "a".into(), "".into(), NodeType::Module);
+        g.upsert_node("b".into(), "b".into(), "".into(), NodeType::Module);
+        // a depends on b (a → b); b is upstream of nothing, a is upstream of b.
+        g.add_edge("a".into(), "b".into(), 1.0, EdgeType::DependsOn);
+        // Inject at b: downstream-only propagation cannot reach a.
+        g.set_failure_relevance(&"b".into(), 1.0);
+        g.propagate_failure(&"b".into(), 0, 3);
+        assert_eq!(g.nodes.get(&"a".into()).unwrap().failure_relevance, 0.0);
+        // Bidirectional propagation reaches the upstream cause a.
+        g.propagate_failure_bidirectional(&"b".into(), 0, 3);
+        assert!(g.nodes.get(&"a".into()).unwrap().failure_relevance > 0.0);
+    }
 
     #[test]
     fn test_upsert_node() {
@@ -532,6 +882,63 @@ mod tests {
         graph.upsert_node("b".into(), "B".into(), "".into(), NodeType::Module);
         graph.add_edge("a".into(), "b".into(), 0.8, EdgeType::DependsOn);
         assert_eq!(graph.edge_count(), 1);
+    }
+
+    #[test]
+    fn scoring_weights_default_matches_shipped_constants() {
+        // Regression guard: the tunable defaults must reproduce the original
+        // hard-coded score, so existing snapshots/hashes/behaviour are unchanged.
+        let w = ScoringWeights::default();
+        assert_eq!(w.w_base, 0.15);
+        assert_eq!(w.w_failure, 0.50);
+        assert_eq!(w.w_recency, 0.30);
+        assert_eq!(w.w_access, 0.05);
+        assert_eq!(w.failure_decay, 0.8);
+    }
+
+    #[test]
+    fn scoring_weights_alter_score() {
+        let mut g = MemoryGraph::new(0.0, usize::MAX);
+        g.upsert_node("n".into(), "n".into(), "".into(), NodeType::Module);
+        g.set_failure_relevance(&"n".into(), 1.0);
+        let node = g.nodes.get(&"n".into()).unwrap().clone();
+        g.set_scoring_weights(ScoringWeights {
+            w_failure: 0.0,
+            ..Default::default()
+        });
+        let low = g.compute_node_score(&node);
+        g.set_scoring_weights(ScoringWeights {
+            w_failure: 1.0,
+            ..Default::default()
+        });
+        let high = g.compute_node_score(&node);
+        assert!(
+            high > low,
+            "raising w_failure must raise a failing node's score"
+        );
+    }
+
+    #[test]
+    fn smaller_failure_decay_reduces_distant_pressure() {
+        let pressure_at_c = |decay: f64| {
+            let mut g = MemoryGraph::new(0.0, usize::MAX);
+            g.set_scoring_weights(ScoringWeights {
+                failure_decay: decay,
+                ..Default::default()
+            });
+            for n in ["a", "b", "c"] {
+                g.upsert_node(n.into(), n.into(), "".into(), NodeType::Module);
+            }
+            g.add_edge("a".into(), "b".into(), 1.0, EdgeType::DependsOn);
+            g.add_edge("b".into(), "c".into(), 1.0, EdgeType::DependsOn);
+            g.set_failure_relevance(&"a".into(), 1.0);
+            g.propagate_failure(&"a".into(), 0, 5);
+            g.nodes.get(&"c".into()).unwrap().failure_relevance
+        };
+        assert!(
+            pressure_at_c(0.9) > pressure_at_c(0.5),
+            "a smaller decay must attenuate failure pressure two hops out"
+        );
     }
 
     #[test]

@@ -24,6 +24,38 @@ Coding agents drown in context. CCOS reframes context management as an operating
 | Fault handling        | Failure detection → weighted propagation across edges    |
 | Syscall validation    | `GuardLayer` over every LLM response                     |
 
+## What the research found — honestly
+
+CCOS began as a bet that organising memory by **causal regions** would retrieve
+long-horizon context *better than RAG*. We built a validation harness to test that
+on real bugs — and the bet did not pay off:
+
+- On **70 real bug-fix commits** across `fd`, `bat`, `hyperfine`, causal selection
+  **ties a plain lexical TF-IDF retriever** at putting a fix's files in the window,
+  and **loses at a tight budget**. On real code a fix's files share vocabulary, so
+  lexical similarity finds them too.
+- A crash-trace pivot (seed CCOS from a panic backtrace) is **beaten by
+  RAG-over-the-error-message** — Rust error messages name the cause.
+- End-to-end (Phase 4: 30B model + compiler-in-the-loop), CCOS and RAG **resolve
+  equally** (2/10 real `fd` bugs) — **but CCOS does so on 6.9× fewer context
+  tokens** (776 vs 5366), and **4–9× fewer across 51 fixes from 3 crates**
+  (model-free): it stops at the causal working set instead of padding a top-k to
+  budget, and **self-calibrates with no k to tune**. **Efficiency is the one axis
+  where CCOS wins** (the baseline fills the budget by construction — a tuned-k RAG
+  would be sparser too; the point is CCOS bounds itself). See
+  [`cargo run --example time_travel`](examples/time_travel.rs) for the
+  time-travel debugging demo.
+
+We report this rather than bury it (see [`scripts/causal_validation/`](scripts/causal_validation/)
+and the [paper](docs/paper/)). It relocates CCOS's value:
+
+> **Not a better retriever — a _frugal, deterministic, replayable, auditable_ agent
+> memory.** It reaches the same result on a fraction of the context budget, and
+> every cognitive operation is event-sourced and hash-chained, so you can **rewind
+> an agent's exact context state** to any step and **replay it under different
+> parameters** (_time-travel debugging_, `agent_session`) — a capability a
+> probabilistic RAG/framework stack structurally lacks.
+
 ## Architecture
 
 ```
@@ -83,6 +115,8 @@ COMMANDS:
     regions <path>             Cluster the causal graph into context regions (--json)
         --activate <node-id>   Hydrate the context window for a node's region
         --metrics <node-id>    Flat-vs-region locality comparison (--radius N)
+    experiment [--tasks N]     Hypothesis test: regional memory vs RAG/GraphRAG (--json)
+    eval [--tasks N]           Real-LLM eval (set OPENAI_API_KEY or OLLAMA_ENDPOINT)
 
   CCOS v0.3 — Autonomous Context Runtime:
     scan <path>                Scan a real workspace and ingest the delta
@@ -187,11 +221,19 @@ cargo run -- regions src                                   # cluster → region 
 cargo run -- regions src --activate file:src/memory.rs     # hydrate a context window
 cargo run -- regions src --metrics sym:src/memory.rs:MemoryGraph --json  # flat vs region
 bash scripts/region_benchmark.sh src                       # full locality benchmark
+cargo run -- experiment --tasks 800                        # hypothesis test (oracle, vs RAG/GraphRAG)
+OPENAI_API_KEY=… OPENAI_BASE_URL=https://api.deepseek.com OPENAI_MODEL=… \
+  cargo run -- eval --tasks 40                              # real-LLM eval (needs a model + host allowlisted)
 ```
 
 On CCOS's own tree, region selection covers **97%** of a task's causal
 neighbourhood (vs 35% for flat top-score selection) at **≈48% fewer tokens**, with
-regions that are **95.5%** internally connected. See
+regions that are **95.5%** internally connected. In a deterministic, LLM-free
+simulation (`ccos experiment`), **lexical RAG solves 0%** of cross-file causal
+tasks while structure-aware methods solve 100%; and under a **misleading query**,
+every lexically-seeded method (RAG, GraphRAG, *and* an ablation of CCOS that
+trusts the query) collapses to **0%** while only the **workspace-anchored region
+survives** — isolating the *anchor* as CCOS's differentiator. See
 [`docs/context_regions.md`](docs/context_regions.md) and the research paper in
 [`docs/paper/`](docs/paper/).
 
@@ -210,10 +252,45 @@ cargo run -- runtime src --state data      # scan → schedule → agents → pe
 
 See [`CCOS_v0.3_REPORT.md`](CCOS_v0.3_REPORT.md) for the full v0.3 report.
 
+### Agent memory interface — `ccos memory` / `ccos mcp`
+
+Use CCOS as an agent's **external working memory** — ingest source, signal
+failures, recall a bounded causal window, verify the hash chain — over two
+transports on the same documented façade:
+
+```bash
+# Any language, via stdio JSON-Lines (checkpoint-backed):
+printf '%s\n' '{"op":"ingest","uri":"src/db.rs","source":"pub fn query() {}"}' \
+              '{"op":"recall","strategy":"around","anchor":"file:src/db.rs","budget":2048}' \
+  | cargo run -- memory --path workspace.ccos
+
+# Any MCP-compatible agent, via stdio JSON-RPC 2.0 (event-sourced, persistent):
+cargo run -- mcp workspace.ccos   # client config: {"command":"ccos","args":["mcp","workspace.ccos"]}
+```
+
+`ccos mcp` speaks the standard MCP handshake and advertises eight tools (`ingest`,
+`recall`, `signal_failure`, `page_fault`, `stats`, `verify`, plus the time-travel
+pair `timeline` / `recall_what_if`) and two resources — `ccos://session/context`,
+the self-bounding working set ready to inject into a system prompt, and
+`ccos://session/timeline`. Dependency-free, backed by the event-sourced session;
+pass a `workspace.ccos` to persist across restarts (shared with `ccos memory`). Full
+contract, tool schemas and a client-config snippet:
+[`docs/MEMORY_INTERFACE.md`](docs/MEMORY_INTERFACE.md).
+
+When a run goes wrong, `ccos postmortem [workspace.ccos]` opens an interactive
+**time-travel debugger** over the persisted timeline — a "GDB for the agent's
+memory". Walk the cognitive history step by step and watch the working set drift:
+`diff A B` shows which files entered/left, and `energy A B` shows the node-level
+score + failure-pressure migration through the AST as failures propagate.
+
+```bash
+printf '%s\n' 'goto 4' 'recall' 'energy 4 9' 'quit' | cargo run -- postmortem
+```
+
 ## Testing
 
 ```bash
-cargo test          # 202 unit + integration tests
+cargo test          # 212 unit + integration tests
 cargo clippy --all-targets   # lint-clean
 cargo test -- --ignored      # opt-in: 1,000,000-cycle long-stability run
 ```
@@ -241,6 +318,12 @@ Heavier stress/chaos harnesses live in [`scripts/`](scripts/) (multi-day chaos,
 - [`docs/USAGE.md`](docs/USAGE.md) — **command reference & walkthroughs**: every
   command with example invocations and output, an end-to-end "analyze a real
   project" tour, the snapshot/replay workflow, and a troubleshooting FAQ.
+- [`docs/MEMORY_INTERFACE.md`](docs/MEMORY_INTERFACE.md) — the **external-memory
+  interface**: the documented façade an agent uses to treat CCOS as working memory,
+  plus its two transports (`ccos memory` stdio JSON, and the `ccos mcp` MCP server).
+- [`docs/SELF_ANALYSIS.md`](docs/SELF_ANALYSIS.md) — **dogfooding**: wire CCOS into a
+  coding agent (`.mcp.json` + a PostToolUse "hardware intercept" hook) so its runs
+  feed a causal memory you debug post-mortem when it drifts.
 - [`docs/context_regions.md`](docs/context_regions.md) — the **Context Region
   Engine** (v0.3): spatial memory model, formal region definition, dynamic
   admission policy, determinism, and measured locality.

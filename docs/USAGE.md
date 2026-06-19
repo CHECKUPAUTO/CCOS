@@ -250,6 +250,84 @@ cargo run -- runtime src --state data --budget 2048
 
 See [`../CCOS_v0.3_REPORT.md`](../CCOS_v0.3_REPORT.md) for the full v0.3 report.
 
+### `memory` — external-memory façade (stdio JSON)
+
+Use CCOS as an agent's external working memory from any language: one JSON
+request per line on stdin, one JSON response per line on stdout. The workspace is
+loaded from `--path` (default `workspace.ccos`) and checkpointed back on mutation.
+
+```bash
+printf '%s\n' \
+  '{"op":"ingest","uri":"src/db.rs","source":"pub fn query() {}"}' \
+  '{"op":"failure","node":"file:src/db.rs","depth":3}' \
+  '{"op":"recall","strategy":"around","anchor":"file:src/db.rs","budget":2048}' \
+  '{"op":"verify"}' \
+  | ccos memory --path workspace.ccos
+```
+
+Ops: `ingest`, `failure`, `recall` (`strategy` ∈ `around`/`task`/`working_set`),
+`impact`, `causes`, `verify`, `stats`. Full contract and a Python example:
+[`MEMORY_INTERFACE.md`](MEMORY_INTERFACE.md).
+
+### `mcp [workspace.ccos]` — serve memory as MCP tools + resources (stdio JSON-RPC)
+
+Expose the same memory to any **MCP-compatible agent** (Claude, a local agent on
+the Jetson, …) over stdio JSON-RPC 2.0 — no HTTP server, no extra dependency. Pass a
+**workspace path** (or set `CCOS_MCP_WORKSPACE`) to reload it on start and checkpoint
+after every memory-changing call, so the memory survives restarts; omit it for an
+ephemeral in-process session. The on-disk form is shared with `ccos memory`.
+
+```bash
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{}}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ingest","arguments":{"uri":"src/db.rs","source":"pub fn query() {}"}}}' \
+  '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"recall","arguments":{"strategy":"around","anchor":"file:src/db.rs","budget":2048}}}' \
+  | ccos mcp workspace.ccos
+```
+
+Tools: `ingest`, `recall`, `signal_failure`, `page_fault` (feed cargo-test/panic
+output back in), `stats`, `verify`, plus the time-travel pair `timeline` /
+`recall_what_if` (rewind to a past step and re-run a recall — the timeline persists
+in a `<workspace>.oplog` sidecar, so this spans restarts). Resources:
+`ccos://session/context` (the self-bounding working set, ready to inject into a
+system prompt) and `ccos://session/timeline`. Point an MCP client's stdio transport
+at `ccos mcp` (`{"command":"ccos","args":["mcp","workspace.ccos"]}`). Full handshake,
+tool schemas and a client-config snippet:
+[`MEMORY_INTERFACE.md`](MEMORY_INTERFACE.md#serving-over-mcp-ccos-mcp).
+
+---
+
+### `postmortem [workspace.ccos]` — interactive time-travel debugger
+
+The "GDB for the agent's memory": walk a recorded cognitive timeline by hand and
+watch the working set drift as failures propagate. With a workspace path it loads the
+persisted op-log (`<workspace>.oplog` from `ccos mcp`, even after a crashed run); with
+none it walks a built-in session that drifts.
+
+```bash
+printf '%s\n' 'timeline' 'goto 4' 'recall' 'goto 9' 'recall' 'diff 4 9' 'energy 4 9' 'quit' \
+  | cargo run -- postmortem
+```
+
+REPL commands: `timeline`/`tl` (journal, `▸` marks the cursor), `goto N` / `next` /
+`prev` (move the time-travel cursor), `recall [budget]` / `around <anchor> [budget]` /
+`task <text…>` (the window as of the cursor), `stats`, and two drift views:
+
+- `diff A B` — which **files** entered/left the working set between two steps.
+- `energy A B` — node-level **Δscore + failure-pressure**: the migration of causal
+  "heat" through the AST as failures propagate (e.g. the deep cause `db.rs` surging
+  `fail 0.00→0.95` after a page-fault, even when the file set itself is unchanged).
+- `missing <node> [budget]` — an **eviction watchpoint**: scan the timeline for the
+  first step a node is in the graph but has dropped out of the budgeted window, with
+  the triggering op and how many tokens short it fell. A status strip shows it at a
+  glance — `·●●●●●○○●●` reads as "the cause was in context until a failure on a
+  neighbour squeezed it out (`○○`), then a page-fault pulled it back". It composes
+  with compaction: an eviction in folded history is reported against the floor rather
+  than guessed.
+
+Every command reconstructs state deterministically from the op-log via
+[`recall_what_if`](MEMORY_INTERFACE.md) / replay — exact and side-effect free.
+
 ---
 
 ## End-to-end walkthrough
