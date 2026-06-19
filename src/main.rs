@@ -56,6 +56,10 @@ async fn main() {
         "eval" => run_eval_cmd(rest).await,
         "memory" => run_memory_cmd(rest),
         "trace" => run_trace_cmd(),
+        "mcp" => {
+            ccos::mcp::serve();
+            0
+        }
         // ── CCOS v0.3 — Autonomous Context Runtime ──────────────────
         "scan" => commands_runtime::run_scan(rest).await,
         "agents" => commands_runtime::run_agents(rest).await,
@@ -1725,6 +1729,7 @@ COMMANDS:\n\
     eval [--tasks N] [--model M]  Real-LLM eval (ANTHROPIC/OPENAI_API_KEY or OLLAMA_ENDPOINT)\n\
     memory [--path FILE]       External-memory façade over stdin JSON Lines (ingest/recall/verify)\n\
     trace                      Parse cargo-test/panic/backtrace (stdin) into the crash's source files\n\
+    mcp                        Serve memory as MCP tools over stdio JSON-RPC (for MCP-compatible agents)\n\
 \n\
   CCOS v0.3 — Autonomous Context Runtime:\n\
     scan <path>                Scan a real workspace and ingest the delta\n\

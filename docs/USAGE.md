@@ -269,6 +269,25 @@ Ops: `ingest`, `failure`, `recall` (`strategy` ∈ `around`/`task`/`working_set`
 `impact`, `causes`, `verify`, `stats`. Full contract and a Python example:
 [`MEMORY_INTERFACE.md`](MEMORY_INTERFACE.md).
 
+### `mcp` — serve memory as MCP tools (stdio JSON-RPC)
+
+Expose the same memory to any **MCP-compatible agent** (Claude, a local agent on
+the Jetson, …) over stdio JSON-RPC 2.0 — no HTTP server, no extra dependency. The
+memory is a live, event-sourced session for the life of the connection.
+
+```bash
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{}}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ingest","arguments":{"uri":"src/db.rs","source":"pub fn query() {}"}}}' \
+  '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"recall","arguments":{"strategy":"around","anchor":"file:src/db.rs","budget":2048}}}' \
+  | ccos mcp
+```
+
+Tools: `ingest`, `recall`, `signal_failure`, `page_fault` (feed cargo-test/panic
+output back in), `stats`, `verify`. Point an MCP client's stdio transport at
+`ccos mcp` (`{"command":"ccos","args":["mcp"]}`). Full handshake, tool schemas and a
+client-config snippet: [`MEMORY_INTERFACE.md`](MEMORY_INTERFACE.md#serving-over-mcp-ccos-mcp).
+
 ---
 
 ## End-to-end walkthrough

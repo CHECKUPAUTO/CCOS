@@ -252,6 +252,27 @@ cargo run -- runtime src --state data      # scan → schedule → agents → pe
 
 See [`CCOS_v0.3_REPORT.md`](CCOS_v0.3_REPORT.md) for the full v0.3 report.
 
+### Agent memory interface — `ccos memory` / `ccos mcp`
+
+Use CCOS as an agent's **external working memory** — ingest source, signal
+failures, recall a bounded causal window, verify the hash chain — over two
+transports on the same documented façade:
+
+```bash
+# Any language, via stdio JSON-Lines (checkpoint-backed):
+printf '%s\n' '{"op":"ingest","uri":"src/db.rs","source":"pub fn query() {}"}' \
+              '{"op":"recall","strategy":"around","anchor":"file:src/db.rs","budget":2048}' \
+  | cargo run -- memory --path workspace.ccos
+
+# Any MCP-compatible agent, via stdio JSON-RPC 2.0 (live event-sourced session):
+cargo run -- mcp        # point a client's stdio transport at this: {"command":"ccos","args":["mcp"]}
+```
+
+`ccos mcp` speaks the standard MCP handshake and advertises six tools (`ingest`,
+`recall`, `signal_failure`, `page_fault`, `stats`, `verify`) — dependency-free,
+backed by the event-sourced session, so it stays replayable. Full contract, tool
+schemas and a client-config snippet: [`docs/MEMORY_INTERFACE.md`](docs/MEMORY_INTERFACE.md).
+
 ## Testing
 
 ```bash
@@ -283,6 +304,9 @@ Heavier stress/chaos harnesses live in [`scripts/`](scripts/) (multi-day chaos,
 - [`docs/USAGE.md`](docs/USAGE.md) — **command reference & walkthroughs**: every
   command with example invocations and output, an end-to-end "analyze a real
   project" tour, the snapshot/replay workflow, and a troubleshooting FAQ.
+- [`docs/MEMORY_INTERFACE.md`](docs/MEMORY_INTERFACE.md) — the **external-memory
+  interface**: the documented façade an agent uses to treat CCOS as working memory,
+  plus its two transports (`ccos memory` stdio JSON, and the `ccos mcp` MCP server).
 - [`docs/context_regions.md`](docs/context_regions.md) — the **Context Region
   Engine** (v0.3): spatial memory model, formal region definition, dynamic
   admission policy, determinism, and measured locality.

@@ -4,9 +4,9 @@ A single, documented façade for using CCOS as an agent's **external working
 memory**: write code and failure signals in, recall a bounded, causally-coherent
 context window out, and keep an auditable, hash-chained state on disk.
 
-It is the in-process Rust surface (`ccos::external_memory`). A network server or a
-stdio CLI can be layered on top later — both would call exactly this API — but the
-façade is the contract.
+It is the in-process Rust surface (`ccos::external_memory`). Two transports ship on
+top of it and call exactly this API — a stdio JSON-Lines CLI (`ccos memory`) and a
+**Model Context Protocol server** (`ccos mcp`) — but the façade is the contract.
 
 - [Why](#why)
 - [Quick start](#quick-start)
@@ -15,6 +15,8 @@ façade is the contract.
 - [Node identity](#node-identity)
 - [Persistence & integrity](#persistence--integrity)
 - [A typical agent loop](#a-typical-agent-loop)
+- [Driving it from any language (`ccos memory`)](#driving-it-from-any-language-ccos-memory)
+- [Serving over MCP (`ccos mcp`)](#serving-over-mcp-ccos-mcp)
 - [Guarantees](#guarantees)
 - [Limitations](#limitations)
 
@@ -212,6 +214,60 @@ for it in win["items"]:
     print(it["score"], it["uri"])
 ```
 
+## Serving over MCP (`ccos mcp`)
+
+`ccos mcp` exposes the same façade as a [Model Context Protocol](https://modelcontextprotocol.io)
+server over **stdio JSON-RPC 2.0**, so any MCP-compatible agent (Claude, a local
+agent on the Jetson, …) can use CCOS as native working memory — no HTTP server, no
+new dependency (it is `serde_json` only). The session is event-sourced, so the
+whole interaction stays replayable.
+
+It speaks the standard handshake (`initialize` → `notifications/initialized` →
+`tools/list` / `tools/call`, plus `ping`) and advertises six tools:
+
+| Tool | Arguments | Maps to |
+| ---- | --------- | ------- |
+| `ingest` | `uri`, `source` | `ingest_source` |
+| `recall` | `strategy` ∈ `around`/`task`/`working_set`, `anchor`/`text`, `budget` | `recall` |
+| `signal_failure` | `node`, `depth` | `signal_failure` |
+| `page_fault` | `output` (cargo-test/panic text), `budget` | parse trace → signal faulting files → recall |
+| `stats` | — | `stats` |
+| `verify` | — | `verify` |
+
+Each `tools/call` returns the corresponding `Serialize` type (above) as JSON inside
+the MCP `content[0].text` field. Tool-level failures come back as
+`{"content":[…],"isError":true}`; protocol errors use standard JSON-RPC codes
+(`-32601` unknown method, `-32602` bad params, `-32700` parse error).
+
+Point an MCP client's **stdio transport** at the binary. For example, a client
+config entry:
+
+```json
+{
+  "mcpServers": {
+    "ccos-memory": {
+      "command": "ccos",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+Or drive it directly over a pipe (one JSON message per line in, one per line out):
+
+```bash
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{}}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ingest","arguments":{"uri":"src/db.rs","source":"pub fn query() {}"}}}' \
+  '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"recall","arguments":{"strategy":"around","anchor":"file:src/db.rs","budget":2048}}}' \
+  | ccos mcp
+```
+
+Unlike `ccos memory`, the MCP server holds its memory **in-process for the life of
+the connection** (an event-sourced `AgentSession`) rather than checkpointing to a
+file each batch — it is a live session, not a one-shot. Persisting an MCP session
+to disk is not yet wired up.
+
 ## Guarantees
 
 - **Deterministic recall** — a total order on `(score, uri)`; same memory, same
@@ -228,5 +284,7 @@ for it in win["items"]:
   fine for interactive use, not for tight inner loops on huge graphs.
 - `Task` uses a deliberately simple lexical entry point (no embeddings) — it is a
   convenience, not a semantic retriever; prefer `Around` with a real anchor.
-- A **stdio JSON CLI** (`ccos memory`) ships on top of this façade (see above); a
-  network/HTTP server is not included, but would layer on the same trait.
+- Two transports ship on top of this façade: a **stdio JSON-Lines CLI**
+  (`ccos memory`, checkpoint-backed) and an **MCP server** (`ccos mcp`, live
+  event-sourced session). A network/HTTP server is not included, but would layer on
+  the same trait. The MCP session is not yet persisted to disk between connections.

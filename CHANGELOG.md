@@ -21,6 +21,15 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **MCP server** (`ccos mcp`, `mcp` module) — exposes the external-memory façade
+  as [Model Context Protocol](https://modelcontextprotocol.io) tools over **stdio
+  JSON-RPC 2.0**, so any MCP-compatible agent (Claude, a local agent on the Jetson)
+  can use CCOS as native working memory. Dependency-free (`serde_json` only); speaks
+  the standard `initialize` / `tools/list` / `tools/call` / `ping` handshake and
+  advertises six tools (`ingest`, `recall`, `signal_failure`, `page_fault`, `stats`,
+  `verify`) backed by a live, event-sourced `AgentSession`. Point a client's stdio
+  transport at it: `{"command":"ccos","args":["mcp"]}`. See
+  [`MEMORY_INTERFACE.md`](docs/MEMORY_INTERFACE.md#serving-over-mcp-ccos-mcp).
 - **Time-travel debugging demo** (`examples/time_travel.rs`, `cargo run --example
   time_travel`) — an agent session that drifts (a tight-budget recall evicts the
   cause two hops away), then is debugged by rewinding to the exact recall and

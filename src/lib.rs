@@ -40,6 +40,9 @@
 //!   / [`external_memory::CcosMemory`]) an agent uses to treat CCOS as external
 //!   working memory: ingest source, signal failures, recall a bounded causal
 //!   window, verify, and checkpoint.
+//! - [`mcp`] — a dependency-free [Model Context Protocol](https://modelcontextprotocol.io)
+//!   server (stdio JSON-RPC 2.0) that exposes the [`external_memory`] façade as MCP
+//!   tools, so any MCP-compatible agent can use CCOS as native working memory.
 //! - [`region_engine`] — the **Context Region Engine** (v0.3): clusters the
 //!   graph into spatial [`region_engine::ContextRegionEngine`] regions that are
 //!   hydrated as context windows, with a dynamic [`context_policy`] admission
@@ -62,6 +65,7 @@ pub mod external_memory;
 pub mod guard;
 pub mod incremental;
 pub mod llm;
+pub mod mcp;
 pub mod memory;
 pub mod parser;
 pub mod persist;
