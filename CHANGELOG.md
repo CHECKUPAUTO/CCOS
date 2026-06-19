@@ -45,6 +45,16 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   memory (only deep historical rewind is traded away). Point a client's stdio
   transport at it: `{"command":"ccos","args":["mcp","workspace.ccos"]}`. See
   [`MEMORY_INTERFACE.md`](docs/MEMORY_INTERFACE.md#serving-over-mcp-ccos-mcp).
+- **Interactive post-mortem debugger** (`ccos postmortem [workspace.ccos]`,
+  `postmortem` module) — a "GDB for the agent's memory": load a persisted timeline
+  (`<workspace>.oplog`, even after a crashed run) or a built-in drifting session and
+  walk it by hand. A REPL cursor time-travels the cognitive timeline (`timeline`,
+  `goto`/`next`/`prev`, `recall`/`around`/`task` at the cursor) and two drift views
+  surface how the working set moved: `diff A B` (files that entered/left) and
+  `energy A B` (node-level Δscore + failure-pressure — the migration of causal heat
+  through the AST as failures propagate, visible even when the file set is stable).
+  Every command reconstructs state deterministically via `recall_what_if`/replay, so
+  it is exact and side-effect free.
 - **Time-travel debugging demo** (`examples/time_travel.rs`, `cargo run --example
   time_travel`) — an agent session that drifts (a tight-budget recall evicts the
   cause two hops away), then is debugged by rewinding to the exact recall and

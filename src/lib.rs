@@ -43,6 +43,10 @@
 //! - [`mcp`] — a dependency-free [Model Context Protocol](https://modelcontextprotocol.io)
 //!   server (stdio JSON-RPC 2.0) that exposes the [`external_memory`] façade as MCP
 //!   tools, so any MCP-compatible agent can use CCOS as native working memory.
+//! - [`postmortem`] — an interactive **time-travel debugger** over an
+//!   [`agent_session::AgentSession`]: walk a recorded (or persisted) cognitive
+//!   timeline by hand, inspect how the recalled context window drifts, and diff two
+//!   points in the agent's history.
 //! - [`region_engine`] — the **Context Region Engine** (v0.3): clusters the
 //!   graph into spatial [`region_engine::ContextRegionEngine`] regions that are
 //!   hydrated as context windows, with a dynamic [`context_policy`] admission
@@ -69,6 +73,7 @@ pub mod mcp;
 pub mod memory;
 pub mod parser;
 pub mod persist;
+pub mod postmortem;
 pub mod query;
 pub mod trace;
 pub mod util;

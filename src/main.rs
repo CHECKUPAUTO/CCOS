@@ -72,6 +72,7 @@ async fn main() {
                 }
             }
         }
+        "postmortem" => run_postmortem(rest),
         // ── CCOS v0.3 — Autonomous Context Runtime ──────────────────
         "scan" => commands_runtime::run_scan(rest).await,
         "agents" => commands_runtime::run_agents(rest).await,
@@ -1538,6 +1539,27 @@ fn run_memory_cmd(args: &[String]) -> i32 {
     i32::from(had_error)
 }
 
+/// `ccos postmortem [workspace.ccos]` — open the interactive **time-travel
+/// debugger** over an agent session's recorded timeline. With a workspace path it
+/// loads the persisted op-log (`<workspace>.oplog` written by `ccos mcp`);
+/// with none it walks a built-in session that drifts. Reads REPL commands on
+/// stdin (`timeline`, `goto N`, `recall`, `diff A B`, `help`, `quit`).
+fn run_postmortem(args: &[String]) -> i32 {
+    let path = args.iter().find(|a| !a.starts_with("--"));
+    let session = match path {
+        Some(p) => match ccos::agent_session::AgentSession::open(p) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("ccos: cannot open session '{p}': {e}");
+                return 1;
+            }
+        },
+        None => ccos::postmortem::demo_session(),
+    };
+    ccos::postmortem::serve(session);
+    0
+}
+
 /// `ccos eval [--tasks N] [--seed S] [--budget T] [--model M] [--json]` — the
 /// **real-LLM** evaluation (clean + noisy). Configure a model with
 /// `ANTHROPIC_API_KEY` (+`ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL`), `OPENAI_API_KEY`
@@ -1743,6 +1765,8 @@ COMMANDS:\n\
     trace                      Parse cargo-test/panic/backtrace (stdin) into the crash's source files\n\
     mcp [workspace.ccos]       Serve memory as MCP tools + resources over stdio JSON-RPC\n\
     \x20                          (persistent if a workspace path is given; for MCP-compatible agents)\n\
+    postmortem [workspace]     Interactive time-travel debugger over a session timeline\n\
+    \x20                          (loads <workspace>.oplog, or walks a built-in drifting session)\n\
 \n\
   CCOS v0.3 — Autonomous Context Runtime:\n\
     scan <path>                Scan a real workspace and ingest the delta\n\

@@ -277,6 +277,16 @@ pass a `workspace.ccos` to persist across restarts (shared with `ccos memory`). 
 contract, tool schemas and a client-config snippet:
 [`docs/MEMORY_INTERFACE.md`](docs/MEMORY_INTERFACE.md).
 
+When a run goes wrong, `ccos postmortem [workspace.ccos]` opens an interactive
+**time-travel debugger** over the persisted timeline — a "GDB for the agent's
+memory". Walk the cognitive history step by step and watch the working set drift:
+`diff A B` shows which files entered/left, and `energy A B` shows the node-level
+score + failure-pressure migration through the AST as failures propagate.
+
+```bash
+printf '%s\n' 'goto 4' 'recall' 'energy 4 9' 'quit' | cargo run -- postmortem
+```
+
 ## Testing
 
 ```bash

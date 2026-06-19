@@ -297,6 +297,32 @@ tool schemas and a client-config snippet:
 
 ---
 
+### `postmortem [workspace.ccos]` — interactive time-travel debugger
+
+The "GDB for the agent's memory": walk a recorded cognitive timeline by hand and
+watch the working set drift as failures propagate. With a workspace path it loads the
+persisted op-log (`<workspace>.oplog` from `ccos mcp`, even after a crashed run); with
+none it walks a built-in session that drifts.
+
+```bash
+printf '%s\n' 'timeline' 'goto 4' 'recall' 'goto 9' 'recall' 'diff 4 9' 'energy 4 9' 'quit' \
+  | cargo run -- postmortem
+```
+
+REPL commands: `timeline`/`tl` (journal, `▸` marks the cursor), `goto N` / `next` /
+`prev` (move the time-travel cursor), `recall [budget]` / `around <anchor> [budget]` /
+`task <text…>` (the window as of the cursor), `stats`, and two drift views:
+
+- `diff A B` — which **files** entered/left the working set between two steps.
+- `energy A B` — node-level **Δscore + failure-pressure**: the migration of causal
+  "heat" through the AST as failures propagate (e.g. the deep cause `db.rs` surging
+  `fail 0.00→0.95` after a page-fault, even when the file set itself is unchanged).
+
+Every command reconstructs state deterministically from the op-log via
+[`recall_what_if`](MEMORY_INTERFACE.md) / replay — exact and side-effect free.
+
+---
+
 ## End-to-end walkthrough
 
 Analyze a real project, inspect it, and prove the session is reproducible:
