@@ -33,6 +33,9 @@
 //! - [`trace`] — the dynamic layer: parse `cargo test` / panic / backtrace output
 //!   into the source locations a crash touched (a direct symptom→cause path), to
 //!   seed a *context page fault* instead of a diffuse structural walk.
+//! - [`agent_session`] — an event-sourced cognitive timeline: record an agent's
+//!   memory operations, replay the exact state at any step, and run *what-if*
+//!   recalls (time-travel debugging) — the deterministic/auditable angle RAG lacks.
 //! - [`external_memory`] — a documented façade ([`external_memory::ExternalMemory`]
 //!   / [`external_memory::CcosMemory`]) an agent uses to treat CCOS as external
 //!   working memory: ingest source, signal failures, recall a bounded causal
@@ -51,6 +54,7 @@
 //! `HashMap` iteration order.
 
 pub mod adversarial;
+pub mod agent_session;
 pub mod consensus;
 pub mod distributed_event_log;
 pub mod event_log;
