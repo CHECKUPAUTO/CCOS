@@ -21,6 +21,12 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Deeper page-fault propagation.** A page-fault now injects failure pressure to
+  depth **3** (was 2), configurable via `CCOS_PAGE_FAULT_DEPTH` — a Jetson field run
+  showed depth 2 left a 3-hop-deep cause un-pressurised (the symptom got hot, the
+  cause stayed cold and was evicted under a tight budget). The depth is recorded in
+  the op-log so replay reproduces the exact pressure (old logs default to the
+  historical depth of 2); determinism preserved.
 - **Field-data collection.** `ccos postmortem <workspace> --json` dumps an
   analytics-ready field record (version, stats, hash-chain integrity, timeline,
   compaction floor, current working set) and exits — the non-interactive way to
