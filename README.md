@@ -1,51 +1,94 @@
 # CCOS — Causal Context Operating System
 
-> **An external working memory for coding agents.** CCOS keeps the *right* code in
-> an LLM agent's context the way a CPU's MMU manages memory — a causal graph of the
-> codebase, paged against a token budget — and records every step in a
-> deterministic, replayable, hash-chained log you can rewind and audit.
+> A local, deterministic **cognitive MMU** for LLM coding agents: it keeps the
+> *right* code in the agent's context window, and makes the agent's attention
+> **auditable** when a long-horizon session drifts.
 
-CCOS gives a coding agent a memory that is **frugal, deterministic, replayable, and
-auditable**, plus the tooling to debug the agent's attention when a run goes wrong:
+CCOS treats an agent's working memory the way a CPU's MMU treats RAM. It maps the
+side effects of a coding session — files read, compiler/test failures, panics —
+into a causal graph, pages that graph against a token budget, and records every
+transition in a deterministic, replayable, hash-chained log. It exposes a
+self-bounding, linearised context window a host can inject into its prompt, plus a
+post-mortem debugger to rewind to exactly where the agent's attention went off the
+rails.
 
-- **A memory server any agent plugs into.** `ccos mcp` speaks the
-  [Model Context Protocol](https://modelcontextprotocol.io) over stdio, so an
-  MCP-compatible agent (Claude Code, a local agent on a Jetson) uses CCOS as native
-  working memory: ingest code, signal failures, recall a bounded causal window —
-  persisted across restarts.
-- **Time-travel sessions.** Every cognitive operation is event-sourced, so you can
-  rewind the agent's exact context to any past step and replay it under different
-  parameters (a larger budget, a different anchor).
-- **A post-mortem debugger.** `ccos postmortem` is "GDB for the agent's memory":
-  walk the cognitive timeline and watch the working set drift — down to the exact
-  step the real cause was evicted from the budgeted window (`missing`, the eviction
-  watchpoint) and the node-level pressure that pushed it out (`energy`).
-- **Transparent self-instrumentation.** A drop-in hook feeds an agent's own file
-  reads and failed test runs into CCOS automatically, so its drifts are reproducible
-  after the fact ([`docs/SELF_ANALYSIS.md`](docs/SELF_ANALYSIS.md)).
-
-CCOS is **not a retriever and not a RAG replacement** — a lexical baseline matches it
-at putting a fix's files in the window. Its value is the axis a probabilistic
-RAG/framework stack structurally lacks: it reaches the same result on a fraction of
-the context budget (it self-bounds at the causal region, with no top-k to tune), and
-every step is deterministic, replayable, and tamper-evident. The research story
+**What it is, honestly.** CCOS is *not* a better retriever — on real bugs a lexical
+baseline matches it at putting a fix's files in the window. Its value is the axis a
+probabilistic RAG/framework stack structurally lacks: it reaches the same result on a
+fraction of the context budget (it self-bounds at the causal region, with no top-k to
+tune), and every step is deterministic, replayable and auditable. The research story
 behind that conclusion — the original hypothesis, the bug-mining harness, the
-measurements against RAG/GraphRAG — lives in the paper, not here:
-[`docs/paper/`](docs/paper/).
-
-| OS / MMU concept     | CCOS analogue                                                |
-| -------------------- | ------------------------------------------------------------ |
-| Pages / working set  | Graph nodes (files, modules, symbols, imports)               |
-| Paging to a budget   | causal `recall` / `select_context_window` + `enforce_paging` |
-| Page fault           | feed a compiler/test failure back in → re-page the region    |
-| Scheduling priority  | causal score (importance · failure · recency · access)       |
-| Write-ahead log      | append-only, **hash-chained** event log (replay + audit)     |
-| Fault propagation    | failure pressure weighted across causal edges                |
-
-CCOS is a research prototype in Rust (edition 2021) — see
+measurements against RAG/GraphRAG — lives in [`docs/paper/`](docs/paper/) (six
+languages). CCOS is a research prototype in Rust (edition 2021); see
 [Status & limitations](#status--limitations).
 
----
+## The cognitive-MMU cycle
+
+```
+  [Host / IDE] ◄──── (linearised, bounded context) ──────┐
+       │                                                  │
+       ▼  (optional PostToolUse hook — docs/SELF_ANALYSIS) │
+  [page fault / ingest]                                   │
+       │                                                  │
+       ▼                                                  │
+  [CCOS kernel] ──► [causal graph + scoring / paging] ────┘
+       │
+       ▼  (on every state change)
+  [storage] ──► workspace.ccos       (snapshot, shared with `ccos memory`)
+            └─► workspace.ccos.oplog  (compacted op-log → time-travel)
+```
+
+## Capabilities
+
+### 1. Demand paging by causal pressure
+
+- **Self-calibration.** CCOS assembles a token-bounded working set from node
+  activation in the causal graph — typically **700–1600 context tokens** where
+  budget-filling lexical RAG uses **~5000–6000** on the same single-file fixes (a
+  measured **4–9× reduction**). It stops at the causal region instead of padding a
+  top-k to budget; there is no `k` to tune. Efficiency is the *one* axis CCOS wins —
+  a carefully tuned-k RAG would also be sparser; the point is that CCOS bounds
+  *itself*.
+- **Context page fault.** Feed `cargo test` / panic output back in: CCOS parses the
+  faulting source locations from the trace, injects failure pressure on those files,
+  and re-pages a refreshed window for the next attempt. (It targets the files the
+  trace names — often the *symptom* site; the post-mortem tools below let you check
+  whether the deep cause actually entered the window.)
+
+### 2. Transactional, replayable storage
+
+- **Hybrid event-sourcing.** A structural snapshot (`.ccos`) plus an operation log
+  (`.oplog`), persisted on every change; the snapshot format is shared with the
+  `ccos memory` transport.
+- **Deterministic compaction.** Older ops fold into the baseline past a threshold
+  (`CCOS_OPLOG_MAX` / `CCOS_OPLOG_KEEP`), keeping the op-log bounded for long-running
+  sessions (e.g. on a Jetson) while preserving **absolute step indices** — so
+  time-travel stays index-stable across a compaction.
+- **Cross-restart resilience.** Reopen a workspace and the cognitive timeline is
+  restored: replay and time-travel span restarts (up to the compaction floor), even
+  after the daemon was killed. A stale log that no longer reproduces the snapshot
+  self-heals to the snapshot — the memory is never corrupted.
+
+### 3. Standard MCP transport
+
+- **Stdio JSON-RPC server.** Native, synchronous, zero-network integration with any
+  MCP-compatible host (e.g. Claude Code). Eight tools: `ingest`, `recall`,
+  `signal_failure`, `page_fault`, `stats`, `verify`, `timeline`, `recall_what_if`.
+- **Dynamic resources.** `ccos://session/context` exposes the self-bounding working
+  set for the host to drop into its system prompt; `ccos://session/timeline` exposes
+  the cognitive journal.
+
+### 4. Post-mortem debugging (`ccos postmortem`)
+
+- **Time-travel REPL.** Step a cursor backward/forward through the agent's recorded
+  memory; recall the window as it stood at any past step (deterministic replay).
+- **Diff vs energy views.** Contrast which *files* entered/left the working set
+  (`diff A B`) against the node-level *causal-heat migration* through the graph
+  (`energy A B`) — drift the file view misses when the file set is stable.
+- **Eviction watchpoint (`missing <node>`).** Find the exact step a node was squeezed
+  out of the budgeted window by competing pressure, with the triggering op and the
+  token gap — e.g. `·●●●●●○○●●` reads "in context until a failure made a neighbour hot
+  and evicted the real cause, then a page-fault pulled it back".
 
 ## Quickstart — give your agent a memory
 
@@ -53,85 +96,33 @@ CCOS is a research prototype in Rust (edition 2021) — see
 cargo build --release          # → ./target/release/ccos
 ```
 
-Plug CCOS into an MCP-compatible agent. The repo ships a project
-[`.mcp.json`](.mcp.json):
+Wire CCOS into an MCP-compatible host. The repo ships a project [`.mcp.json`](.mcp.json):
 
 ```json
-{ "mcpServers": { "ccos": { "command": "./target/release/ccos", "args": ["mcp", "workspace.ccos"] } } }
+{
+  "mcpServers": {
+    "ccos": { "command": "./target/release/ccos", "args": ["mcp", "workspace.ccos"] }
+  }
+}
 ```
 
-The agent now has CCOS tools (`ingest`, `recall`, `signal_failure`, `page_fault`,
-`timeline`, `recall_what_if`, `stats`, `verify`) and the `ccos://session/context`
-resource — its self-bounding working set, ready to inject into a system prompt.
-Memory persists in `workspace.ccos` (plus a `.oplog` timeline) across restarts.
-
-When a run drifts, debug it post-mortem:
+The agent now has the CCOS tools and the `ccos://session/context` resource; memory
+persists in `workspace.ccos` (+ a `.oplog` timeline) across restarts. When a run
+drifts, debug it post-mortem:
 
 ```bash
 printf '%s\n' 'timeline' 'missing src/db.rs 40' 'energy 4 9' 'quit' \
   | ccos postmortem workspace.ccos
 ```
 
-## Agent memory — `ccos mcp` / `ccos memory`
-
-Use CCOS as an agent's external working memory — ingest source, signal failures,
-recall a bounded causal window, verify the hash chain — over two transports on the
-same documented façade:
-
-```bash
-# Any MCP-compatible agent, via stdio JSON-RPC 2.0 (event-sourced, persistent):
-ccos mcp workspace.ccos
-
-# Any language, via stdio JSON-Lines (checkpoint-backed):
-printf '%s\n' '{"op":"ingest","uri":"src/db.rs","source":"pub fn query() {}"}' \
-              '{"op":"recall","strategy":"around","anchor":"file:src/db.rs","budget":2048}' \
-  | ccos memory --path workspace.ccos
-```
-
-`ccos mcp` speaks the standard MCP handshake and advertises eight tools and two
-resources (`ccos://session/context`, the self-bounding working set, and
-`ccos://session/timeline`). Pass a `workspace.ccos` to persist across restarts; the
-op-log compacts so a long-running session stays bounded. Full contract, tool schemas
-and a client-config snippet: [`docs/MEMORY_INTERFACE.md`](docs/MEMORY_INTERFACE.md).
-
-## Post-mortem debugging — `ccos postmortem`
-
-A "GDB for the agent's memory": walk a recorded (or persisted) cognitive timeline by
-hand and watch the working set drift as failures propagate. With a workspace path it
-loads the persisted op-log (even after a crashed run); with none it walks a built-in
-session that drifts.
-
-```bash
-ccos postmortem workspace.ccos     # then: timeline / goto N / recall / diff / energy / missing
-```
-
-A cursor time-travels the timeline (`goto`, `next`/`prev`, `recall`/`around`/`task`
-as of the cursor), and three drift views explain what happened:
-
-- `diff A B` — which **files** entered/left the working set between two steps.
-- `energy A B` — node-level **Δscore + failure-pressure**, the migration of causal
-  "heat" through the AST as failures propagate (visible even when the file set is
-  stable).
-- `missing <node> [budget]` — an **eviction watchpoint**: the exact step a node drops
-  out of the budgeted window, the triggering op, and the token gap. A status strip
-  reads at a glance — `·●●●●●○○●●`: in context until a failure made a neighbour hot
-  and squeezed the real cause out, then a page-fault pulled it back.
-
-Every command reconstructs state deterministically via replay — exact and
-side-effect free.
-
-## Self-analysis — dogfood CCOS on your own agent
-
-Wire CCOS into a coding agent so its runs feed a causal memory you can then debug.
-The repo ships the `.mcp.json` above (the agent queries its memory) and
-[`scripts/ccos_self_feed.py`](scripts/ccos_self_feed.py), a PostToolUse hook — a
-transparent "hardware intercept" that turns every source file read into an `ingest`
-and every failed `cargo test/build` into a `page_fault`, with zero cognitive overhead.
-Methodology and the post-mortem protocol: [`docs/SELF_ANALYSIS.md`](docs/SELF_ANALYSIS.md).
+Agent-memory contract and MCP tool schemas:
+[`docs/MEMORY_INTERFACE.md`](docs/MEMORY_INTERFACE.md). Wiring CCOS to feed an agent's
+own runs automatically (the transparent PostToolUse "hardware intercept") and the
+post-mortem protocol: [`docs/SELF_ANALYSIS.md`](docs/SELF_ANALYSIS.md).
 
 ## Inspect the causal graph (CLI)
 
-CCOS can also be driven directly to analyse a codebase's causal structure. It can
+CCOS can also be driven directly to analyse a codebase's causal structure — it can
 analyse its own source tree:
 
 ```bash
@@ -140,16 +131,14 @@ ccos analyze src --out run.json           # persist a snapshot (graph + hash-cha
 ccos verify run.json                      # hash chain valid? dangling edges? → exit 0/1
 ccos replay run.json                      # deterministic event-log replay + stats
 
-ccos top src --limit 15                   # the hottest nodes by causal score (the working set)
+ccos top src --limit 15                   # the hottest nodes by causal score
 ccos blame run.json file:src/memory.rs --depth 4   # upstream causes + downstream blast radius
 ccos failure run.json file:src/memory.rs --depth 2 # inject a fault and watch it propagate
-ccos export run.json --out graph.graphml  # GraphML for Gephi / yEd / Cytoscape / networkx
 ccos regions src --activate file:src/memory.rs     # cluster into causal regions, hydrate one
 ```
 
-See [`docs/USAGE.md`](docs/USAGE.md) for every command with examples and output, and
-`ccos --help` for the full list (including the v0.3 autonomous runtime: `scan`,
-`agents`, `runtime`).
+See [`docs/USAGE.md`](docs/USAGE.md) for every command with examples, and `ccos --help`
+for the full list.
 
 ## Architecture
 
@@ -171,44 +160,35 @@ See [`docs/USAGE.md`](docs/USAGE.md) for every command with examples and output,
                               └────────────────────────────────────────────┘
 ```
 
-Module reference: `cargo doc --open` (each module has rustdoc), or
+Module reference: `cargo doc --open` (every module has rustdoc), or
 [`src/lib.rs`](src/lib.rs) and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## Testing
 
 ```bash
 cargo test                     # 267 unit, integration & doc tests
-cargo clippy --all-targets     # lint-clean
+cargo clippy --all-targets --all-features   # lint-clean (-D warnings in CI)
 cargo test -- --ignored        # opt-in: 1,000,000-cycle long-stability run
 ```
 
-Heavier stress/chaos harnesses live in [`scripts/`](scripts/). Key invariants under
-test:
-
-- **No dangling edges**: `edges ⊆ nodes × nodes`, even under aggressive paging.
-- **Bounded growth**: node and edge counts stay bounded over 10k+ mutation cycles.
-- **Deterministic eviction**: identical builds evict identically, so snapshot hashes
-  and replays are reproducible.
-- **Tamper-evidence**: both hash-chained logs detect any payload mutation, reorder,
-  insertion or deletion.
+Key invariants under test: no dangling edges (`edges ⊆ nodes × nodes`) even under
+aggressive paging; bounded node/edge growth over 10k+ mutation cycles; deterministic
+eviction (reproducible snapshot hashes and replays); and tamper-evidence (both
+hash-chained logs detect any mutation, reorder, insertion or deletion).
 
 ## Documentation
 
-- [`docs/USAGE.md`](docs/USAGE.md) — **command reference & walkthroughs**: every
-  command with example invocations and output.
+- [`docs/USAGE.md`](docs/USAGE.md) — **command reference & walkthroughs**.
 - [`docs/MEMORY_INTERFACE.md`](docs/MEMORY_INTERFACE.md) — the **external-memory
-  interface**: the façade an agent uses, plus its `ccos memory` and `ccos mcp`
+  interface**: the façade an agent programs against, and the `ccos memory` / `ccos mcp`
   transports.
 - [`docs/SELF_ANALYSIS.md`](docs/SELF_ANALYSIS.md) — **dogfooding**: wire CCOS into a
   coding agent and debug its drifts post-mortem.
-- [`docs/paper/`](docs/paper/) — **research paper**: the formal model, the
-  determinism argument, and the falsifiable comparison protocol vs RAG / GraphRAG /
-  MemGPT / LangGraph — the *why* and the *what-it-was-meant-to-be*.
-- [`docs/context_regions.md`](docs/context_regions.md) — the Context Region Engine:
-  spatial memory model, region definition, admission policy, measured locality.
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — developer guide: module map, data
-  structures, invariants, and how to extend the kernel.
-- [`CONTRIBUTING.md`](CONTRIBUTING.md), [`CHANGELOG.md`](CHANGELOG.md),
+- [`docs/paper/`](docs/paper/) — the **research paper** (English + fr/es/zh/ko/ar): the
+  formal model, the determinism + replay theorem, and the honest negative result vs
+  RAG / GraphRAG.
+- [`docs/context_regions.md`](docs/context_regions.md), [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md),
+  [`CONTRIBUTING.md`](CONTRIBUTING.md), [`CHANGELOG.md`](CHANGELOG.md),
   [`ROADMAP.md`](ROADMAP.md), [`docs/BIBLIOGRAPHY.md`](docs/BIBLIOGRAPHY.md).
 
 ## Status & limitations
@@ -216,10 +196,12 @@ test:
 A research prototype, not a production system. Known gaps (tracked in
 [`ROADMAP.md`](ROADMAP.md)):
 
-- The parser defaults to a **line-based heuristic** (zero dependencies). Build with
-  `--features syn-parser` for a real `syn` AST (nested modules, multi-line signatures,
-  grouped `use`, impl methods); the heuristic stays as the fallback.
-- Edges capture containment/dependency, **not** call graphs or data flow.
+- The parser defaults to a **line-based heuristic** (zero dependencies); build with
+  `--features syn-parser` for a real `syn` AST. Edges capture containment/dependency,
+  **not** call graphs or data flow — so the causal graph is structural, not semantic.
+- CCOS makes drift **auditable and debuggable**; it does **not** claim to prevent
+  drift or to improve task success (the paper is explicit on this — the demonstrated
+  win is efficiency and auditability, not resolution).
 - The agent self-feed hook is a best-effort heuristic intercept, not a ground-truth
   tracer; use one writer per `workspace.ccos`.
 
