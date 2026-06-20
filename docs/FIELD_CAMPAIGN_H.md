@@ -1,0 +1,151 @@
+# Campagne H — Le test décisif : bugs multi-fichiers (CCOS vs dump)
+
+Le corpus de 16 runs a montré que les vrais bugs testés étaient **mono-fichier**, où
+CCOS est à parité avec un dump du fichier. L'avantage de frugalité de CCOS est un
+phénomène **multi-fichier** — non encore testé. Cette campagne le teste : des bugs où
+**le `cargo test` panique dans un fichier, mais la cause est dans un *autre*.**
+
+## La question décisive
+
+> Quand le symptôme et la cause sont dans des fichiers différents, CCOS ramène-t-il la
+> **cause** dans le contexte, en **bien moins de tokens** que dumper tout le `src/` ?
+
+- **Baseline-symptôme** : dumper le seul fichier du panic → **rate la cause** (autre
+  fichier).
+- **Baseline-tout** : dumper tout `src/` → contient la cause mais **cher**.
+- **CCOS** : `recall around <fichier-du-panic>` → la **région causale**, qui inclut le
+  fichier-cause par l'arête `use crate::…`, frugalement. ← l'hypothèse à prouver.
+
+## Protocole de mesure (model-free, robuste — par bug Hk)
+
+1. `cargo new --lib hk`, écris les fichiers du bug (ci-dessous), `cd hk`.
+2. `cargo test` → **capture la sortie rouge**. Note le **fichier-symptôme** (la
+   localisation du panic, `src/X.rs:ligne`).
+3. Ingère **tous** les fichiers `src/` dans un workspace neuf `corpus_H/Hk/` (l'agent
+   les aurait lus).
+4. `page_fault {output:"<sortie cargo test brute>"}` → CCOS pressurise le symptôme.
+5. **CCOS** : `recall {around, anchor:"src/X.rs", budget:2048}` → enregistre :
+   - `cause_in_window` : `file:src/<cause>.rs` est-il dans la fenêtre ? *(le booléen clé)*
+   - `ccos_tokens` : tokens de la fenêtre.
+6. **Baselines** : `all_tokens` = somme (chars/4) de tous les `src/*.rs` ;
+   `symptom_tokens` = celui du seul fichier-symptôme.
+7. Export : `ccos postmortem corpus_H/Hk --json > corpus_H/Hk.json`.
+
+**Tableau visé** : `bug | sauts | cause_in_CCOS | ccos_tokens | all_tokens | ratio`.
+
+**Critère de succès** : pour les bugs ≤ 3 sauts, la cause **est** dans la fenêtre CCOS,
+à `ccos_tokens ≪ all_tokens`. Pour H4 (3 sauts) on teste la limite. Pour H5 (leurre),
+CCOS inclut la **vraie** cause et **pas** le décoy.
+
+*(Optionnel — moitié suffisante)* : envoie au LLM local la fenêtre CCOS vs le dump-tout
+**au même budget**, « corrige le fichier en cause », et note par `cargo test`.
+
+---
+
+## Les bugs (copier-coller, prêts à injecter)
+
+> Dans chaque crate, `src/lib.rs` déclare les `pub mod …` et porte le test. Le **panic
+> surgit dans le fichier-symptôme**, la **cause est ailleurs**.
+
+### H1 — Constante fausse, 1 saut  *(symptôme `writer.rs` → cause `config.rs`)*
+```rust
+// src/config.rs
+pub fn buffer_size() -> usize { 0 }              // BUG : devrait être 8
+// src/writer.rs
+use crate::config;
+pub fn render() -> u8 {
+    let mut buf = vec![0u8; config::buffer_size()];
+    buf[0] = 42;                                 // panic : index out of bounds (len 0)
+    buf[0]
+}
+// src/lib.rs
+pub mod config; pub mod writer;
+#[cfg(test)] mod tests { #[test] fn renders() { assert_eq!(crate::writer::render(), 42); } }
+```
+
+### H2 — Off-by-one dans un helper, 1 saut  *(`access.rs` → `idx.rs`)*
+```rust
+// src/idx.rs
+pub fn last_index(len: usize) -> usize { len }   // BUG : devrait être len - 1
+// src/access.rs
+use crate::idx;
+pub fn last(v: &[i32]) -> i32 { v[idx::last_index(v.len())] }   // index out of bounds
+// src/lib.rs
+pub mod idx; pub mod access;
+#[cfg(test)] mod tests { #[test] fn t() { assert_eq!(crate::access::last(&[1,2,3]), 3); } }
+```
+
+### H3 — Diviseur nul, 2 sauts  *(`engine.rs` → `math.rs` → `settings.rs`)*
+```rust
+// src/settings.rs
+pub fn divisor() -> i64 { 0 }                    // BUG : devrait être 2
+// src/math.rs
+use crate::settings;
+pub fn d() -> i64 { settings::divisor() }
+// src/engine.rs
+use crate::math;
+pub fn run() -> i64 { 100 / math::d() }          // panic : divide by zero
+// src/lib.rs
+pub mod settings; pub mod math; pub mod engine;
+#[cfg(test)] mod tests { #[test] fn t() { assert_eq!(crate::engine::run(), 50); } }
+```
+
+### H4 — Cause à 3 sauts (teste la limite de propagation)  *(`api.rs` → ctrl → repo → `store.rs`)*
+```rust
+// src/store.rs
+pub fn capacity() -> usize { 0 }                 // BUG : devrait être 4
+// src/repo.rs
+use crate::store; pub fn cap() -> usize { store::capacity() }
+// src/ctrl.rs
+use crate::repo; pub fn limit() -> usize { repo::cap() }
+// src/api.rs
+use crate::ctrl;
+pub fn first() -> u8 { let v = vec![0u8; ctrl::limit()]; v[0] }   // panic : index out of bounds
+// src/lib.rs
+pub mod store; pub mod repo; pub mod ctrl; pub mod api;
+#[cfg(test)] mod tests { #[test] fn t() { assert_eq!(crate::api::first(), 0); } }
+```
+
+### H5 — Le leurre (structure vs lexical)  *(symptôme `handler.rs` → vraie cause `config.rs`, décoy `handler_helpers.rs`)*
+```rust
+// src/config.rs
+pub fn timeout() -> u64 { 0 }                    // BUG : la vraie cause (devrait être 200)
+// src/handler.rs
+use crate::config;
+pub fn handle() -> u64 { 1000 / config::timeout() }   // panic : divide by zero
+// src/handler_helpers.rs
+// DÉCOY : lexicalement proche de handler.rs, MAIS hors du chemin causal.
+pub fn handle_format(s: &str) -> String { format!("handled: {s}") }
+// src/lib.rs
+pub mod config; pub mod handler; pub mod handler_helpers;
+#[cfg(test)] mod tests { #[test] fn t() { assert_eq!(crate::handler::handle(), 5); } }
+```
+**Attendu (vérifié en preview)** : CCOS `around handler.rs` **atteint la vraie cause**
+`config.rs` (via `use crate::config`) ✅. Mais le décoy `handler_helpers.rs` **est aussi
+tiré dans la fenêtre** — car `pub mod handler_helpers;` dans `lib.rs` connecte les
+modules frères en une seule région via la racine. C'est la **précision faible** connue du
+paper (recall 0.97 / précision 0.06), confirmée sur du vrai code. La vraie question de H5
+n'est donc pas « le décoy est-il exclu ? » (il ne l'est pas) mais : **sous budget serré
+ou avec la pression d'échec, `config.rs` est-il classé au-dessus du décoy ?** (mesure le
+rang/score des deux). Un baseline lexical, lui, attraperait le décoy *à la place* de la
+cause — CCOS, au moins, a la cause.
+
+---
+
+## Grille de résultats à remplir
+
+| Bug | sauts symptôme→cause | cause dans CCOS ? | ccos_tokens | all_tokens | ratio |
+| --- | -------------------- | ----------------- | ----------- | ---------- | ----- |
+| H1  | 1 | ? | ? | ? | ? |
+| H2  | 1 | ? | ? | ? | ? |
+| H3  | 2 | ? | ? | ? | ? |
+| H4  | 3 | ? | ? | ? | ? |
+| H5  | 1 (+ décoy) | ? (et décoy exclu ?) | ? | ? | ? |
+
+**Lecture** : si CCOS ramène la cause d'un autre fichier à quelques centaines de tokens
+là où le dump-tout en coûte plusieurs milliers — **c'est la preuve, sur du vrai code, de
+ce que le corpus n'avait pas encore montré.** Si H4 échoue (cause à 3 sauts hors
+fenêtre/pression), c'est la donnée qui justifie le levier seuil/decay. Si H5 attrape le
+décoy, c'est un problème de région à investiguer.
+
+Ramène `corpus_H/` complet — on le déroule ensemble.
