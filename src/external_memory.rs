@@ -353,6 +353,23 @@ impl CcosMemory {
         &self.graph
     }
 
+    /// The node currently under the most failure pressure — the workspace's active
+    /// problem focus, and the natural anchor for "what should I be looking at".
+    /// `None` when nothing is failing. Deterministic (ties break on the node id).
+    pub fn hottest_failure_node(&self) -> Option<String> {
+        self.graph
+            .nodes
+            .iter()
+            .filter(|(_, n)| n.failure_relevance > 0.0)
+            .max_by(|(ka, a), (kb, b)| {
+                a.failure_relevance
+                    .partial_cmp(&b.failure_relevance)
+                    .unwrap_or(Ordering::Equal)
+                    .then_with(|| kb.0.cmp(&ka.0)) // tie → smaller id wins
+            })
+            .map(|(id, _)| id.0.clone())
+    }
+
     fn write_to(&self, p: &Path) -> Result<(), MemoryError> {
         crate::util::write_durable(p, self.to_json()?.as_bytes())?;
         Ok(())
@@ -419,6 +436,14 @@ impl CcosMemory {
         let mut scored: Vec<RecallItem> = Vec::new();
         for id in ids {
             if !seen.insert(id.0.clone()) {
+                continue;
+            }
+            // External-dependency hubs (`dep:std`, `dep:crate`, …) are causal
+            // connectors, not context: they carry no source, yet a `use`-heavy real
+            // codebase drives their access count up so they dominate the working
+            // set (a field run on 8 CCOS files returned only the `dep:` hubs). Keep
+            // them in the graph for causality, but never spend window budget on them.
+            if id.0.starts_with("dep:") {
                 continue;
             }
             if let Some(node) = self.graph.nodes.get(&id) {
@@ -586,6 +611,47 @@ impl ExternalMemory for CcosMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recall_excludes_external_dependency_hubs() {
+        // Field regression (Jetson, 8 real CCOS files): a `use`-heavy codebase
+        // drove `dep:crate`'s access count up so the working set returned only the
+        // `dep:` hubs (24 tokens of "External dependency: …", zero code).
+        let mut mem = CcosMemory::new();
+        mem.ingest_source("src/db.rs", "pub fn q() -> i64 { 1 }\n");
+        mem.ingest_source(
+            "src/repo.rs",
+            "use crate::db;\npub fn f() -> i64 { db::q() }\n",
+        );
+        mem.ingest_source(
+            "src/api.rs",
+            "use crate::repo;\npub fn h() -> i64 { repo::f() }\n",
+        );
+        let win = mem.recall(&Recall::working_set(), 4096);
+        assert!(!win.items.is_empty(), "window is not empty");
+        assert!(
+            !win.items.iter().any(|i| i.uri.starts_with("dep:")),
+            "no external-dependency hubs in the window: {:?}",
+            win.items.iter().map(|i| &i.uri).collect::<Vec<_>>()
+        );
+        assert!(
+            win.items.iter().any(|i| i.uri.starts_with("file:")),
+            "real file nodes are present"
+        );
+    }
+
+    #[test]
+    fn hottest_failure_node_is_the_active_problem() {
+        let mut mem = CcosMemory::new();
+        mem.ingest_source("src/db.rs", "pub fn q() {}\n");
+        mem.ingest_source("src/api.rs", "use crate::db;\npub fn h() { db::q() }\n");
+        assert!(mem.hottest_failure_node().is_none(), "nothing failing yet");
+        mem.signal_failure("file:src/db.rs", 2).unwrap();
+        assert_eq!(
+            mem.hottest_failure_node().as_deref(),
+            Some("file:src/db.rs")
+        );
+    }
 
     #[test]
     fn recall_around_reaches_cross_file_cause() {
