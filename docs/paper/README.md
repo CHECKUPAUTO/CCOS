@@ -17,9 +17,9 @@ equations, tables and bibliography (only the prose is translated).
 | [`ccos_regions.tex`](ccos_regions.tex)       | English (canonical) | `pdflatex` |
 | [`ccos_regions.fr.tex`](ccos_regions.fr.tex) | Français            | `pdflatex` (babel) |
 | [`ccos_regions.es.tex`](ccos_regions.es.tex) | Español             | `pdflatex` (babel) |
-| `ccos_regions.zh.tex` | 中文 (Chinese)   | `xelatex` (ctex) — *in progress* |
-| `ccos_regions.ko.tex` | 한국어 (Korean)  | `xelatex` (kotex) — *in progress* |
-| `ccos_regions.ar.tex` | العربية (Arabic) | `xelatex` (polyglossia, RTL) — *in progress* |
+| [`ccos_regions.zh.tex`](ccos_regions.zh.tex) | 中文 (Chinese)      | `xelatex` (ctex) |
+| [`ccos_regions.ko.tex`](ccos_regions.ko.tex) | 한국어 (Korean)     | `xelatex` (kotex) |
+| [`ccos_regions.ar.tex`](ccos_regions.ar.tex) | العربية (Arabic)    | `xelatex` (polyglossia, RTL) |
 
 ## Build
 
