@@ -21,6 +21,17 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Durable checkpoints + bare-metal notes.** Snapshots (`.ccos`) and the op-log
+  (`.oplog`) are now written **durably and atomically** (`util::write_durable`: temp
+  + `fsync` + atomic rename + directory `fsync`), so a power loss or killed daemon
+  can't leave a truncated file — hardening the "replayable after a crash" guarantee
+  (a plain `std::fs::write` only reaches the page cache). On by default. Adds
+  `scripts/jetson_repro_env.sh` (pin a Jetson to max clocks for reproducible
+  measurement — `nvpmodel`/`jetson_clocks`, no `nvidia-smi`/NUMA on Tegra), an
+  optional `mimalloc` allocator feature and a `target-cpu=native` build note for
+  bare-metal A/B benchmarking, and [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) — an
+  honest triage (the kernel is <1% of an agent loop, so most low-level knobs don't
+  move the needle; what matters is durability and reproducible measurement).
 - **Self-analysis dogfood loop** (`.mcp.json`, `scripts/ccos_self_feed.py`,
   `docs/SELF_ANALYSIS.md`) — wires CCOS into a coding agent (Claude Code) as its
   causal memory. A project `.mcp.json` registers `ccos mcp` so the agent gets the

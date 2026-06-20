@@ -58,7 +58,8 @@ languages). CCOS is a research prototype in Rust (edition 2021); see
 ### 2. Transactional, replayable storage
 
 - **Hybrid event-sourcing.** A structural snapshot (`.ccos`) plus an operation log
-  (`.oplog`), persisted on every change; the snapshot format is shared with the
+  (`.oplog`), persisted **durably** on every change (`fsync` + atomic rename, so a
+  crash never leaves a half-written file); the snapshot format is shared with the
   `ccos memory` transport.
 - **Deterministic compaction.** Older ops fold into the baseline past a threshold
   (`CCOS_OPLOG_MAX` / `CCOS_OPLOG_KEEP`), keeping the op-log bounded for long-running
@@ -187,6 +188,9 @@ hash-chained logs detect any mutation, reorder, insertion or deletion).
 - [`docs/paper/`](docs/paper/) — the **research paper** (English + fr/es/zh/ko/ar): the
   formal model, the determinism + replay theorem, and the honest negative result vs
   RAG / GraphRAG.
+- [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) — **bare-metal notes**: durable
+  checkpoints, the Jetson reproducible-measurement script, and the honest triage of
+  which low-level knobs actually matter for a <1%-of-the-loop kernel.
 - [`docs/context_regions.md`](docs/context_regions.md), [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md),
   [`CONTRIBUTING.md`](CONTRIBUTING.md), [`CHANGELOG.md`](CHANGELOG.md),
   [`ROADMAP.md`](ROADMAP.md), [`docs/BIBLIOGRAPHY.md`](docs/BIBLIOGRAPHY.md).

@@ -351,7 +351,7 @@ impl CcosMemory {
     }
 
     fn write_to(&self, p: &Path) -> Result<(), MemoryError> {
-        std::fs::write(p, self.to_json()?)?;
+        crate::util::write_durable(p, self.to_json()?.as_bytes())?;
         Ok(())
     }
 

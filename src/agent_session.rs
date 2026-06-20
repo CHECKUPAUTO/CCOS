@@ -186,7 +186,7 @@ impl AgentSession {
                 ops: self.ops.clone(),
                 folded: self.folded,
             };
-            std::fs::write(p, serde_json::to_string(&timeline)?)?;
+            crate::util::write_durable(p, serde_json::to_string(&timeline)?.as_bytes())?;
         }
         Ok(())
     }
