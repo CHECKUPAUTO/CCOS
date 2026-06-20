@@ -131,9 +131,11 @@ impl AgentSession {
     /// mutated out-of-band by `ccos memory`) the snapshot wins and the timeline
     /// restarts from it — the memory is never corrupted by a stale log.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, MemoryError> {
-        let path = path.as_ref();
-        let live = CcosMemory::open(path)?;
-        let oplog_path = oplog_sidecar(path);
+        // Resolve a directory workspace to its state file so the snapshot and the
+        // op-log sidecar land together (see CcosMemory::open).
+        let file = crate::external_memory::workspace_file(path.as_ref());
+        let live = CcosMemory::open(&file)?;
+        let oplog_path = oplog_sidecar(&file);
 
         // Restore the timeline from the sidecar if one is there and parses; a
         // missing/corrupt sidecar just means "no recorded history yet".
@@ -553,6 +555,37 @@ mod tests {
     fn new_session_has_no_checkpoint_path() {
         let mut s = AgentSession::new();
         assert!(matches!(s.checkpoint(), Err(MemoryError::NoPath)));
+    }
+
+    /// Field regression: a launcher created `workspace.ccos` as a *directory*, so
+    /// opening it used to fail with "Is a directory". A directory workspace must
+    /// place its state file inside it and round-trip.
+    #[test]
+    fn open_accepts_a_directory_workspace() {
+        let dir = tmp("ccos-ws-dir");
+        let _ = std::fs::remove_file(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let mut s = AgentSession::open(&dir).unwrap(); // a DIRECTORY, not a file
+            s.ingest("src/db.rs", "pub fn q() {}\n");
+            s.ingest("src/api.rs", "use crate::db;\npub fn h() { db::q() }\n");
+            s.checkpoint().unwrap();
+        }
+        assert!(
+            dir.join("workspace.ccos").is_file(),
+            "state file lives inside the dir"
+        );
+        assert!(
+            dir.join("workspace.ccos.oplog").is_file(),
+            "oplog lives inside the dir"
+        );
+        let s2 = AgentSession::open(&dir).unwrap();
+        assert!(
+            s2.memory().stats().files >= 2,
+            "reloads from the directory workspace"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Compaction bounds the op-log by folding older ops into the baseline, while

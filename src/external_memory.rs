@@ -281,9 +281,12 @@ impl CcosMemory {
     }
 
     /// Open a memory backed by `path`: load it if the file exists, otherwise
-    /// start empty with `path` bound as the checkpoint target.
+    /// start empty with `path` bound as the checkpoint target. If `path` is an
+    /// existing **directory** (a launcher may create the workspace as one), state
+    /// is placed in `<path>/workspace.ccos` inside it rather than failing with
+    /// "Is a directory".
     pub fn open(path: impl AsRef<Path>) -> Result<Self, MemoryError> {
-        let p = path.as_ref().to_path_buf();
+        let p = workspace_file(path.as_ref());
         let mut mem = if p.exists() {
             Self::from_json(&std::fs::read_to_string(&p)?)?
         } else {
@@ -458,6 +461,18 @@ fn normalize(uri: &str) -> String {
         uri.to_string()
     } else {
         format!("file:{uri}")
+    }
+}
+
+/// Resolve a workspace path to its state **file**. A plain path is used as-is; an
+/// existing directory becomes `<dir>/workspace.ccos` inside it (so a launcher that
+/// pre-creates the workspace as a directory works instead of erroring with "Is a
+/// directory"). Idempotent: resolving an already-resolved file path is a no-op.
+pub(crate) fn workspace_file(path: &Path) -> PathBuf {
+    if path.is_dir() {
+        path.join("workspace.ccos")
+    } else {
+        path.to_path_buf()
     }
 }
 
