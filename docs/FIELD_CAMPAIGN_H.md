@@ -132,7 +132,50 @@ cause — CCOS, au moins, a la cause.
 
 ---
 
-## Grille de résultats à remplir
+## Preview sur fichiers-jouets (ce repo, binaire 0.3.0) — fait
+
+Exécuté ici via le serveur MCP (workspace neuf par bug, `cargo test` réel →
+`page_fault` → `recall around <symptôme>`, budget 2048). **Tous les bugs paniquent
+bien dans le fichier-symptôme attendu.**
+
+| Bug | sauts | cause dans CCOS ? | rang de la cause | ccos_tokens | all_tokens | ratio |
+| --- | ----- | ----------------- | ---------------- | ----------- | ---------- | ----- |
+| H1  | 1 | ✅ oui | **#1** (0.875) | 173 | 71 | 0.41× |
+| H2  | 1 | ✅ oui | top (0.875) | 139 | 60 | 0.43× |
+| H3  | 2 | ✅ oui | top (0.875) | 167 | 69 | 0.41× |
+| H4  | 3 | ✅ oui (chaîne `api→ctrl→repo→store` entière) | présent (0.779/0.569) | 202 | 91 | 0.45× |
+| H5  | 1 (+ décoy) | ✅ oui ; décoy **présent mais classé dernier** | **#1** (0.875) ; décoy 0.569 | 201 | 92 | 0.46× |
+
+**Trois lectures, honnêtes :**
+
+1. **Couverture — PROUVÉE à 1, 2 et 3 sauts.** La cause d'un *autre* fichier est dans
+   la fenêtre à chaque fois, y compris la chaîne à 3 sauts de H4 (avec décroissance
+   visible du score, mais présente). C'est exactement ce que le corpus mono-fichier
+   n'avait jamais montré.
+2. **Classement sous pression — meilleur que prévu.** En H5, le décoy lexical
+   `handler_helpers.rs` *entre* bien dans la région (sur-connexion par la racine de
+   module `pub mod`), **mais le score causal le classe bon dernier** ; la vraie cause
+   `config.rs` est **#1**. Sous budget serré (200) l'ordre est
+   `config.rs > handler.rs > … > handler_helpers.rs`. Un baseline lexical classerait le
+   décoy *haut* (préfixe « handler »). Le score fait le tri que la topologie seule ne
+   fait pas. ✅
+3. **Frugalité — PAS démontrée sur des jouets (ratio 0.41–0.46×, CCOS *plus gros*).** Sur
+   des fichiers de 60–90 tokens, la fenêtre duplique le source : un même fichier apparaît
+   dans son nœud `file:`, ses nœuds `sym:` et ses nœuds `use:` (chacun portant **tout** le
+   fichier — granularité fichier, pas symbole). Dumper `src/` est donc *moins* cher que la
+   région. **La frugalité exige (a) de vrais gros fichiers** (où `all-src ≫ région`) **et
+   (b) la granularité symbole** (qu'un nœud `sym:` ne porte que sa fonction). C'est le
+   point qui relie directement H à l'item roadmap Q2.
+
+➡️ **Conclusion preview** : le *quoi* (la cause multi-fichier est atteinte et bien classée)
+est acquis ; le *combien* (frugalité) ne se mesurera que sur du vrai code volumineux. D'où
+la campagne sur le terrain ci-dessous.
+
+## Grille de résultats à remplir (vrai code, Thor)
+
+Refais les 5 bugs **mais greffés sur de vrais fichiers volumineux** (insère le mauvais
+constant dans un module réel de `ripgrep`/`bat`/`fd` ; le symptôme panique ailleurs). Là,
+`all_tokens` = plusieurs milliers, et on verra si la région reste petite.
 
 | Bug | sauts symptôme→cause | cause dans CCOS ? | ccos_tokens | all_tokens | ratio |
 | --- | -------------------- | ----------------- | ----------- | ---------- | ----- |
@@ -140,12 +183,11 @@ cause — CCOS, au moins, a la cause.
 | H2  | 1 | ? | ? | ? | ? |
 | H3  | 2 | ? | ? | ? | ? |
 | H4  | 3 | ? | ? | ? | ? |
-| H5  | 1 (+ décoy) | ? (et décoy exclu ?) | ? | ? | ? |
+| H5  | 1 (+ décoy) | ? (rang cause vs décoy) | ? | ? | ? |
 
-**Lecture** : si CCOS ramène la cause d'un autre fichier à quelques centaines de tokens
-là où le dump-tout en coûte plusieurs milliers — **c'est la preuve, sur du vrai code, de
-ce que le corpus n'avait pas encore montré.** Si H4 échoue (cause à 3 sauts hors
-fenêtre/pression), c'est la donnée qui justifie le levier seuil/decay. Si H5 attrape le
-décoy, c'est un problème de région à investiguer.
+**Lecture** : si, sur du vrai code, CCOS ramène la cause d'un autre fichier à quelques
+centaines de tokens là où le dump-tout en coûte plusieurs milliers — **c'est la preuve de
+frugalité que le corpus n'avait pas encore montrée.** Si le ratio reste ≤ 1 même sur de
+gros fichiers, **la granularité symbole (Q2) devient l'item bloquant**, pas un détail.
 
 Ramène `corpus_H/` complet — on le déroule ensemble.
