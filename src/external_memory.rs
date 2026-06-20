@@ -478,6 +478,10 @@ pub(crate) fn workspace_file(path: &Path) -> PathBuf {
 
 impl ExternalMemory for CcosMemory {
     fn ingest_source(&mut self, uri: &str, source: &str) -> IngestReport {
+        // Tolerate a redundant `file:` namespace prefix on the uri (an agent often
+        // copies a node id back from `recall`, which returns `file:<path>`); without
+        // this, `ingest("file:src/a.rs")` would double-prefix to `file:file:src/a.rs`.
+        let uri = uri.strip_prefix("file:").unwrap_or(uri);
         let file_key = format!("file:{uri}");
         let prev = self.sources.get(&file_key).cloned();
         let delta = self
@@ -611,6 +615,33 @@ mod tests {
             !files.contains(&"file:src/unrelated.rs"),
             "recall excludes unrelated code: {files:?}"
         );
+    }
+
+    #[test]
+    fn ingest_tolerates_a_redundant_file_prefix_and_around_takes_either_form() {
+        let mut mem = CcosMemory::new();
+        // An agent copies a node id back from `recall` (which returns `file:<path>`).
+        mem.ingest_source("file:src/a.rs", "pub fn alpha() {}\n");
+        let ids: Vec<String> = mem
+            .recall(&Recall::working_set(), 10_000)
+            .items
+            .into_iter()
+            .map(|i| i.uri)
+            .collect();
+        assert!(
+            ids.iter().any(|u| u == "file:src/a.rs"),
+            "single prefix, not file:file: — got {ids:?}"
+        );
+        assert!(!ids.iter().any(|u| u.starts_with("file:file:")));
+        // `around` resolves both the bare path and the `file:`-prefixed node id.
+        assert!(!mem
+            .recall(&Recall::around("src/a.rs"), 10_000)
+            .items
+            .is_empty());
+        assert!(!mem
+            .recall(&Recall::around("file:src/a.rs"), 10_000)
+            .items
+            .is_empty());
     }
 
     #[test]
