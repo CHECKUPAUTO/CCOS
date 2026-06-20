@@ -1,6 +1,13 @@
 mod commands_demo;
 mod commands_runtime;
 
+// Optional drop-in allocator for bare-metal benchmarking (off by default; build
+// with `--features mimalloc`). CCOS is not allocation-bound at its scale, so this
+// is a knob to *measure*, not a default win — see docs/PERFORMANCE.md.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use ccos::adversarial::{AdversarialEngine, AdversarialMode};
 use ccos::context_policy::ContextPolicy;
 use ccos::distributed_event_log::DistributedEventLog;
