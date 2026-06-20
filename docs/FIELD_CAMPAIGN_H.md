@@ -168,8 +168,58 @@ bien dans le fichier-symptôme attendu.**
    point qui relie directement H à l'item roadmap Q2.
 
 ➡️ **Conclusion preview** : le *quoi* (la cause multi-fichier est atteinte et bien classée)
-est acquis ; le *combien* (frugalité) ne se mesurera que sur du vrai code volumineux. D'où
-la campagne sur le terrain ci-dessous.
+est acquis sur des jouets ; le *combien* (frugalité) ne se mesure que sur du vrai code
+volumineux. Je l'ai mesuré — section suivante.
+
+## Réalité sur vrai code (le `src/` de CCOS, 32 fichiers, 130 287 tokens) — la correction
+
+Le protocole H, appliqué non plus à des crates-jouets mais au **propre `src/` de CCOS**
+(32 fichiers réels, vraies arêtes `use crate::`, fichiers de 700 à 17 000 tokens),
+**renverse le résultat des jouets**. Le binaire 0.3.0, via MCP (ingest des 32 fichiers →
+`signal_failure file:src/mcp.rs` → `recall around file:src/mcp.rs`) donne :
+
+| profondeur | budget | symptôme dans la fenêtre ? | deps couvertes | ce que contient la fenêtre |
+| ---------- | ------ | -------------------------- | -------------- | -------------------------- |
+| **3 (défaut)** | 2 048 → 32 768 | ❌ non | **0/2** | 1 nœud = le **hub `memory.rs`** entier (9 747 tok) |
+| 1 | 2 048 | ❌ non | 1/2 | 1 fichier entier (`external_memory.rs`) |
+| 1 | **32 768** | ✅ oui | 2/2 | les 3 fichiers entiers (20 405 tok uniques) |
+
+**Trois causes racines, chacune mesurée (plus des hypothèses) :**
+
+1. **Granularité fichier — le blocant n°1 (Q2), désormais prouvé.** Chaque nœud
+   `sym:`/`use:`/`mod:` porte **tout son fichier**. Un seul nœud (`sym:memory.rs:MemoryGraph`
+   = 9 747 tok) **dépasse à lui seul un budget de 2 048**. La fenêtre ne tient donc qu'1
+   nœud = 1 fichier dupliqué. La **région complète** (budget ∞) autour de *n'importe quel*
+   ancre = **les 32 fichiers, ~2 000 000 tokens** pour 130 287 tokens uniques : un facteur
+   **15× de duplication** (les ~6 symboles de `main.rs` portent chacun les 64 655 chars de
+   `main.rs`). Tant que `sym:` ne porte pas seulement *sa* fonction, le budget est brûlé.
+2. **Propagation à profondeur fixe — elle inonde les graphes denses.** `signal_failure`
+   sur **un** fichier pressurise **518 / 1037 nœuds** (depth 3) : la moitié du dépôt. La
+   donnée dit ici **depth=1 ≫ depth=3** (le défaut est *mauvais* sur du vrai code dense).
+   Tension honnête avec le corpus précédent (sur des **chaînes linéaires creuses**,
+   depth=3 était nécessaire pour atteindre une cause à 3 sauts) : **la bonne profondeur
+   dépend de la densité du graphe** — creux ⇒ profond, dense ⇒ court. La propagation
+   devrait être *consciente du degré*, pas une constante.
+3. **Domination du hub.** `memory.rs` (utilisé par presque tout) accumule la pression de
+   tous les côtés ; ses nœuds whole-file **surclassent le symptôme** (`sym:memory.rs`
+   score 0.910 > `file:mcp.rs`). Il faut un **down-weighting par degré inverse (IDF)** pour
+   qu'un hub ne gagne pas *toutes* les régions.
+
+**Le verdict frugalité, sans fard** : les 3 fichiers pertinents = **20 405 tokens**. CCOS
+exige un budget de **32 768** pour les livrer (taxe de duplication) **et seulement** à
+`depth=1` ; au **défaut `depth=3`, il ne les atteint sous aucun budget testé** — il sert le
+hub. **En l'état, sur du vrai code, CCOS est *moins* frugal que « dumper les 3 bons
+fichiers ».** Son seul apport résiduel — *dire quels* fichiers — coûte plus de tokens que
+les fichiers eux-mêmes, et le défaut désigne les mauvais (le hub).
+
+Ce n'est pas un échec de la machinerie (event-sourcing, time-travel, persistance, audit
+fonctionnent) : c'est l'**assemblage de contexte** — le cœur de la thèse — qui ne survit
+pas au passage à l'échelle réelle **tant que la granularité symbole, la propagation
+degré-consciente et la suppression de hub ne sont pas faites**. Ces trois items passent
+de « roadmap spéculative » à « les trois raisons chiffrées pour lesquelles ça casse ».
+
+➡️ Le test de Thor sur un **autre** vrai dépôt (ripgrep/bat/fd) reste utile comme
+confirmation indépendante, mais la conclusion est déjà nette ici.
 
 ## Grille de résultats à remplir (vrai code, Thor)
 
