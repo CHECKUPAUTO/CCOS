@@ -94,42 +94,65 @@ impl ASTParser {
         )
     }
 
-    pub fn update_memory_graph(&self, result: &ParseResult, graph: &mut MemoryGraph) {
+    /// Build the causal graph for one file, storing **granular** content on every
+    /// node so recall never spends a whole file's budget on a single node (see
+    /// `docs/DESIGN_symbol_granularity.md`): the file node carries a *header*
+    /// (path + one signature line per symbol), each symbol node carries its own
+    /// source span, modules carry their declaration line, and `use` nodes the
+    /// import line. The whole-file source is kept by the caller (`ExternalMemory`)
+    /// for explicit retrieval, not duplicated into every node.
+    pub fn update_memory_graph(&self, result: &ParseResult, source: &str, graph: &mut MemoryGraph) {
+        let lines: Vec<&str> = source.lines().collect();
+        let line_at = |ln: usize| {
+            lines
+                .get(ln.saturating_sub(1))
+                .map(|l| l.trim().to_string())
+                .unwrap_or_default()
+        };
+
+        // File node = a thin header: the path and a signature line per symbol. The
+        // agent expands any entry via that symbol's own (span-sized) node.
         let file_id = NodeId(format!("file:{}", result.file_path));
+        let mut header = format!(
+            "// {} — {} symbols\n",
+            result.file_path,
+            result.symbols.len()
+        );
+        for s in &result.symbols {
+            let sig = line_at(s.line);
+            if !sig.is_empty() {
+                header.push_str(&sig);
+                header.push('\n');
+            }
+        }
         graph.upsert_node(
             file_id.clone(),
             result.file_path.clone(),
-            format!("Source file at {}", result.file_path),
+            header,
             NodeType::Module,
         );
 
-        // Add module nodes
+        // Module nodes = their declaration line only; the items inside become their
+        // own symbol nodes, so carrying the body here would just duplicate them.
         for module in &result.modules {
             let mod_id = NodeId(format!("mod:{}:{}", result.file_path, module.name));
             graph.upsert_node(
                 mod_id.clone(),
                 module.name.clone(),
-                format!(
-                    "{}module {} at line {}",
-                    if module.is_public { "pub " } else { "" },
-                    module.name,
-                    module.line
-                ),
+                line_at(module.line),
                 NodeType::Module,
             );
             graph.add_edge(file_id.clone(), mod_id.clone(), 0.9, EdgeType::Contains);
-
-            // Process nested modules
-            self.add_module_tree(graph, &mod_id, &module.children, &result.file_path);
+            self.add_module_tree(graph, &mod_id, &module.children, &result.file_path, &lines);
         }
 
-        // Add use statements as edges
+        // Use statements = the import line itself.
         for use_stmt in &result.use_statements {
             let use_id = NodeId(format!("use:{}:{}", result.file_path, use_stmt.full_path));
             graph.upsert_node(
                 use_id.clone(),
                 format!("use {}", use_stmt.full_path),
-                format!("Import: {} at line {}", use_stmt.full_path, use_stmt.line),
+                line_at(use_stmt.line),
                 NodeType::Symbol,
             );
             graph.add_edge(file_id.clone(), use_id.clone(), 0.5, EdgeType::DependsOn);
@@ -147,15 +170,12 @@ impl ASTParser {
             }
         }
 
-        // Add symbol nodes
+        // Symbol nodes = the symbol's own source span (the granular recall unit).
         for symbol in &result.symbols {
             let sym_id = NodeId(format!("sym:{}:{}", result.file_path, symbol.name));
-            graph.upsert_node(
-                sym_id.clone(),
-                symbol.name.clone(),
-                format!("{:?} {} at line {}", symbol.kind, symbol.name, symbol.line),
-                NodeType::Symbol,
-            );
+            let (start, end) = symbol_span(&lines, symbol.line);
+            let body = lines[start - 1..end].join("\n");
+            graph.upsert_node(sym_id.clone(), symbol.name.clone(), body, NodeType::Symbol);
             graph.add_edge(file_id.clone(), sym_id.clone(), 0.6, EdgeType::Contains);
         }
     }
@@ -166,20 +186,15 @@ impl ASTParser {
         parent_id: &NodeId,
         children: &[ModuleDecl],
         file_path: &str,
+        lines: &[&str],
     ) {
         for child in children {
             let child_id = NodeId(format!("mod:{}:{}", file_path, child.name));
-            graph.upsert_node(
-                child_id.clone(),
-                child.name.clone(),
-                format!(
-                    "{}module {} at line {}",
-                    if child.is_public { "pub " } else { "" },
-                    child.name,
-                    child.line
-                ),
-                NodeType::Module,
-            );
+            let decl = lines
+                .get(child.line.saturating_sub(1))
+                .map(|l| l.trim().to_string())
+                .unwrap_or_default();
+            graph.upsert_node(child_id.clone(), child.name.clone(), decl, NodeType::Module);
             graph.add_edge(
                 parent_id.clone(),
                 child_id.clone(),
@@ -188,7 +203,7 @@ impl ASTParser {
             );
 
             if !child.children.is_empty() {
-                self.add_module_tree(graph, &child_id, &child.children, file_path);
+                self.add_module_tree(graph, &child_id, &child.children, file_path, lines);
             }
         }
     }
@@ -563,6 +578,52 @@ impl Default for ASTParser {
     }
 }
 
+/// Inclusive 1-based `[start, end]` line span of the item beginning at
+/// `start_line`. Brace-matched for `{}`-bodied items (fn/struct/enum/trait/impl);
+/// semicolon-terminated for the rest (const/static/type/use); a lone start line
+/// otherwise. Capped at end-of-file. `//`-comment and string aware via
+/// [`strip_comments`]; braces inside strings and multi-line `/* … */` share the
+/// line parser's documented fragility — `--features syn-parser` parses exactly.
+fn symbol_span(lines: &[&str], start_line: usize) -> (usize, usize) {
+    let n = lines.len();
+    if start_line == 0 || start_line > n {
+        return (start_line.max(1), start_line.max(1));
+    }
+    let s0 = start_line - 1; // 0-based
+                             // Within a short signature window, find the body's opening brace — or a
+                             // semicolon that terminates a brace-less item (const/static/type/use).
+    let mut open = None;
+    for (off, line) in lines[s0..(s0 + 8).min(n)].iter().enumerate() {
+        let stripped = strip_comments(line);
+        if stripped.contains('{') {
+            open = Some(s0 + off);
+            break;
+        }
+        if stripped.trim_end().ends_with(';') {
+            return (start_line, s0 + off + 1);
+        }
+    }
+    let Some(open) = open else {
+        return (start_line, start_line);
+    };
+    let mut depth: i32 = 0;
+    for (i, line) in lines.iter().enumerate().skip(open) {
+        for c in strip_comments(line).chars() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return (start_line, i + 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    (start_line, n)
+}
+
 /// Real-AST parsing via `syn` (enabled by the `syn-parser` feature). Produces
 /// the same `(modules, uses, symbols)` triple as the heuristic parser, but
 /// accurately: it descends into nested-module bodies and impl blocks, expands
@@ -787,8 +848,75 @@ mod tests {
         let parser = ASTParser::new();
         let result = parser.parse_source("test.rs", source);
         let mut graph = MemoryGraph::default();
-        parser.update_memory_graph(&result, &mut graph);
+        parser.update_memory_graph(&result, source, &mut graph);
         assert!(graph.node_count() > 3);
+    }
+
+    #[test]
+    fn symbol_span_brace_matches_multiline_and_single_line() {
+        let src = "pub fn a() {\n    let x = 1;\n    x\n}\nfn b() {}\nconst K: u8 = 3;";
+        let lines: Vec<&str> = src.lines().collect();
+        assert_eq!(
+            symbol_span(&lines, 1),
+            (1, 4),
+            "multi-line fn closes at its brace"
+        );
+        assert_eq!(
+            symbol_span(&lines, 5),
+            (5, 5),
+            "one-line fn is a single line"
+        );
+        assert_eq!(
+            symbol_span(&lines, 6),
+            (6, 6),
+            "a const ends at its semicolon line"
+        );
+    }
+
+    #[test]
+    fn symbol_span_keeps_nested_braces() {
+        let src = "fn f() {\n    if x { a(); }\n    loop { break; }\n}";
+        let lines: Vec<&str> = src.lines().collect();
+        assert_eq!(
+            symbol_span(&lines, 1),
+            (1, 4),
+            "nested braces must not close the span early"
+        );
+    }
+
+    #[test]
+    fn symbol_node_carries_its_span_and_file_node_is_a_header() {
+        let src = "pub fn small() -> u8 { 7 }\npub fn big() {\n    let _ = 1;\n    let _ = 2;\n}";
+        let parser = ASTParser::new();
+        let result = parser.parse_source("t.rs", src);
+        let mut graph = MemoryGraph::default();
+        parser.update_memory_graph(&result, src, &mut graph);
+
+        let small = graph
+            .nodes
+            .get(&NodeId("sym:t.rs:small".to_string()))
+            .expect("small symbol node");
+        assert_eq!(small.content, "pub fn small() -> u8 { 7 }");
+
+        let big = graph
+            .nodes
+            .get(&NodeId("sym:t.rs:big".to_string()))
+            .expect("big symbol node");
+        assert!(big.content.starts_with("pub fn big()") && big.content.contains("let _ = 2;"));
+
+        // The file node is a header (signatures), never the embedded bodies.
+        let file = graph
+            .nodes
+            .get(&NodeId("file:t.rs".to_string()))
+            .expect("file node");
+        assert!(
+            file.content.contains("pub fn small"),
+            "header lists signatures"
+        );
+        assert!(
+            !file.content.contains("let _ = 2;"),
+            "file header must not embed symbol bodies"
+        );
     }
 }
 

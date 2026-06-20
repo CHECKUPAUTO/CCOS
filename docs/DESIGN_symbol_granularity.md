@@ -1,5 +1,25 @@
 # Design — symbol-span granularity (root cause #1 of the real-code failure)
 
+## Status: ✅ implemented & validated (P2)
+
+Shipped: every node now stores **granular** content at ingest — file→header,
+symbol→its source span, module→declaration line, `use`→import line — and
+`content_for` just returns it (no whole-file lookup). Measured on the real 32-file
+CCOS `src/` (the same harness as `FIELD_CAMPAIGN_H.md`):
+
+| metric | before | after |
+| ------ | ------ | ----- |
+| `around mcp.rs`, depth=1, budget 2048 | symptom absent, **1/2** deps, 7235 tok (1 whole-file node) | **symptom + 2/2 deps**, 2033 tok, 3 files |
+| full region around any anchor | 1 994 329 tok (**15×** of 131 k unique) | 157 957 tok (**1.2×**) |
+| toy Campaign H (5 cross-file bugs) | cause reached 5/5 | cause reached **5/5** (frugality 0.41–0.46× → 0.68–0.89×) |
+
+Tests: +4 regression tests (span correctness, granular node content, cross-file
+cause reached under a 2048 budget on a >budget file); 184 lib + all integration
+suites green (190 with `--features syn-parser`); clippy/fmt clean. The two remaining
+levers — propagation flooding (depth) and hub dominance (IDF) — are untouched and
+still make the **default** `depth=3` need ~32 k budget; `depth=1` is the sweet spot
+now. Those are the next follow-ups.
+
 ## The measured problem (see `FIELD_CAMPAIGN_H.md`)
 
 On CCOS's own `src/` (32 files, 130 k tokens), `recall around <symptom>` returns a

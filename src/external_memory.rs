@@ -57,7 +57,6 @@
 //! detects any tampering with a persisted checkpoint; a checkpoint round-trips
 //! (reload reproduces the graph and the chain).
 
-use crate::context_region::file_of;
 use crate::distributed_event_log::DistributedEventLog;
 use crate::event_log::{EventLog, EventPayload, EventType};
 use crate::incremental::IncrementalGraphEngine;
@@ -420,14 +419,14 @@ impl CcosMemory {
             .map(|(_, id)| id)
     }
 
-    /// Best available content for a node: its file's ingested source if known,
-    /// else the node's own stored content.
-    fn content_for(&self, node_id: &str, node: &GraphNode) -> String {
-        let file_key = format!("file:{}", file_of(node_id));
-        self.sources
-            .get(&file_key)
-            .cloned()
-            .unwrap_or_else(|| node.content.clone())
+    /// Content a node contributes to a recall window: its own **granular** content
+    /// — a symbol span, a `use` line, or a file *header* — as stored at ingest by
+    /// `ASTParser::update_memory_graph`. The whole-file source stays in
+    /// `self.sources` for explicit retrieval, but a window never pays whole-file
+    /// cost per node (the real-code failure this fixed; see
+    /// `docs/DESIGN_symbol_granularity.md`).
+    fn content_for(&self, _node_id: &str, node: &GraphNode) -> String {
+        node.content.clone()
     }
 
     /// Score, order (by `(score, uri)`), and budget-truncate a set of nodes.
@@ -463,7 +462,14 @@ impl CcosMemory {
         });
         let mut items = Vec::new();
         let mut tokens = 0usize;
+        let mut seen_content = BTreeSet::new();
         for it in scored {
+            // Drop empty and exact-duplicate content (in score order, so the
+            // highest-scored copy wins): granular nodes rarely collide, but this
+            // guards against whole-file duplication ever creeping back.
+            if it.content.trim().is_empty() || !seen_content.insert(it.content.clone()) {
+                continue;
+            }
             let t = it.content.chars().count() / 4;
             if tokens + t > budget && !items.is_empty() {
                 break;
@@ -680,6 +686,44 @@ mod tests {
         assert!(
             !files.contains(&"file:src/unrelated.rs"),
             "recall excludes unrelated code: {files:?}"
+        );
+    }
+
+    #[test]
+    fn recall_around_reaches_the_cause_under_a_tight_budget_on_a_large_file() {
+        // The real-code regression (docs/DESIGN_symbol_granularity.md): a symptom
+        // file larger than the budget that depends on a small cause file. Before
+        // symbol-span granularity, the symptom's whole-file node alone blew the
+        // 2048 budget and the cross-file cause never entered the window.
+        let mut mem = CcosMemory::new();
+        let mut symptom = String::from("use crate::cfg;\n");
+        for i in 0..150 {
+            symptom.push_str(&format!(
+                "pub fn f{i}() -> u8 {{\n    let _a = {i};\n    let _b = {i};\n    {i}\n}}\n"
+            ));
+        }
+        symptom.push_str("pub fn run() -> u8 { cfg::limit() }\n");
+        assert!(
+            symptom.chars().count() / 4 > 2048,
+            "fixture symptom file must exceed the budget to be meaningful"
+        );
+        mem.ingest_source("src/symptom.rs", &symptom);
+        mem.ingest_source("src/cfg.rs", "pub fn limit() -> u8 { 0 }\n");
+        for i in 0..6 {
+            mem.ingest_source(&format!("src/filler{i}.rs"), "pub fn pad() -> u8 { 1 }\n");
+        }
+        mem.signal_failure("file:src/symptom.rs", 1).unwrap();
+
+        let win = mem.recall(&Recall::around("file:src/symptom.rs"), 2048);
+        let uris: Vec<&str> = win.items.iter().map(|i| i.uri.as_str()).collect();
+        assert!(
+            uris.iter().any(|u| u.contains("src/cfg.rs")),
+            "the cross-file cause must be reached within a 2048 budget: {uris:?}"
+        );
+        assert!(
+            win.tokens <= 2048,
+            "granular nodes keep the window within budget: {} tokens",
+            win.tokens
         );
     }
 

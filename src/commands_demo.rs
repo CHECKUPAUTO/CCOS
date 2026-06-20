@@ -202,7 +202,7 @@ pub async fn handle_request(state: &AppState, path: &str, body: &str) -> Result<
 
         let parse_result = incremental_engine.register_file(file_path, source_code);
         let parser = ASTParser::new();
-        parser.update_memory_graph(&parse_result, &mut memory_graph);
+        parser.update_memory_graph(&parse_result, source_code, &mut memory_graph);
 
         let _event_id = event_log.append(
             EventType::GraphMutation,
