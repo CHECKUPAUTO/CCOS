@@ -20,6 +20,7 @@
 use crate::agent_session::AgentSession;
 use crate::external_memory::{ExternalMemory, Recall, RecallWindow};
 use crate::memory::{MemoryGraph, NodeId};
+use chrono::Utc;
 
 /// What a [`Debugger::command`] decides the REPL should do next.
 pub enum Outcome {
@@ -469,6 +470,26 @@ pub fn demo_session() -> AgentSession {
     s
 }
 
+/// A one-shot, analytics-ready JSON snapshot of a session's **field record**:
+/// stats, hash-chain integrity, the cognitive timeline, and the current working
+/// set. The non-interactive counterpart to the REPL — run it on a cron or after a
+/// field run to **archive** a session (each export captures the timeline *before*
+/// the next compaction folds older steps into the baseline). The raw
+/// `<workspace>.oplog` remains the structured source of truth for deeper analysis.
+pub fn export(session: &AgentSession, workspace: &str, budget: usize) -> serde_json::Value {
+    serde_json::json!({
+        "ccos_version": env!("CARGO_PKG_VERSION"),
+        "workspace": workspace,
+        "generated_at": Utc::now().to_rfc3339(),
+        "timeline_len": session.len(),
+        "compaction_floor": session.floor(),
+        "stats": session.memory().stats(),
+        "integrity": session.memory().verify(),
+        "timeline": session.timeline(),
+        "working_set": session.memory().recall(&Recall::working_set(), budget),
+    })
+}
+
 /// Run the interactive REPL until `quit`/EOF. Prompts and the banner go to stderr;
 /// command output goes to stdout (so a piped session captures clean results).
 pub fn serve(session: AgentSession) {
@@ -635,5 +656,21 @@ mod tests {
         assert!(matches!(d.command("quit"), Outcome::Quit));
         assert!(out(d.command("frobnicate")).contains("unknown command"));
         assert!(out(d.command("help")).contains("time-travel position"));
+    }
+
+    #[test]
+    fn export_produces_a_structured_field_record() {
+        let mut s = AgentSession::new();
+        s.ingest("src/db.rs", "pub fn q() {}\n");
+        let v = export(&s, "workspace.ccos", 2048);
+        assert_eq!(v["workspace"], "workspace.ccos");
+        assert!(v["stats"]["nodes"].as_u64().unwrap() >= 1);
+        assert_eq!(v["integrity"]["valid"], true);
+        assert!(v["working_set"]["items"].is_array());
+        assert!(v["timeline"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l.as_str().unwrap().contains("Ingest(src/db.rs)")));
     }
 }

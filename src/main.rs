@@ -1546,12 +1546,15 @@ fn run_memory_cmd(args: &[String]) -> i32 {
     i32::from(had_error)
 }
 
-/// `ccos postmortem [workspace.ccos]` — open the interactive **time-travel
+/// `ccos postmortem [workspace.ccos] [--json]` — open the interactive **time-travel
 /// debugger** over an agent session's recorded timeline. With a workspace path it
 /// loads the persisted op-log (`<workspace>.oplog` written by `ccos mcp`);
 /// with none it walks a built-in session that drifts. Reads REPL commands on
-/// stdin (`timeline`, `goto N`, `recall`, `diff A B`, `help`, `quit`).
+/// stdin (`timeline`, `goto N`, `recall`, `diff A B`, `help`, `quit`). With
+/// `--json` it dumps the field record (stats / integrity / timeline / working set)
+/// as JSON and exits — for archiving / fleet collection (see `scripts/fleet_collect.sh`).
 fn run_postmortem(args: &[String]) -> i32 {
+    let as_json = args.iter().any(|a| a == "--json");
     let path = args.iter().find(|a| !a.starts_with("--"));
     let session = match path {
         Some(p) => match ccos::agent_session::AgentSession::open(p) {
@@ -1563,6 +1566,12 @@ fn run_postmortem(args: &[String]) -> i32 {
         },
         None => ccos::postmortem::demo_session(),
     };
+    if as_json {
+        let ws = path.map(String::as_str).unwrap_or("(built-in demo)");
+        let record = ccos::postmortem::export(&session, ws, 4096);
+        println!("{}", serde_json::to_string_pretty(&record).unwrap());
+        return 0;
+    }
     ccos::postmortem::serve(session);
     0
 }
@@ -1772,8 +1781,8 @@ COMMANDS:\n\
     trace                      Parse cargo-test/panic/backtrace (stdin) into the crash's source files\n\
     mcp [workspace.ccos]       Serve memory as MCP tools + resources over stdio JSON-RPC\n\
     \x20                          (persistent if a workspace path is given; for MCP-compatible agents)\n\
-    postmortem [workspace]     Interactive time-travel debugger over a session timeline\n\
-    \x20                          (loads <workspace>.oplog, or walks a built-in drifting session)\n\
+    postmortem [workspace] [--json]  Time-travel debugger over a session timeline; --json\n\
+    \x20                          dumps the field record (stats/timeline/integrity) and exits\n\
 \n\
   CCOS v0.3 — Autonomous Context Runtime:\n\
     scan <path>                Scan a real workspace and ingest the delta\n\

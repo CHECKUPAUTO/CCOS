@@ -98,6 +98,46 @@ That is the scientific loop: a deterministic, replayable account of how the agen
 working memory evolved, so a drift is reproducible and explainable rather than a
 vibe.
 
+## Collecting field data
+
+In production a workspace is just two portable JSON files: `workspace.ccos` (the
+causal-memory snapshot + hash-chained log) and `workspace.ccos.oplog` (the cognitive
+timeline). Because the timeline replays bit-for-bit, the field record is
+**reproducible off-site** — copy the files to a workstation and `ccos postmortem`
+them to get exactly what happened on the device, time-travel included.
+
+**Archive / extract a session** without the REPL:
+
+```bash
+ccos postmortem workspace.ccos --json > archive/$(date +%F_%H%M).json
+```
+
+`--json` dumps an analytics-ready record — `stats`, `integrity` (the hash-chain
+verdict), `timeline`, `compaction_floor`, and the current `working_set` — and exits.
+Run it on a cron/systemd-timer to archive history *before* the next compaction folds
+older steps into the baseline; the raw `.oplog` stays the structured source of truth.
+
+**Collect from a fleet** (local-first — `rsync` + `ccos`, no central server):
+
+```bash
+scripts/fleet_collect.sh --out ./fleet \
+  user@node1:~/agent/workspace.ccos  user@node2:~/agent/workspace.ccos
+# → ./fleet/<host>/{workspace.ccos, workspace.ccos.oplog, session.json}
+```
+
+It rsyncs each node's workspace to a hub and writes a `session.json` per node;
+integrity is checked offline, so a truncated/tampered transfer surfaces as
+`integrity.valid = false` in the record.
+
+Two honest operational notes:
+
+- **No built-in telemetry.** CCOS is local-first and zero-network by design; fleet
+  aggregation is the thin `rsync`-and-extract layer above, not a daemon phoning home.
+- **Compaction bounds per-step history.** The memory state and replay-to-now are
+  always complete, but rewind below the compaction floor is folded into the baseline.
+  For full unbounded history, raise `CCOS_OPLOG_MAX` / `CCOS_OPLOG_KEEP`, or archive
+  with the `--json` export above on a schedule.
+
 ## Honest caveats
 
 - **Feeding is best-effort.** The hook only sees tools its matcher catches and only
