@@ -58,10 +58,30 @@ enum Op {
         budget: usize,
     },
     /// A compiler/test failure fed back in: pressure injected on the faulting
-    /// files (the "page fault"), then a refreshed recall around them.
+    /// files (the "page fault"), then a refreshed recall around them. The
+    /// propagation `depth` is recorded so replay reproduces the exact pressure
+    /// (old logs predate it and default to the historical depth of 2).
     PageFault {
         files: Vec<String>,
+        #[serde(default = "legacy_page_fault_depth")]
+        depth: u32,
     },
+}
+
+/// Failure-propagation depth a `page_fault` injects. Configurable via
+/// `CCOS_PAGE_FAULT_DEPTH` (default 3): deeper reaches a cause further down the
+/// dependency chain from the symptom, at the cost of less focus. A field run
+/// showed depth 2 left a 3-hop cause un-pressurised, hence the bump.
+fn page_fault_depth() -> u32 {
+    std::env::var("CCOS_PAGE_FAULT_DEPTH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3)
+}
+
+/// The depth `PageFault` ops used before it was recorded — for replaying old logs.
+fn legacy_page_fault_depth() -> u32 {
+    2
 }
 
 /// The on-disk timeline sidecar (`<workspace>.oplog`): the replay **baseline**
@@ -131,9 +151,11 @@ impl AgentSession {
     /// mutated out-of-band by `ccos memory`) the snapshot wins and the timeline
     /// restarts from it — the memory is never corrupted by a stale log.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, MemoryError> {
-        let path = path.as_ref();
-        let live = CcosMemory::open(path)?;
-        let oplog_path = oplog_sidecar(path);
+        // Resolve a directory workspace to its state file so the snapshot and the
+        // op-log sidecar land together (see CcosMemory::open).
+        let file = crate::external_memory::workspace_file(path.as_ref());
+        let live = CcosMemory::open(&file)?;
+        let oplog_path = oplog_sidecar(&file);
 
         // Restore the timeline from the sidecar if one is there and parses; a
         // missing/corrupt sidecar just means "no recorded history yet".
@@ -266,15 +288,16 @@ impl AgentSession {
     /// Returns the refreshed context window for the agent's next attempt.
     pub fn page_fault(&mut self, compiler_output: &str, budget: usize) -> RecallWindow {
         let files = parse_cargo_test_output(compiler_output).files();
+        let depth = page_fault_depth();
         for f in &files {
-            let _ = self.live.signal_failure(&format!("file:{f}"), 2);
+            let _ = self.live.signal_failure(&format!("file:{f}"), depth);
         }
         let recall = files
             .first()
             .map(|f| Recall::around(format!("file:{f}")))
             .unwrap_or(Recall::WorkingSet);
         let window = self.live.recall(&recall, budget);
-        self.ops.push(Op::PageFault { files });
+        self.ops.push(Op::PageFault { files, depth });
         window
     }
 
@@ -323,9 +346,9 @@ impl AgentSession {
                 Op::Failure { node, depth } => {
                     let _ = m.signal_failure(node, *depth);
                 }
-                Op::PageFault { files } => {
+                Op::PageFault { files, depth } => {
                     for f in files {
-                        let _ = m.signal_failure(&format!("file:{f}"), 2);
+                        let _ = m.signal_failure(&format!("file:{f}"), *depth);
                     }
                 }
                 Op::Recall { .. } => {} // read-only: no state change
@@ -362,7 +385,9 @@ impl AgentSession {
                 Op::Recall { recall, budget } => {
                     format!("t={t}  Recall({recall:?}, budget={budget})")
                 }
-                Op::PageFault { files } => format!("t={t}  PageFault(files={files:?})"),
+                Op::PageFault { files, depth } => {
+                    format!("t={t}  PageFault(files={files:?}, depth={depth})")
+                }
             }
         }));
         out
@@ -555,6 +580,37 @@ mod tests {
         assert!(matches!(s.checkpoint(), Err(MemoryError::NoPath)));
     }
 
+    /// Field regression: a launcher created `workspace.ccos` as a *directory*, so
+    /// opening it used to fail with "Is a directory". A directory workspace must
+    /// place its state file inside it and round-trip.
+    #[test]
+    fn open_accepts_a_directory_workspace() {
+        let dir = tmp("ccos-ws-dir");
+        let _ = std::fs::remove_file(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let mut s = AgentSession::open(&dir).unwrap(); // a DIRECTORY, not a file
+            s.ingest("src/db.rs", "pub fn q() {}\n");
+            s.ingest("src/api.rs", "use crate::db;\npub fn h() { db::q() }\n");
+            s.checkpoint().unwrap();
+        }
+        assert!(
+            dir.join("workspace.ccos").is_file(),
+            "state file lives inside the dir"
+        );
+        assert!(
+            dir.join("workspace.ccos.oplog").is_file(),
+            "oplog lives inside the dir"
+        );
+        let s2 = AgentSession::open(&dir).unwrap();
+        assert!(
+            s2.memory().stats().files >= 2,
+            "reloads from the directory workspace"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Compaction bounds the op-log by folding older ops into the baseline, while
     /// keeping logical indices, recent rewind depth, and the live memory intact.
     #[test]
@@ -642,5 +698,34 @@ mod tests {
         let replayed = s.replay_to(s.len());
         assert_eq!(replayed.stats().nodes, s.memory().stats().nodes);
         assert!(s.timeline().last().unwrap().contains("PageFault"));
+    }
+
+    /// A field finding: depth-2 propagation left a 3-hop cause un-pressurised. With
+    /// the default depth (3) a page-fault on the symptom reaches a 3-hop-deep cause,
+    /// and the recorded depth replays the exact same pressure (determinism).
+    #[test]
+    fn page_fault_reaches_a_three_hop_cause_and_replays_the_depth() {
+        let mut s = AgentSession::new();
+        s.ingest("src/a.rs", "use crate::b;\npub fn f() -> i64 { b::g() }\n");
+        s.ingest("src/b.rs", "use crate::c;\npub fn g() -> i64 { c::h() }\n");
+        s.ingest("src/c.rs", "use crate::d;\npub fn h() -> i64 { d::i() }\n");
+        s.ingest("src/d.rs", "pub fn i() -> i64 { 0 }\n");
+        // Panic at the entry a.rs (the symptom); the cause d.rs is 3 hops down.
+        s.page_fault("thread 'main' panicked at src/a.rs:1:1:\nboom\n", 8000);
+
+        let fr = |m: &CcosMemory| {
+            m.graph()
+                .nodes
+                .iter()
+                .find(|(id, _)| id.0 == "file:src/d.rs")
+                .map(|(_, n)| n.failure_relevance)
+                .unwrap_or(0.0)
+        };
+        assert!(
+            fr(s.memory()) > 0.0,
+            "depth-3 page-fault pressurises the 3-hop cause d.rs"
+        );
+        // Replay uses the recorded depth → reproduces the same pressure on d.rs.
+        assert!((fr(&s.replay_to(s.len())) - fr(s.memory())).abs() < 1e-9);
     }
 }

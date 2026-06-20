@@ -90,6 +90,10 @@ languages). CCOS is a research prototype in Rust (edition 2021); see
   out of the budgeted window by competing pressure, with the triggering op and the
   token gap — e.g. `·●●●●●○○●●` reads "in context until a failure made a neighbour hot
   and evicted the real cause, then a page-fault pulled it back".
+- **Field-data export.** `ccos postmortem <workspace> --json` dumps the session
+  record (stats / integrity / timeline / working set) for archiving or fleet
+  collection (`scripts/fleet_collect.sh`); a copied workspace replays bit-for-bit
+  off-site. See [`docs/SELF_ANALYSIS.md`](docs/SELF_ANALYSIS.md).
 
 ## Quickstart — give your agent a memory
 

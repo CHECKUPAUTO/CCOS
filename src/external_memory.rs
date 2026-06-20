@@ -281,9 +281,12 @@ impl CcosMemory {
     }
 
     /// Open a memory backed by `path`: load it if the file exists, otherwise
-    /// start empty with `path` bound as the checkpoint target.
+    /// start empty with `path` bound as the checkpoint target. If `path` is an
+    /// existing **directory** (a launcher may create the workspace as one), state
+    /// is placed in `<path>/workspace.ccos` inside it rather than failing with
+    /// "Is a directory".
     pub fn open(path: impl AsRef<Path>) -> Result<Self, MemoryError> {
-        let p = path.as_ref().to_path_buf();
+        let p = workspace_file(path.as_ref());
         let mut mem = if p.exists() {
             Self::from_json(&std::fs::read_to_string(&p)?)?
         } else {
@@ -348,6 +351,23 @@ impl CcosMemory {
     /// Read-only access to the underlying causal graph (escape hatch).
     pub fn graph(&self) -> &MemoryGraph {
         &self.graph
+    }
+
+    /// The node currently under the most failure pressure — the workspace's active
+    /// problem focus, and the natural anchor for "what should I be looking at".
+    /// `None` when nothing is failing. Deterministic (ties break on the node id).
+    pub fn hottest_failure_node(&self) -> Option<String> {
+        self.graph
+            .nodes
+            .iter()
+            .filter(|(_, n)| n.failure_relevance > 0.0)
+            .max_by(|(ka, a), (kb, b)| {
+                a.failure_relevance
+                    .partial_cmp(&b.failure_relevance)
+                    .unwrap_or(Ordering::Equal)
+                    .then_with(|| kb.0.cmp(&ka.0)) // tie → smaller id wins
+            })
+            .map(|(id, _)| id.0.clone())
     }
 
     fn write_to(&self, p: &Path) -> Result<(), MemoryError> {
@@ -418,6 +438,14 @@ impl CcosMemory {
             if !seen.insert(id.0.clone()) {
                 continue;
             }
+            // External-dependency hubs (`dep:std`, `dep:crate`, …) are causal
+            // connectors, not context: they carry no source, yet a `use`-heavy real
+            // codebase drives their access count up so they dominate the working
+            // set (a field run on 8 CCOS files returned only the `dep:` hubs). Keep
+            // them in the graph for causality, but never spend window budget on them.
+            if id.0.starts_with("dep:") {
+                continue;
+            }
             if let Some(node) = self.graph.nodes.get(&id) {
                 scored.push(RecallItem {
                     uri: id.0.clone(),
@@ -461,8 +489,24 @@ fn normalize(uri: &str) -> String {
     }
 }
 
+/// Resolve a workspace path to its state **file**. A plain path is used as-is; an
+/// existing directory becomes `<dir>/workspace.ccos` inside it (so a launcher that
+/// pre-creates the workspace as a directory works instead of erroring with "Is a
+/// directory"). Idempotent: resolving an already-resolved file path is a no-op.
+pub(crate) fn workspace_file(path: &Path) -> PathBuf {
+    if path.is_dir() {
+        path.join("workspace.ccos")
+    } else {
+        path.to_path_buf()
+    }
+}
+
 impl ExternalMemory for CcosMemory {
     fn ingest_source(&mut self, uri: &str, source: &str) -> IngestReport {
+        // Tolerate a redundant `file:` namespace prefix on the uri (an agent often
+        // copies a node id back from `recall`, which returns `file:<path>`); without
+        // this, `ingest("file:src/a.rs")` would double-prefix to `file:file:src/a.rs`.
+        let uri = uri.strip_prefix("file:").unwrap_or(uri);
         let file_key = format!("file:{uri}");
         let prev = self.sources.get(&file_key).cloned();
         let delta = self
@@ -569,6 +613,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn recall_excludes_external_dependency_hubs() {
+        // Field regression (Jetson, 8 real CCOS files): a `use`-heavy codebase
+        // drove `dep:crate`'s access count up so the working set returned only the
+        // `dep:` hubs (24 tokens of "External dependency: …", zero code).
+        let mut mem = CcosMemory::new();
+        mem.ingest_source("src/db.rs", "pub fn q() -> i64 { 1 }\n");
+        mem.ingest_source(
+            "src/repo.rs",
+            "use crate::db;\npub fn f() -> i64 { db::q() }\n",
+        );
+        mem.ingest_source(
+            "src/api.rs",
+            "use crate::repo;\npub fn h() -> i64 { repo::f() }\n",
+        );
+        let win = mem.recall(&Recall::working_set(), 4096);
+        assert!(!win.items.is_empty(), "window is not empty");
+        assert!(
+            !win.items.iter().any(|i| i.uri.starts_with("dep:")),
+            "no external-dependency hubs in the window: {:?}",
+            win.items.iter().map(|i| &i.uri).collect::<Vec<_>>()
+        );
+        assert!(
+            win.items.iter().any(|i| i.uri.starts_with("file:")),
+            "real file nodes are present"
+        );
+    }
+
+    #[test]
+    fn hottest_failure_node_is_the_active_problem() {
+        let mut mem = CcosMemory::new();
+        mem.ingest_source("src/db.rs", "pub fn q() {}\n");
+        mem.ingest_source("src/api.rs", "use crate::db;\npub fn h() { db::q() }\n");
+        assert!(mem.hottest_failure_node().is_none(), "nothing failing yet");
+        mem.signal_failure("file:src/db.rs", 2).unwrap();
+        assert_eq!(
+            mem.hottest_failure_node().as_deref(),
+            Some("file:src/db.rs")
+        );
+    }
+
+    #[test]
     fn recall_around_reaches_cross_file_cause() {
         let mut mem = CcosMemory::new();
         mem.ingest_source("src/db.rs", "pub fn connect() -> i32 { 5 }\n");
@@ -596,6 +681,33 @@ mod tests {
             !files.contains(&"file:src/unrelated.rs"),
             "recall excludes unrelated code: {files:?}"
         );
+    }
+
+    #[test]
+    fn ingest_tolerates_a_redundant_file_prefix_and_around_takes_either_form() {
+        let mut mem = CcosMemory::new();
+        // An agent copies a node id back from `recall` (which returns `file:<path>`).
+        mem.ingest_source("file:src/a.rs", "pub fn alpha() {}\n");
+        let ids: Vec<String> = mem
+            .recall(&Recall::working_set(), 10_000)
+            .items
+            .into_iter()
+            .map(|i| i.uri)
+            .collect();
+        assert!(
+            ids.iter().any(|u| u == "file:src/a.rs"),
+            "single prefix, not file:file: — got {ids:?}"
+        );
+        assert!(!ids.iter().any(|u| u.starts_with("file:file:")));
+        // `around` resolves both the bare path and the `file:`-prefixed node id.
+        assert!(!mem
+            .recall(&Recall::around("src/a.rs"), 10_000)
+            .items
+            .is_empty());
+        assert!(!mem
+            .recall(&Recall::around("file:src/a.rs"), 10_000)
+            .items
+            .is_empty());
     }
 
     #[test]

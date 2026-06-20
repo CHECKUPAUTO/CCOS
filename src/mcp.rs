@@ -226,12 +226,21 @@ fn read_resource(session: &AgentSession, params: &Value) -> Result<Value, (i64, 
     let uri = params.get("uri").and_then(Value::as_str).unwrap_or("");
     let text = match uri {
         "ccos://session/context" => {
-            // Self-bounding working set; budget tunable at launch without a flag.
+            // Budget tunable at launch without a flag.
             let budget = std::env::var("CCOS_MCP_CONTEXT_BUDGET")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(2048usize);
-            linearize_window(&session.memory().recall(&Recall::working_set(), budget))
+            // Anchor on the workspace signal: if something is failing, inject the
+            // causal *region* of that problem (far more useful on a real codebase
+            // than the global working set, which a `use`-heavy repo fills with the
+            // hottest file); otherwise fall back to the global working set.
+            let mem = session.memory();
+            let window = match mem.hottest_failure_node() {
+                Some(anchor) => mem.recall(&Recall::around(anchor), budget),
+                None => mem.recall(&Recall::working_set(), budget),
+            };
+            linearize_window(&window)
         }
         "ccos://session/timeline" => session.timeline().join("\n"),
         other => return Err((-32602, format!("unknown resource: {other}"))),
@@ -530,6 +539,42 @@ mod tests {
         assert!(
             text.contains("file:src/a.rs"),
             "context resource linearises the working set: {text}"
+        );
+    }
+
+    #[test]
+    fn context_resource_anchors_on_the_active_failure() {
+        let mut s = AgentSession::new();
+        ingest(&mut s, 1, "src/db.rs", "pub fn q() {}\n");
+        ingest(
+            &mut s,
+            2,
+            "src/api.rs",
+            "use crate::db;\npub fn h() { db::q() }\n",
+        );
+        // A failure on db.rs → the injected context should be db.rs's causal region.
+        handle(
+            &mut s,
+            &req(
+                3,
+                "tools/call",
+                json!({ "name": "signal_failure", "arguments": { "node": "file:src/db.rs" } }),
+            ),
+        )
+        .unwrap();
+        let read = handle(
+            &mut s,
+            &req(
+                4,
+                "resources/read",
+                json!({ "uri": "ccos://session/context" }),
+            ),
+        )
+        .unwrap();
+        let text = read["result"]["contents"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("file:src/db.rs"),
+            "context anchors on the failing file: {text}"
         );
     }
 
