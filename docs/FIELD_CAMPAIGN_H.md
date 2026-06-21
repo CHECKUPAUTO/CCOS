@@ -387,6 +387,35 @@ les modèles faibles, soit (b) mesurer la valeur de CCOS sur l'**assemblage de c
 générale** (où les dépendances sont omniprésentes), pas seulement sur le bug-fix-avec-test —
 créneau qui, lui, s'est avéré rare.
 
+## Valeur en tâche générale — le créneau large (model-free)
+
+Le bug-fix multi-fichiers est rare (~1–2 %). Mais le *besoin* sous-jacent — « je travaille sur
+le fichier X, ai-je ses dépendances cross-file dans mon budget ? » — est **omniprésent** (tout
+fichier non trivial utilise ses deps). Mesuré sur **chaque** fichier de vrais crates
+(`scripts/ccos_context_value.py`, budget 2048, sans LLM, sans signal d'échec — juste « je
+travaille sur X ») : pour chaque arête de dépendance `use crate::Y`, le contenu de Y est-il dans
+`recall around X` ? Comparé à ouvrir X naïvement (tronqué au budget, puis les voisins).
+
+| crate | arêtes-dep | **CCOS** | dump naïf | gros fichiers (> budget) : CCOS / naïf |
+| ----- | ---------- | -------- | --------- | -------------------------------------- |
+| `syn` | 112 | **81 %** | 2 % | 79 % / 0 % |
+| CCOS `src/` | 57 | **93 %** | 0 % | 92 % / 0 % |
+| `serde_json` | 14 | **100 %** | 0 % | 100 % / 0 % |
+
+**Sur 183 arêtes de dépendance réelles, CCOS place la dépendance dans une fenêtre de 2048 tokens
+81–100 % du temps ; ouvrir le fichier en donne 0–2 %.** Et c'est concentré là où ça compte : sur
+les **gros fichiers** (plus grands que le budget), ouvrir le fichier **tronque toutes ses deps**
+(0 %), CCOS en garde **79–100 %**. C'est le créneau **large** que le test de résolution (rare)
+sous-mesurait : l'avantage de couverture n'est pas réservé aux bugs multi-fichiers, c'est le
+quotidien « travailler sur un fichier et avoir besoin de ses deps ».
+
+**Bémol honnête** : ceci mesure la **couverture** (la dep est *présente*), pas la **valeur
+prouvée** (la dep *aide*). La suffisance (couverture → meilleur résultat) n'a été testée que sur
+le créneau étroit du bug-fix, où elle tient *si le modèle exploite le contexte*. Donc : avantage
+de **couverture large et fort** (prouvé ici), **suffisance démontrée sur l'étroit**. On ne
+sur-vend pas : la couverture est nécessaire et omniprésente ; reste à prouver que l'aide qu'elle
+procure se généralise au-delà du bug-fix.
+
 
 ## Grille de résultats à remplir (vrai code, Thor)
 
