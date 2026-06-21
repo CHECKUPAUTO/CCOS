@@ -12,15 +12,22 @@ self-bounding, linearised context window a host can inject into its prompt, plus
 post-mortem debugger to rewind to exactly where the agent's attention went off the
 rails.
 
-**What it is, honestly.** CCOS is *not* a better retriever — on real bugs a lexical
-baseline matches it at putting a fix's files in the window. Its value is the axis a
-probabilistic RAG/framework stack structurally lacks: it reaches the same result on a
-fraction of the context budget (it self-bounds at the causal region, with no top-k to
-tune), and every step is deterministic, replayable and auditable. The research story
-behind that conclusion — the original hypothesis, the bug-mining harness, the
-measurements against RAG/GraphRAG — lives in [`docs/paper/`](docs/paper/) (six
-languages). CCOS is a research prototype in Rust (edition 2021); see
-[Status & limitations](#status--limitations).
+**What it is, honestly.** CCOS's measured advantage is **coverage of the right context,
+frugally**. When you work on a real source file, its causal recall puts that file's
+cross-file dependencies into a tight (2048-token) window **81–100 %** of the time, where
+naively opening the file truncated to the same budget gets **0–2 %** — and cross-file
+dependencies are everywhere, so this is the *everyday* case, not a corner one (measured
+model-free over `syn`, `serde_json` and this repo — `scripts/ccos_context_value.py`). On the
+*narrow* slice of **multi-file bugs** (the cause sits in a file a budget would truncate away —
+only ~1–2 % of real fixes), that coverage advantage becomes a **resolution** one: a capable
+local model fixes the root cause where an equal-budget file dump cannot. CCOS is *not* a
+better retriever in the RAG sense (a tuned top-k baseline can also be sparse); its structural
+wins are self-bounding (no `k` to tune) plus **deterministic, replayable, auditable**. The
+full research story — the original hypothesis, the bug-mining harness, the honest negative
+result vs RAG/GraphRAG — lives in [`docs/paper/`](docs/paper/) (six languages); the field
+measurements behind the numbers above are in
+[`docs/FIELD_CAMPAIGN_H.md`](docs/FIELD_CAMPAIGN_H.md). CCOS is a research prototype in Rust
+(edition 2021); see [Status & limitations](#status--limitations).
 
 ## The cognitive-MMU cycle
 
@@ -42,18 +49,20 @@ languages). CCOS is a research prototype in Rust (edition 2021); see
 
 ### 1. Demand paging by causal pressure
 
-- **Self-calibration.** CCOS assembles a token-bounded working set from node
-  activation in the causal graph — typically **700–1600 context tokens** where
-  budget-filling lexical RAG uses **~5000–6000** on the same single-file fixes (a
-  measured **4–9× reduction**). It stops at the causal region instead of padding a
-  top-k to budget; there is no `k` to tune. Efficiency is the *one* axis CCOS wins —
-  a carefully tuned-k RAG would also be sparser; the point is that CCOS bounds
-  *itself*.
-- **Context page fault.** Feed `cargo test` / panic output back in: CCOS parses the
-  faulting source locations from the trace, injects failure pressure on those files,
-  and re-pages a refreshed window for the next attempt. (It targets the files the
-  trace names — often the *symptom* site; the post-mortem tools below let you check
-  whether the deep cause actually entered the window.)
+- **Self-calibration.** CCOS assembles a token-bounded working set from causal-graph
+  activation and **stops at the causal region** — there is no `k` to tune. Measured over
+  real crates (`syn`, `serde_json`, this repo): for a file you're working on, its cross-file
+  dependencies land in a 2048-token window **81–100 %** of the time, vs **0–2 %** for naively
+  opening the file at the same budget. On a *big* file — where opening it truncates every
+  dependency — that gap is **79–100 % vs 0 %**. Three measured fixes get it there at a fixed
+  budget regardless of the anchor's size: symbol-span granularity (no node carries a whole
+  file), degree-aware failure propagation (a hub distributes pressure instead of flooding),
+  and anchor-proximity ranking — see [`docs/FIELD_CAMPAIGN_H.md`](docs/FIELD_CAMPAIGN_H.md).
+- **Context page fault.** Feed `cargo test` / panic output back in: CCOS parses the faulting
+  source locations from the trace, injects failure pressure on those files, and re-pages a
+  refreshed window. The propagation reaches the cross-file *cause* (up to ~3 hops), not just
+  the symptom the trace names — the post-mortem tools below let you verify which nodes the
+  window actually held at each step.
 
 ### 2. Transactional, replayable storage
 
@@ -171,7 +180,7 @@ Module reference: `cargo doc --open` (every module has rustdoc), or
 ## Testing
 
 ```bash
-cargo test                     # 267 unit, integration & doc tests
+cargo test                     # 285 unit, integration & doc tests
 cargo clippy --all-targets --all-features   # lint-clean (-D warnings in CI)
 cargo test -- --ignored        # opt-in: 1,000,000-cycle long-stability run
 ```
@@ -207,12 +216,15 @@ A research prototype, not a production system. Known gaps (tracked in
 - The parser defaults to a **line-based heuristic** (zero dependencies); build with
   `--features syn-parser` for a real `syn` AST. Edges capture containment/dependency,
   **not** call graphs or data flow — so the causal graph is structural, not semantic.
-- CCOS makes drift **auditable and debuggable**; it does **not** claim to prevent
-  drift or to improve task success (the paper is explicit on this — the demonstrated
-  win is efficiency and auditability, not resolution).
+- CCOS's broad, proven wins are **coverage** (the right context, frugally) and
+  **auditability**. On the *narrow* slice of multi-file bugs it also improves
+  **resolution** (a capable local model fixes the root cause where an equal-budget dump
+  can't — measured across two model families); on single-file bugs it's at parity, and
+  the right context is **necessary but not sufficient** — a weak model (≤~3B), or even a
+  strong one, can still misuse it (see `docs/FIELD_CAMPAIGN_H.md`). It does **not** claim
+  to prevent drift.
 - The agent self-feed hook is a best-effort heuristic intercept, not a ground-truth
   tracer; use one writer per `workspace.ccos`.
 
-## License
 
-Unlicensed research prototype. Add a license before any external use.
+
