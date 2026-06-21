@@ -39,4 +39,4 @@ criterion = "0.5"
 [[bench]]
 name = "delta_bench"
 harness = false
-license = "PolyForm-Noncommercial-1.0.0"
+license = "LicenseRef-CheckupAuto-Dual"
