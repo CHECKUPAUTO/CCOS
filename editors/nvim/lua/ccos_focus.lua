@@ -156,4 +156,8 @@ function M.setup(opts)
   end
 end
 
+-- Exposed for a headless render smoke-test (see editors/README.md): float a given
+-- payload directly, bypassing the async test run.
+M.render = render
+
 return M

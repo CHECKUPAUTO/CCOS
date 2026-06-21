@@ -64,8 +64,18 @@ project's `.gitignore`.
   (`npm run compile`, tsc strict, exit 0), and the pure render logic (`src/render.ts`) **passes
   its tests** (`npm test` — verified against real `ccos focus --json` output). The glue still
   needs the editor (F5) to exercise the actual UI; only the compile + render tests run headless.
-- **Neovim plugin**: written against the same verified contract; **not** checked by a Lua
-  interpreter here. Treat both clients as MVPs to F5/`:CcosFocus`, not shipped extensions.
+- **Neovim plugin**: **loads + registers `:CcosFocus` on real Neovim 0.9.5/arm64** (verified
+  headless on the Jetson). `require("ccos_focus").render(payload)` is exposed so the float
+  render can be smoke-tested headless too:
+  ```sh
+  nvim --headless --noplugin -u NONE -c "set rtp+=…/CCOS/editors/nvim" \
+    -c "lua local m=require('ccos_focus'); m.render({workspace_files=3,tokens=9,message='x', \
+        entries={{file='src/filter.rs',role='cause',score=0.7,content='pub const MIN_SCORE: f64 = 0.0;'}}, _root='/tmp'}); \
+        assert(table.concat(vim.api.nvim_buf_get_lines(0,0,-1,false),'\n'):find('filter.rs'),'no render'); \
+        print('PASS: render')" -c "qa"
+  ```
+  The interactive bits — the floating window appearing, `<CR>` opening the file — still need a
+  real session. Treat both clients as MVPs to drive, not shipped extensions.
 
 ## Known limits (inherited from the kernel)
 
