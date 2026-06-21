@@ -267,10 +267,13 @@ entrent dans la fenêtre, à quel coût.
   tient.
 
 > **Le bémol honnête que `syn` a révélé (que le `src/` plus petit de CCOS cachait) : le budget
-> doit suivre la taille de l'ancre.** Les fichiers de `syn` sont gros (`item.rs` ≈ 88 symboles) ;
-> à budget 2048, le **contenu propre de l'ancre** (pertinent) remplit la fenêtre et n'atteint
-> qu'1/7 deps. À 8192 → 7/7. Il n'y a donc pas de budget magique universel : il s'échelonne avec
-> la taille du fichier ancré. (Piste future : plafonner le header / auto-échelonner le budget.)
+> devait suivre la taille de l'ancre. ✅ CORRIGÉ.** Les fichiers de `syn` sont gros
+> (`item.rs` ≈ 88 symboles) ; à budget 2048, le contenu propre de l'ancre remplissait la
+> fenêtre et n'atteignait qu'1/7 deps. **Deux plafonds** (header ≤ 24 signatures ;
+> aucun fichier > 40 % du budget ancré — `CCOS_HEADER_SYMBOLS` / `CCOS_RECALL_FILE_CAP`)
+> donnent maintenant, à **budget fixe 2048** : item.rs **7/7**, token.rs **7/7**, ty.rs
+> **6/6**, expr.rs **5/5** — quelle que soit la taille de l'ancre. Détail + simulation dans
+> `docs/DESIGN_recall_budget.md`. (Aucun seul plafond ne suffit : 5/7 chacun, 7/7 ensemble.)
 
 **Conclusion** : sur un dépôt **indépendant**, la triade donne une fenêtre multi-fichiers
 **correcte (100 % des deps), locale (≈0 bruit) et frugale (~4 % de l'all-src)** — au budget

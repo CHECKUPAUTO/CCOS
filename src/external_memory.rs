@@ -57,6 +57,7 @@
 //! detects any tampering with a persisted checkpoint; a checkpoint round-trips
 //! (reload reproduces the graph and the chain).
 
+use crate::context_region::file_of;
 use crate::distributed_event_log::DistributedEventLog;
 use crate::event_log::{EventLog, EventPayload, EventType};
 use crate::incremental::IncrementalGraphEngine;
@@ -509,9 +510,16 @@ impl CcosMemory {
                 .unwrap_or(Ordering::Equal)
                 .then_with(|| a.uri.cmp(&b.uri))
         });
+        // When anchored (`around`/`task`), cap how much any single file may
+        // contribute, so a large anchor's own content cannot crowd out its
+        // cross-file dependencies at a fixed budget (the budget-scaling caveat
+        // `syn` exposed; see `docs/DESIGN_recall_budget.md`). With a cap, skip an
+        // over-quota node and keep packing smaller ones instead of stopping.
+        let file_cap = proximity.map(|_| (budget as f64 * recall_file_cap()) as usize);
         let mut items = Vec::new();
         let mut tokens = 0usize;
         let mut seen_content = BTreeSet::new();
+        let mut per_file: HashMap<String, usize> = HashMap::new();
         for it in scored {
             // Drop empty and exact-duplicate content (in score order, so the
             // highest-scored copy wins): granular nodes rarely collide, but this
@@ -520,7 +528,17 @@ impl CcosMemory {
                 continue;
             }
             let t = it.content.chars().count() / 4;
-            if tokens + t > budget && !items.is_empty() {
+            if let Some(cap) = file_cap {
+                let f = file_of(&it.uri).to_string();
+                let used = per_file.get(&f).copied().unwrap_or(0);
+                if !items.is_empty() && used + t > cap {
+                    continue; // over this file's quota — skip, keep packing others
+                }
+                if tokens + t > budget && !items.is_empty() {
+                    continue; // over the global budget — try a smaller later node
+                }
+                *per_file.entry(f).or_default() += t;
+            } else if tokens + t > budget && !items.is_empty() {
                 break;
             }
             tokens += t;
@@ -543,6 +561,17 @@ fn proximity_decay() -> f64 {
         .and_then(|v| v.trim().parse::<f64>().ok())
         .filter(|x| x.is_finite() && *x > 0.0 && *x <= 1.0)
         .unwrap_or(0.85)
+}
+
+/// Fraction of an anchored recall budget any single file may fill, so a large
+/// anchor's own content cannot crowd out its cross-file dependencies. Default
+/// 0.40; override with `CCOS_RECALL_FILE_CAP` (clamped to `(0, 1]`).
+fn recall_file_cap() -> f64 {
+    std::env::var("CCOS_RECALL_FILE_CAP")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|x| x.is_finite() && *x > 0.0 && *x <= 1.0)
+        .unwrap_or(0.40)
 }
 
 /// Hop radius for anchor-proximity weighting. Default 6; override with
@@ -764,6 +793,48 @@ mod tests {
         assert!(
             !files.contains(&"file:src/unrelated.rs"),
             "recall excludes unrelated code: {files:?}"
+        );
+    }
+
+    #[test]
+    fn around_caps_anchor_footprint_so_cross_file_deps_fit_a_fixed_budget() {
+        // The budget-scaling caveat syn exposed: a large anchor file depending on
+        // several small files. Without the per-file + header caps, the anchor's own
+        // content fills the budget and the deps are crowded out. With them, all
+        // five deps fit a fixed 2048 budget.
+        let mut mem = CcosMemory::new();
+        let mut anchor = String::new();
+        for d in 0..5 {
+            anchor.push_str(&format!("use crate::d{d};\n"));
+        }
+        for i in 0..250 {
+            anchor.push_str(&format!(
+                "pub fn f{i}() -> u8 {{\n    let _x = {i};\n    {i}\n}}\n"
+            ));
+        }
+        assert!(
+            anchor.chars().count() / 4 > 2048,
+            "anchor must exceed the budget"
+        );
+        mem.ingest_source("src/anchor.rs", &anchor);
+        for d in 0..5 {
+            mem.ingest_source(
+                &format!("src/d{d}.rs"),
+                &format!("pub fn d{d}() -> u8 {{ {d} }}\n"),
+            );
+        }
+        mem.signal_failure("file:src/anchor.rs", 1).unwrap();
+
+        let win = mem.recall(&Recall::around("file:src/anchor.rs"), 2048);
+        let reached = (0..5)
+            .filter(|d| {
+                let f = format!("src/d{d}.rs");
+                win.items.iter().any(|it| it.uri.contains(&f))
+            })
+            .count();
+        assert_eq!(
+            reached, 5,
+            "all 5 cross-file deps must fit the fixed budget despite the large anchor"
         );
     }
 

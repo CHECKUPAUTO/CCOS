@@ -110,20 +110,32 @@ impl ASTParser {
                 .unwrap_or_default()
         };
 
-        // File node = a thin header: the path and a signature line per symbol. The
-        // agent expands any entry via that symbol's own (span-sized) node.
+        // File node = a thin header: the path and a signature line per symbol,
+        // capped at `header_symbol_cap()` lines so a huge file (syn's `item.rs` has
+        // ~88 symbols) does not spend a third of a recall budget on its index alone
+        // (see `docs/DESIGN_recall_budget.md`). Capped-out symbols are still their
+        // own span nodes; the header just teases the first N.
         let file_id = NodeId(format!("file:{}", result.file_path));
+        let cap = header_symbol_cap();
         let mut header = format!(
             "// {} — {} symbols\n",
             result.file_path,
             result.symbols.len()
         );
+        let mut shown = 0usize;
         for s in &result.symbols {
+            if shown >= cap {
+                break;
+            }
             let sig = line_at(s.line);
             if !sig.is_empty() {
                 header.push_str(&sig);
                 header.push('\n');
+                shown += 1;
             }
+        }
+        if result.symbols.len() > shown {
+            header.push_str(&format!("// … (+{} more)\n", result.symbols.len() - shown));
         }
         graph.upsert_node(
             file_id.clone(),
@@ -578,6 +590,17 @@ impl Default for ASTParser {
     }
 }
 
+/// Max signature lines a file-header node lists. Default 24; override with
+/// `CCOS_HEADER_SYMBOLS`. Caps the header footprint of very large files so it
+/// cannot dominate a recall budget; the omitted symbols remain their own nodes.
+fn header_symbol_cap() -> usize {
+    std::env::var("CCOS_HEADER_SYMBOLS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|x| *x >= 1)
+        .unwrap_or(24)
+}
+
 /// Inclusive 1-based `[start, end]` line span of the item beginning at
 /// `start_line`. Brace-matched for `{}`-bodied items (fn/struct/enum/trait/impl);
 /// semicolon-terminated for the rest (const/static/type/use); a lone start line
@@ -850,6 +873,32 @@ mod tests {
         let mut graph = MemoryGraph::default();
         parser.update_memory_graph(&result, source, &mut graph);
         assert!(graph.node_count() > 3);
+    }
+
+    #[test]
+    fn file_header_caps_its_symbol_list() {
+        let mut src = String::new();
+        for i in 0..50 {
+            src.push_str(&format!("pub fn f{i}() {{}}\n"));
+        }
+        let parser = ASTParser::new();
+        let result = parser.parse_source("t.rs", &src);
+        let mut graph = MemoryGraph::default();
+        parser.update_memory_graph(&result, &src, &mut graph);
+        let header = &graph
+            .nodes
+            .get(&NodeId("file:t.rs".to_string()))
+            .expect("file node")
+            .content;
+        // Default cap is 24 lines + a "(+N more)" marker, not all 50 signatures.
+        assert!(
+            header.contains("(+26 more)"),
+            "header must note the omitted symbols: {header}"
+        );
+        assert!(
+            !header.contains("f49"),
+            "header must not list every symbol of a large file"
+        );
     }
 
     #[test]
