@@ -41,7 +41,7 @@ fn phase1_initial_state() {
     for (path, source) in &workspace {
         let result = engine.register_file(path, source);
         let parser = ASTParser::new();
-        parser.update_memory_graph(&result, &mut graph);
+        parser.update_memory_graph(&result, source, &mut graph);
     }
 
     // Assertions

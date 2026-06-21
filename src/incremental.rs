@@ -95,14 +95,14 @@ impl IncrementalGraphEngine {
         match op {
             MutationOp::FileAdded => {
                 let result = self.parser.parse_source(file_path, new_source);
-                self.parser.update_memory_graph(&result, graph);
+                self.parser.update_memory_graph(&result, new_source, graph);
                 self.store_file_state(file_path, new_hash, &result);
             }
             MutationOp::FileModified => {
                 // O(Δ): only modify this file's contributions
                 self.evict_file_nodes(file_path, graph);
                 let result = self.parser.parse_source(file_path, new_source);
-                self.parser.update_memory_graph(&result, graph);
+                self.parser.update_memory_graph(&result, new_source, graph);
                 self.store_file_state(file_path, new_hash, &result);
             }
             MutationOp::NoChange => {

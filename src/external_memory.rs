@@ -67,7 +67,7 @@ use crate::region_engine::ContextRegionEngine;
 use crate::util::sha256_hex;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
 /// Errors returned by memory operations.
@@ -420,18 +420,62 @@ impl CcosMemory {
             .map(|(_, id)| id)
     }
 
-    /// Best available content for a node: its file's ingested source if known,
-    /// else the node's own stored content.
-    fn content_for(&self, node_id: &str, node: &GraphNode) -> String {
-        let file_key = format!("file:{}", file_of(node_id));
-        self.sources
-            .get(&file_key)
-            .cloned()
-            .unwrap_or_else(|| node.content.clone())
+    /// Content a node contributes to a recall window: its own **granular** content
+    /// — a symbol span, a `use` line, or a file *header* — as stored at ingest by
+    /// `ASTParser::update_memory_graph`. The whole-file source stays in
+    /// `self.sources` for explicit retrieval, but a window never pays whole-file
+    /// cost per node (the real-code failure this fixed; see
+    /// `docs/DESIGN_symbol_granularity.md`).
+    fn content_for(&self, _node_id: &str, node: &GraphNode) -> String {
+        node.content.clone()
     }
 
-    /// Score, order (by `(score, uri)`), and budget-truncate a set of nodes.
-    fn assemble_window(&self, strategy: &str, ids: Vec<NodeId>, budget: usize) -> RecallWindow {
+    /// Hop distance from `anchor` to each node reachable within `max_hops` over
+    /// edges in **both** directions, **without relaying through `dep:` hubs** (a
+    /// shared `std` import must not make two unrelated files "close"). Plain BFS,
+    /// so each node's distance is the true shortest hop count; unreachable nodes
+    /// (or those only reachable through a hub) are simply absent.
+    fn hop_distances(&self, anchor: &NodeId, max_hops: u32) -> HashMap<NodeId, u32> {
+        let mut dist: HashMap<NodeId, u32> = HashMap::new();
+        let mut queue: VecDeque<NodeId> = VecDeque::new();
+        dist.insert(anchor.clone(), 0);
+        queue.push_back(anchor.clone());
+        while let Some(cur) = queue.pop_front() {
+            let d = dist[&cur];
+            // Stop relaying at the hop bound or at a pure-connector `dep:` hub
+            // (it is reached and recorded, but not expanded onward).
+            if d >= max_hops || cur.0.starts_with("dep:") {
+                continue;
+            }
+            for e in &self.graph.edges {
+                let nb = if e.source == cur {
+                    &e.target
+                } else if e.target == cur {
+                    &e.source
+                } else {
+                    continue;
+                };
+                if !dist.contains_key(nb) {
+                    dist.insert(nb.clone(), d + 1);
+                    queue.push_back(nb.clone());
+                }
+            }
+        }
+        dist
+    }
+
+    /// Score, order (by `(score, uri)`), and budget-truncate a set of nodes. When
+    /// `proximity` is `Some((dist, decay, max_hops))`, each node's score is scaled
+    /// by `decay^hops_from_anchor` so near neighbours outrank distant ones — the
+    /// locality term `around`/`task` need in a densely-connected repo (where the
+    /// causal region is nearly the whole graph; see `FIELD_CAMPAIGN_H.md` #3).
+    fn assemble_window(
+        &self,
+        strategy: &str,
+        ids: Vec<NodeId>,
+        budget: usize,
+        proximity: Option<(&HashMap<NodeId, u32>, f64, u32)>,
+    ) -> RecallWindow {
         let mut seen = BTreeSet::new();
         let mut scored: Vec<RecallItem> = Vec::new();
         for id in ids {
@@ -447,9 +491,14 @@ impl CcosMemory {
                 continue;
             }
             if let Some(node) = self.graph.nodes.get(&id) {
+                let mut score = self.graph.compute_node_score(node);
+                if let Some((dist, decay, max_hops)) = proximity {
+                    let hops = dist.get(&id).copied().unwrap_or(max_hops + 1);
+                    score *= decay.powi(hops as i32);
+                }
                 scored.push(RecallItem {
                     uri: id.0.clone(),
-                    score: self.graph.compute_node_score(node),
+                    score,
                     kind: format!("{:?}", node.node_type),
                     content: self.content_for(&id.0, node),
                 });
@@ -461,11 +510,35 @@ impl CcosMemory {
                 .unwrap_or(Ordering::Equal)
                 .then_with(|| a.uri.cmp(&b.uri))
         });
+        // When anchored (`around`/`task`), cap how much any single file may
+        // contribute, so a large anchor's own content cannot crowd out its
+        // cross-file dependencies at a fixed budget (the budget-scaling caveat
+        // `syn` exposed; see `docs/DESIGN_recall_budget.md`). With a cap, skip an
+        // over-quota node and keep packing smaller ones instead of stopping.
+        let file_cap = proximity.map(|_| (budget as f64 * recall_file_cap()) as usize);
         let mut items = Vec::new();
         let mut tokens = 0usize;
+        let mut seen_content = BTreeSet::new();
+        let mut per_file: HashMap<String, usize> = HashMap::new();
         for it in scored {
+            // Drop empty and exact-duplicate content (in score order, so the
+            // highest-scored copy wins): granular nodes rarely collide, but this
+            // guards against whole-file duplication ever creeping back.
+            if it.content.trim().is_empty() || !seen_content.insert(it.content.clone()) {
+                continue;
+            }
             let t = it.content.chars().count() / 4;
-            if tokens + t > budget && !items.is_empty() {
+            if let Some(cap) = file_cap {
+                let f = file_of(&it.uri).to_string();
+                let used = per_file.get(&f).copied().unwrap_or(0);
+                if !items.is_empty() && used + t > cap {
+                    continue; // over this file's quota — skip, keep packing others
+                }
+                if tokens + t > budget && !items.is_empty() {
+                    continue; // over the global budget — try a smaller later node
+                }
+                *per_file.entry(f).or_default() += t;
+            } else if tokens + t > budget && !items.is_empty() {
                 break;
             }
             tokens += t;
@@ -477,6 +550,38 @@ impl CcosMemory {
             tokens,
         }
     }
+}
+
+/// Per-hop attenuation of a node's recall score by its graph distance from the
+/// anchor (`around`/`task`). Default 0.85; override with `CCOS_PROXIMITY_DECAY`
+/// (clamped to `(0, 1]`).
+fn proximity_decay() -> f64 {
+    std::env::var("CCOS_PROXIMITY_DECAY")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|x| x.is_finite() && *x > 0.0 && *x <= 1.0)
+        .unwrap_or(0.85)
+}
+
+/// Fraction of an anchored recall budget any single file may fill, so a large
+/// anchor's own content cannot crowd out its cross-file dependencies. Default
+/// 0.40; override with `CCOS_RECALL_FILE_CAP` (clamped to `(0, 1]`).
+fn recall_file_cap() -> f64 {
+    std::env::var("CCOS_RECALL_FILE_CAP")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|x| x.is_finite() && *x > 0.0 && *x <= 1.0)
+        .unwrap_or(0.40)
+}
+
+/// Hop radius for anchor-proximity weighting. Default 6; override with
+/// `CCOS_PROXIMITY_HOPS` (at least 1).
+fn proximity_hops() -> u32 {
+    std::env::var("CCOS_PROXIMITY_HOPS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|x| *x >= 1)
+        .unwrap_or(6)
 }
 
 /// Prefix a bare path with `file:`; leave known node-id prefixes untouched.
@@ -562,19 +667,27 @@ impl ExternalMemory for CcosMemory {
                     .into_iter()
                     .map(|(id, _)| id)
                     .collect();
-                self.assemble_window("working-set", ids, budget_tokens)
+                self.assemble_window("working-set", ids, budget_tokens, None)
             }
             Recall::Around(uri) => {
+                let anchor = NodeId(normalize(uri));
                 let ids = self.region_member_ids(uri);
-                self.assemble_window("region", ids, budget_tokens)
+                let hops = proximity_hops();
+                let dist = self.hop_distances(&anchor, hops);
+                let prox = (&dist, proximity_decay(), hops);
+                self.assemble_window("region", ids, budget_tokens, Some(prox))
             }
-            Recall::Task(text) => {
-                let ids = self
-                    .lexical_entry(text)
-                    .map(|e| self.region_member_ids(&e))
-                    .unwrap_or_default();
-                self.assemble_window("task-region", ids, budget_tokens)
-            }
+            Recall::Task(text) => match self.lexical_entry(text) {
+                Some(entry) => {
+                    let anchor = NodeId(normalize(&entry));
+                    let ids = self.region_member_ids(&entry);
+                    let hops = proximity_hops();
+                    let dist = self.hop_distances(&anchor, hops);
+                    let prox = (&dist, proximity_decay(), hops);
+                    self.assemble_window("task-region", ids, budget_tokens, Some(prox))
+                }
+                None => self.assemble_window("task-region", Vec::new(), budget_tokens, None),
+            },
         }
     }
 
@@ -680,6 +793,110 @@ mod tests {
         assert!(
             !files.contains(&"file:src/unrelated.rs"),
             "recall excludes unrelated code: {files:?}"
+        );
+    }
+
+    #[test]
+    fn around_caps_anchor_footprint_so_cross_file_deps_fit_a_fixed_budget() {
+        // The budget-scaling caveat syn exposed: a large anchor file depending on
+        // several small files. Without the per-file + header caps, the anchor's own
+        // content fills the budget and the deps are crowded out. With them, all
+        // five deps fit a fixed 2048 budget.
+        let mut mem = CcosMemory::new();
+        let mut anchor = String::new();
+        for d in 0..5 {
+            anchor.push_str(&format!("use crate::d{d};\n"));
+        }
+        for i in 0..250 {
+            anchor.push_str(&format!(
+                "pub fn f{i}() -> u8 {{\n    let _x = {i};\n    {i}\n}}\n"
+            ));
+        }
+        assert!(
+            anchor.chars().count() / 4 > 2048,
+            "anchor must exceed the budget"
+        );
+        mem.ingest_source("src/anchor.rs", &anchor);
+        for d in 0..5 {
+            mem.ingest_source(
+                &format!("src/d{d}.rs"),
+                &format!("pub fn d{d}() -> u8 {{ {d} }}\n"),
+            );
+        }
+        mem.signal_failure("file:src/anchor.rs", 1).unwrap();
+
+        let win = mem.recall(&Recall::around("file:src/anchor.rs"), 2048);
+        let reached = (0..5)
+            .filter(|d| {
+                let f = format!("src/d{d}.rs");
+                win.items.iter().any(|it| it.uri.contains(&f))
+            })
+            .count();
+        assert_eq!(
+            reached, 5,
+            "all 5 cross-file deps must fit the fixed budget despite the large anchor"
+        );
+    }
+
+    #[test]
+    fn around_proximity_ranks_near_neighbours_above_distant_ones() {
+        // FIELD_CAMPAIGN_H.md #3: in a connected region, a 1-hop dependency must
+        // outrank one three hops away (recency alone would tie them). Chain
+        // a→b→c→d via real imports; recall around a with a budget large enough to
+        // hold the whole region, then check the order.
+        let mut mem = CcosMemory::new();
+        mem.ingest_source("src/a.rs", "use crate::b;\npub fn a() -> i64 { b::b() }\n");
+        mem.ingest_source("src/b.rs", "use crate::c;\npub fn b() -> i64 { c::c() }\n");
+        mem.ingest_source("src/c.rs", "use crate::d;\npub fn c() -> i64 { d::d() }\n");
+        mem.ingest_source("src/d.rs", "pub fn d() -> i64 { 0 }\n");
+        let win = mem.recall(&Recall::around("file:src/a.rs"), 100_000);
+        let pos = |u: &str| {
+            win.items
+                .iter()
+                .position(|i| i.uri == u)
+                .unwrap_or_else(|| panic!("{u} should be in the window"))
+        };
+        assert!(
+            pos("file:src/b.rs") < pos("file:src/d.rs"),
+            "1-hop neighbour b.rs must rank above 3-hop d.rs"
+        );
+    }
+
+    #[test]
+    fn recall_around_reaches_the_cause_under_a_tight_budget_on_a_large_file() {
+        // The real-code regression (docs/DESIGN_symbol_granularity.md): a symptom
+        // file larger than the budget that depends on a small cause file. Before
+        // symbol-span granularity, the symptom's whole-file node alone blew the
+        // 2048 budget and the cross-file cause never entered the window.
+        let mut mem = CcosMemory::new();
+        let mut symptom = String::from("use crate::cfg;\n");
+        for i in 0..150 {
+            symptom.push_str(&format!(
+                "pub fn f{i}() -> u8 {{\n    let _a = {i};\n    let _b = {i};\n    {i}\n}}\n"
+            ));
+        }
+        symptom.push_str("pub fn run() -> u8 { cfg::limit() }\n");
+        assert!(
+            symptom.chars().count() / 4 > 2048,
+            "fixture symptom file must exceed the budget to be meaningful"
+        );
+        mem.ingest_source("src/symptom.rs", &symptom);
+        mem.ingest_source("src/cfg.rs", "pub fn limit() -> u8 { 0 }\n");
+        for i in 0..6 {
+            mem.ingest_source(&format!("src/filler{i}.rs"), "pub fn pad() -> u8 { 1 }\n");
+        }
+        mem.signal_failure("file:src/symptom.rs", 1).unwrap();
+
+        let win = mem.recall(&Recall::around("file:src/symptom.rs"), 2048);
+        let uris: Vec<&str> = win.items.iter().map(|i| i.uri.as_str()).collect();
+        assert!(
+            uris.iter().any(|u| u.contains("src/cfg.rs")),
+            "the cross-file cause must be reached within a 2048 budget: {uris:?}"
+        );
+        assert!(
+            win.tokens <= 2048,
+            "granular nodes keep the window within budget: {} tokens",
+            win.tokens
         );
     }
 
