@@ -193,30 +193,41 @@ Le protocole H, appliqué non plus à des crates-jouets mais au **propre `src/` 
    ancre = **les 32 fichiers, ~2 000 000 tokens** pour 130 287 tokens uniques : un facteur
    **15× de duplication** (les ~6 symboles de `main.rs` portent chacun les 64 655 chars de
    `main.rs`). Tant que `sym:` ne porte pas seulement *sa* fonction, le budget est brûlé.
-2. **Propagation à profondeur fixe — elle inonde les graphes denses.** `signal_failure`
-   sur **un** fichier pressurise **518 / 1037 nœuds** (depth 3) : la moitié du dépôt. La
-   donnée dit ici **depth=1 ≫ depth=3** (le défaut est *mauvais* sur du vrai code dense).
-   Tension honnête avec le corpus précédent (sur des **chaînes linéaires creuses**,
-   depth=3 était nécessaire pour atteindre une cause à 3 sauts) : **la bonne profondeur
-   dépend de la densité du graphe** — creux ⇒ profond, dense ⇒ court. La propagation
-   devrait être *consciente du degré*, pas une constante.
+2. **Propagation à profondeur fixe — elle inonde les graphes denses. ✅ CORRIGÉ.**
+   `signal_failure` sur **un** fichier pressurisait **518 / 1037 nœuds** (depth 3) : la
+   moitié du dépôt, et le hub finissait par surclasser le symptôme. Correctif livré :
+   **propagation consciente du degré** — un nœud *distribue* sa pression sur ses arêtes
+   (`damp = failure_fanout / out_degree`, no-op sous `failure_fanout=6`) au lieu de la
+   *répliquer*, plus un **cutoff au plancher de paging** (on arrête de relayer une pression
+   qui ne peut plus rien pager). Résultat mesuré : **flood 518 → 37 nœuds (14×)** ; le
+   **défaut `depth=3` atteint maintenant le symptôme + 2/2 deps en 2035 tokens** (identique
+   à depth=1 — la tension profondeur/densité est **résolue**) ; le symptôme `mcp.rs` repasse
+   **#1** (0.850) et le hub `memory.rs` sort de la fenêtre. La **réuse-clé** : sur une chaîne
+   creuse `a→b→c→d` (degré 1), `damp=1`, donc la cause à 3 sauts `d.rs` est **toujours**
+   atteinte — le degré-conscient préserve la portée profonde là où baisser la profondeur
+   l'aurait perdue. (`CCOS_FAILURE_FANOUT` ajustable.)
 3. **Domination du hub.** `memory.rs` (utilisé par presque tout) accumule la pression de
    tous les côtés ; ses nœuds whole-file **surclassent le symptôme** (`sym:memory.rs`
    score 0.910 > `file:mcp.rs`). Il faut un **down-weighting par degré inverse (IDF)** pour
    qu'un hub ne gagne pas *toutes* les régions.
 
-**Le verdict frugalité, sans fard** : les 3 fichiers pertinents = **20 405 tokens**. CCOS
-exige un budget de **32 768** pour les livrer (taxe de duplication) **et seulement** à
-`depth=1` ; au **défaut `depth=3`, il ne les atteint sous aucun budget testé** — il sert le
-hub. **En l'état, sur du vrai code, CCOS est *moins* frugal que « dumper les 3 bons
-fichiers ».** Son seul apport résiduel — *dire quels* fichiers — coûte plus de tokens que
-les fichiers eux-mêmes, et le défaut désigne les mauvais (le hub).
+**Le verdict frugalité, sans fard (diagnostic d'origine)** : les 3 fichiers pertinents =
+**20 405 tokens**. CCOS exigeait un budget de **32 768** pour les livrer (taxe de
+duplication) **et seulement** à `depth=1` ; au **défaut `depth=3`, il ne les atteignait sous
+aucun budget testé** — il servait le hub.
 
-Ce n'est pas un échec de la machinerie (event-sourcing, time-travel, persistance, audit
-fonctionnent) : c'est l'**assemblage de contexte** — le cœur de la thèse — qui ne survit
-pas au passage à l'échelle réelle **tant que la granularité symbole, la propagation
-degré-consciente et la suppression de hub ne sont pas faites**. Ces trois items passent
-de « roadmap spéculative » à « les trois raisons chiffrées pour lesquelles ça casse ».
+> **MISE À JOUR (causes #1 et #2 corrigées).** Avec la granularité symbole **et** la
+> propagation degré-consciente, la même mesure donne : **défaut `depth=3`, budget 2048 →
+> symptôme + 2/2 deps en 2035 tokens** (region complète 15× → 1.2× ; flood 518 → 37). CCOS
+> livre désormais les 3 bons fichiers **et dit lesquels** sous un budget serré, au réglage
+> par défaut. Reste la cause **#3** (le `around` traverse encore les hubs `dep:`/std partagés
+> — un nœud `use:commands_demo` non pertinent entre par cette voie). C'est le dernier levier.
+
+Ce n'était pas un échec de la machinerie (event-sourcing, time-travel, persistance, audit
+fonctionnent) : c'était l'**assemblage de contexte** — le cœur de la thèse — qui ne
+survivait pas à l'échelle réelle tant que la granularité symbole et la propagation
+degré-consciente n'étaient pas faites. **Deux des trois sont livrées** ; ces items sont
+passés de « roadmap spéculative » à « corrigés, avec les chiffres avant/après ».
 
 ➡️ Le test de Thor sur un **autre** vrai dépôt (ripgrep/bat/fd) reste utile comme
 confirmation indépendante, mais la conclusion est déjà nette ici.

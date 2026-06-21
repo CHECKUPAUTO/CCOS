@@ -85,6 +85,20 @@ pub struct ScoringWeights {
     pub w_access: f64,
     /// Geometric attenuation of failure pressure per propagation hop.
     pub failure_decay: f64,
+    /// Out-degree at which a node starts **distributing** (rather than
+    /// replicating) failure pressure across its edges. At or below this fan-out,
+    /// propagation is unchanged — so sparse causal chains still reach depth; above
+    /// it, a hub's emission is damped by `failure_fanout / out_degree`, so one
+    /// over-connected node (e.g. a file with dozens of contained symbols) cannot
+    /// flood the graph. See `docs/FIELD_CAMPAIGN_H.md` (root cause #2).
+    #[serde(default = "default_failure_fanout")]
+    pub failure_fanout: f64,
+}
+
+/// Default [`ScoringWeights::failure_fanout`]; also fills the field when an older
+/// snapshot (written before it existed) is deserialised.
+fn default_failure_fanout() -> f64 {
+    6.0
 }
 
 impl Default for ScoringWeights {
@@ -95,6 +109,7 @@ impl Default for ScoringWeights {
             w_recency: 0.30,
             w_access: 0.05,
             failure_decay: 0.8,
+            failure_fanout: default_failure_fanout(),
         }
     }
 }
@@ -102,7 +117,8 @@ impl Default for ScoringWeights {
 impl ScoringWeights {
     /// Read overrides from the environment, falling back to [`Default`] for any
     /// variable that is unset or unparsable. Recognised variables: `CCOS_W_BASE`,
-    /// `CCOS_W_FAILURE`, `CCOS_W_RECENCY`, `CCOS_W_ACCESS`, `CCOS_FAILURE_DECAY`.
+    /// `CCOS_W_FAILURE`, `CCOS_W_RECENCY`, `CCOS_W_ACCESS`, `CCOS_FAILURE_DECAY`,
+    /// `CCOS_FAILURE_FANOUT`.
     pub fn from_env() -> Self {
         let d = Self::default();
         let get = |key: &str, fallback: f64| -> f64 {
@@ -118,6 +134,7 @@ impl ScoringWeights {
             w_recency: get("CCOS_W_RECENCY", d.w_recency),
             w_access: get("CCOS_W_ACCESS", d.w_access),
             failure_decay: get("CCOS_FAILURE_DECAY", d.failure_decay),
+            failure_fanout: get("CCOS_FAILURE_FANOUT", d.failure_fanout),
         }
     }
 }
@@ -363,14 +380,27 @@ impl MemoryGraph {
             .collect();
 
         let decay = self.scoring_weights.failure_decay;
+        // Degree-aware damping: a node *distributes* its pressure across its
+        // out-edges rather than replicating it to each. At or below `failure_fanout`
+        // this is a no-op (`damp == 1`), so sparse causal chains still reach depth;
+        // a hub (a file with dozens of contained symbols) is damped by
+        // `fanout / out_degree`, which stops one over-connected node from flooding
+        // the graph (FIELD_CAMPAIGN_H.md, root cause #2).
+        let fanout = self.scoring_weights.failure_fanout.max(1.0);
+        let damp = (fanout / (targets.len() as f64).max(fanout)).min(1.0);
+        let floor = self.paging_threshold;
         for (target, weight) in targets {
-            let propagation = base_value * weight * decay.powi(depth as i32);
+            let propagation = base_value * weight * decay.powi(depth as i32) * damp;
             if let Some(node) = self.nodes.get_mut(&target) {
                 node.failure_relevance = (node.failure_relevance + propagation).clamp(0.0, 1.0);
                 node.recency = 1.0;
                 node.last_accessed = self.clock;
             }
-            self.propagate_failure(&target, depth + 1, max_depth);
+            // Stop relaying once the pressure added this hop is below the paging
+            // floor: it cannot page anything in, and continuing only floods.
+            if propagation > floor {
+                self.propagate_failure(&target, depth + 1, max_depth);
+            }
         }
     }
 
@@ -412,8 +442,13 @@ impl MemoryGraph {
             .collect();
 
         let decay = self.scoring_weights.failure_decay;
+        // Degree-aware damping (see [`propagate_failure`](Self::propagate_failure)):
+        // a hub distributes pressure across its neighbours instead of replicating it.
+        let fanout = self.scoring_weights.failure_fanout.max(1.0);
+        let damp = (fanout / (neighbours.len() as f64).max(fanout)).min(1.0);
+        let floor = self.paging_threshold;
         for (nb, weight) in neighbours {
-            let propagation = base_value * weight * decay.powi(depth as i32);
+            let propagation = base_value * weight * decay.powi(depth as i32) * damp;
             let mut grew = false;
             if let Some(node) = self.nodes.get_mut(&nb) {
                 let before = node.failure_relevance;
@@ -422,7 +457,9 @@ impl MemoryGraph {
                 node.last_accessed = self.clock;
                 grew = node.failure_relevance > before + 1e-9;
             }
-            if grew {
+            // Continue only into neighbours that actually grew (cycle-safe) and only
+            // while the added pressure can still page something in (anti-flood).
+            if grew && propagation > floor {
                 self.propagate_failure_bidirectional(&nb, depth + 1, max_depth);
             }
         }
@@ -894,6 +931,7 @@ mod tests {
         assert_eq!(w.w_recency, 0.30);
         assert_eq!(w.w_access, 0.05);
         assert_eq!(w.failure_decay, 0.8);
+        assert_eq!(w.failure_fanout, 6.0);
     }
 
     #[test]
@@ -951,6 +989,61 @@ mod tests {
         graph.propagate_failure(&"root".into(), 0, 3);
         let child = graph.nodes.get(&"child".into()).unwrap();
         assert!(child.failure_relevance > 0.0);
+    }
+
+    #[test]
+    fn high_fanout_node_damps_pressure_but_low_fanout_does_not() {
+        // Degree-aware damping (FIELD_CAMPAIGN_H.md #2): a focused node (out-degree
+        // 1) passes pressure undamped; a hub (out-degree ≫ failure_fanout)
+        // distributes it, so each neighbour receives strictly less.
+        let mut g = MemoryGraph::new(0.0, usize::MAX);
+        g.upsert_node("f".into(), "f".into(), "".into(), NodeType::Module);
+        g.upsert_node("t".into(), "t".into(), "".into(), NodeType::Module);
+        g.add_edge("f".into(), "t".into(), 1.0, EdgeType::DependsOn);
+        g.upsert_node("h".into(), "h".into(), "".into(), NodeType::Module);
+        for i in 0..20 {
+            let leaf = format!("l{i}");
+            g.upsert_node(
+                leaf.clone().into(),
+                leaf.clone(),
+                "".into(),
+                NodeType::Module,
+            );
+            g.add_edge("h".into(), leaf.into(), 1.0, EdgeType::Contains);
+        }
+        g.set_failure_relevance(&"f".into(), 1.0);
+        g.propagate_failure(&"f".into(), 0, 1);
+        g.set_failure_relevance(&"h".into(), 1.0);
+        g.propagate_failure(&"h".into(), 0, 1);
+
+        let focused = g.nodes.get(&"t".into()).unwrap().failure_relevance;
+        let from_hub = g.nodes.get(&"l0".into()).unwrap().failure_relevance;
+        assert!(
+            from_hub < focused,
+            "a high-fanout node must spread less pressure per neighbour: hub={from_hub} focused={focused}"
+        );
+        // 20 leaves with fanout 6 ⇒ ~6/20 of the undamped amount.
+        assert!((from_hub - focused * 6.0 / 20.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn degree_damping_preserves_sparse_chain_reach() {
+        // a→b→c→d, every out-degree 1: damping is a no-op, so depth-3 propagation
+        // still reaches the 3-hop cause d — the property that lets us keep a deep
+        // default depth without flooding dense graphs.
+        let mut g = MemoryGraph::new(0.0, usize::MAX);
+        for n in ["a", "b", "c", "d"] {
+            g.upsert_node(n.into(), n.into(), "".into(), NodeType::Module);
+        }
+        g.add_edge("a".into(), "b".into(), 1.0, EdgeType::DependsOn);
+        g.add_edge("b".into(), "c".into(), 1.0, EdgeType::DependsOn);
+        g.add_edge("c".into(), "d".into(), 1.0, EdgeType::DependsOn);
+        g.set_failure_relevance(&"a".into(), 1.0);
+        g.propagate_failure(&"a".into(), 0, 3);
+        assert!(
+            g.nodes.get(&"d".into()).unwrap().failure_relevance > 0.0,
+            "the 3-hop cause must still be pressured on a sparse chain"
+        );
     }
 
     #[test]
