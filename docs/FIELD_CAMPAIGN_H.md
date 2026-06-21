@@ -280,6 +280,44 @@ entrent dans la fenêtre, à quel coût.
 dimensionné à l'ancre. Le test de Thor sur encore un autre dépôt (ripgrep/bat/fd) reste utile,
 mais la généralisation est déjà démontrée ici.
 
+## Suffisance (Q7) — le contexte fait-il *résoudre* ? (Campagne J, Thor)
+
+La couverture/frugalité est **nécessaire** ; la question qui décide la valeur de CCOS est la
+**suffisance** : à budget égal, le contexte CCOS fait-il *résoudre* un bug à un LLM local
+qu'un dump ne peut pas ? Protocole (Thor, `qwen3-coder:30b`, budget 2048) : 3 bugs
+multi-fichiers **contrôlés** — fichier-symptôme **paddé au-delà du budget**, cause = une
+constante dans un **fichier-dep** ; deux contextes à budget égal (région CCOS vs dump naïf
+tronqué) ; appliquer le diff du modèle, `cargo test`. **Vérité terrain = la sortie
+`cargo test`** (pas une heuristique — voir la note grader plus bas).
+
+| Bug (synthétique) | symptôme→cause | cause dans CCOS / baseline | **CCOS** | **baseline** | fichier patché baseline |
+| ----------------- | -------------- | -------------------------- | -------- | ------------ | ----------------------- |
+| JM1 `buffer_size` (*devinable*) | writer→config | oui / non | ✅ 3/3 | ✅ 3/3 *(deviné)* | config.rs (deviné juste) |
+| JM2 `HEADER_SIZE` | renderer→config | oui / non | ✅ 3/3 (corrige config) | ❌ **1/3** | renderer.rs (hack du symptôme) |
+| JM3 `MIN_SCORE` | reader→filter | oui / non | ✅ 3/3 (corrige filter) | ❌ **0/3** | renderer.rs (mauvais fichier inventé) |
+
+**Résultat** : sur les bugs où la *valeur* de la cause n'est pas inférable du symptôme
+(JM2, JM3), **CCOS résout (3/3) là où le dump à budget égal échoue** — il patche la racine
+(le fichier-cause), tandis que la baseline hacke le symptôme (JM2) ou hallucine un fichier
+sans rapport (JM3), parce que le budget a tronqué la cause de son contexte. **C'est la
+première preuve de suffisance** : le contexte CCOS ne fait pas que *couvrir* la cause, il
+fait *résoudre*.
+
+**Bémols honnêtes (pas de survente) :**
+- **n = 2 cas décisifs**, **synthétiques** (bugs construits, pas des commits réels minés),
+  **un seul modèle**. C'est une **démonstration de mécanisme**, pas encore un résultat à
+  l'échelle. → relance : vrais bugs (`bat`/`ripgrep`, fix dans une dep d'un gros fichier) +
+  2–3 modèles.
+- **JM1 ne compte pas** : la cause est devinable depuis l'import + l'assert ; la baseline a
+  deviné le bon fichier. Le gain n'existe que quand la *valeur* est **définie** dans la cause.
+- **CCOS n'est pas *moins cher* ici** : 2276/2351 tok vs 2048. Le gain est la **correction**
+  à budget comparable, pas la frugalité (axe séparé : la couverture).
+- **Grader corrigé** : le premier `result.json` de Thor notait JM3 CCOS `resolved=False`
+  alors que `cargo test` montrait **3 passed** (faux négatif d'une heuristique sur le fichier
+  patché). `scripts/ccos_grade.py` note désormais la **vérité `cargo test`**. Le test
+  « cause » direct (`assert_eq!(cause(), valeur_correcte)`) défait le hack du symptôme : un
+  patch local au symptôme passe 2/3 mais échoue ce test-là — seul un fix racine passe 3/3.
+
 ## Grille de résultats à remplir (vrai code, Thor)
 
 Refais les 5 bugs **mais greffés sur de vrais fichiers volumineux** (insère le mauvais
