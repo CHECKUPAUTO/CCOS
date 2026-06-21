@@ -1427,6 +1427,10 @@ struct FocusOpts {
     budget: usize,
     json: bool,
     input: Option<String>,
+    /// Reuse/persist a workspace checkpoint so only *changed* files are re-parsed
+    /// (O(Δ) freshness for an editor calling `focus` on every run). `--workspace`
+    /// with no path defaults to `workspace.ccos`.
+    workspace: Option<String>,
 }
 
 impl FocusOpts {
@@ -1435,6 +1439,7 @@ impl FocusOpts {
         let mut budget = 2048usize;
         let mut json = false;
         let mut input = None;
+        let mut workspace = None;
         let mut i = 0;
         while i < args.len() {
             match args[i].as_str() {
@@ -1447,6 +1452,17 @@ impl FocusOpts {
                 "--input" => {
                     i += 1;
                     input = args.get(i).cloned();
+                }
+                "--workspace" => {
+                    // Optional path; default when the next token is another flag/absent.
+                    let p = match args.get(i + 1) {
+                        Some(v) if !v.starts_with("--") => {
+                            i += 1;
+                            v.clone()
+                        }
+                        _ => "workspace.ccos".to_string(),
+                    };
+                    workspace = Some(p);
                 }
                 "--json" => json = true,
                 s if !s.starts_with("--") => {
@@ -1463,6 +1479,7 @@ impl FocusOpts {
             budget,
             json,
             input,
+            workspace,
         }
     }
 }
@@ -1552,11 +1569,30 @@ fn run_focus(opts: &FocusOpts) -> i32 {
 
     // Ingest under crate-relative URIs (`src/…`), matching how `cargo` reports paths
     // in the trace — so a fault on `src/writer.rs` anchors regardless of whether the
-    // user passed `src` or an absolute path.
-    let mut session = AgentSession::new();
+    // user passed `src` or an absolute path. With `--workspace`, reuse the persisted
+    // checkpoint and `sync` (re-parse only changed files — O(Δ) for an editor); without
+    // it, a fresh ephemeral session ingesting the whole tree.
+    let mut session = match &opts.workspace {
+        Some(ws) => match AgentSession::open(ws) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("ccos: cannot open workspace '{ws}': {e}");
+                return 1;
+            }
+        },
+        None => AgentSession::new(),
+    };
+    let mut reparsed = 0usize;
     for f in &files {
         if let Ok(src) = std::fs::read_to_string(f) {
-            session.ingest(&crate_relative(f), &src);
+            let uri = crate_relative(f);
+            if opts.workspace.is_some() {
+                if session.sync(&uri, &src) {
+                    reparsed += 1;
+                }
+            } else {
+                session.ingest(&uri, &src);
+            }
         }
     }
 
@@ -1574,6 +1610,13 @@ fn run_focus(opts: &FocusOpts) -> i32 {
     let window = session.page_fault(&output, opts.budget);
     let view = focus_view(&window, &trace);
 
+    // Persist the synced graph + this page-fault so the next `--workspace` run is O(Δ).
+    if opts.workspace.is_some() {
+        if let Err(e) = session.checkpoint() {
+            eprintln!("ccos focus: checkpoint failed: {e}");
+        }
+    }
+
     if opts.json {
         let entries: Vec<_> = view
             .iter()
@@ -1590,6 +1633,7 @@ fn run_focus(opts: &FocusOpts) -> i32 {
             "message": trace.message,
             "symptom_files": trace.files(),
             "workspace_files": files.len(),
+            "reparsed_files": reparsed,
             "tokens": window.tokens,
             "entries": entries,
         });
@@ -1597,7 +1641,14 @@ fn run_focus(opts: &FocusOpts) -> i32 {
         return 0;
     }
 
-    render_focus_human(&trace, &view, files.len(), window.tokens);
+    render_focus_human(
+        &trace,
+        &view,
+        files.len(),
+        window.tokens,
+        opts.workspace.as_deref(),
+        reparsed,
+    );
     0
 }
 
@@ -1607,12 +1658,19 @@ fn render_focus_human(
     view: &[FocusEntry],
     total_files: usize,
     tokens: usize,
+    workspace: Option<&str>,
+    reparsed: usize,
 ) {
+    let delta = match workspace {
+        Some(_) => format!(", {reparsed} re-parsed (Δ)"),
+        None => String::new(),
+    };
     println!(
-        "⚡ CCOS focus — {} files in workspace → {} in view (~{} tokens)\n",
+        "⚡ CCOS focus — {} files in workspace → {} in view (~{} tokens{})\n",
         total_files,
         view.len(),
-        tokens
+        tokens,
+        delta
     );
     if !trace.message.is_empty() {
         println!("  panicked: {}", truncate(trace.message.trim(), 76));
@@ -1993,7 +2051,7 @@ COMMANDS:\n\
     \x20                          --max-nodes K, --bidirectional, --json)\n\
     focus [src]                Pipe `cargo test` output in → show the causal region\n\
     \x20                          (likely root cause + deps), hiding the noise (--budget,\n\
-    \x20                          --input FILE, --json for an editor client)\n\
+    \x20                          --input FILE, --json, --workspace [ws] for O(Δ) reuse)\n\
     chaos [--iters N]          Fuzz the guard with adversarial payloads\n\
 \n\
   Inspection & export:\n\
