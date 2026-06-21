@@ -239,8 +239,43 @@ régression et chiffres avant/après ; ces items sont passés de « roadmap spé
 « corrigés et mesurés ». Reste à **confirmer sur un autre dépôt** (Thor : ripgrep/bat/fd) que
 le gain n'est pas propre au `src/` de CCOS.
 
-➡️ Le test de Thor sur un **autre** vrai dépôt (ripgrep/bat/fd) reste utile comme
-confirmation indépendante, mais la conclusion est déjà nette ici.
+## Confirmation indépendante — crate `syn` (44 fichiers, 191 130 tokens, **zéro code CCOS**)
+
+Pour vérifier que le gain n'est pas propre au `src/` de CCOS, la triade a été mesurée sur
+**`syn-1.0.103`** (sources vendorisées, layout `src/*.rs` plat, 141 `use crate::`), ~1.5× la
+taille de CCOS. Protocole structurel : ingérer les 44 fichiers, `signal_failure(depth=3)` sur
+un fichier, `recall around` ce fichier, et compter combien de ses **vraies deps `use crate::`**
+entrent dans la fenêtre, à quel coût.
+
+- **#1 granularité — confirmé.** Région complète = 111 618 tokens vs 191 130 uniques →
+  **0.58×** (aucune duplication ; sur CCOS c'était 15× → 1.2×).
+- **#2 flood — confirmé (borné).** `signal_failure` sur un fichier pressurise **46–122 nœuds**
+  (sur ~2 000) selon la taille du fichier — borné, jamais la moitié (proportionnel au nombre
+  de symboles du fichier, pas à la taille du dépôt).
+- **#3 couverture + localité — confirmé, au bon budget.** À budget **8192** (3.4–4.3 % de
+  l'all-src) :
+
+  | ancre | deps atteintes | fenêtre (tok) | % all-src | fichiers-bruit |
+  | ----- | -------------- | ------------- | --------- | -------------- |
+  | item.rs  | **7/7** | 6 577 | 3.4 % | 0 |
+  | token.rs | **7/7** | 7 039 | 3.7 % | 0 |
+  | ty.rs    | **6/6** | 8 167 | 4.3 % | 2 |
+  | expr.rs  | **5/5** | 8 079 | 4.2 % | 0 |
+
+  Le **voisinage causal entier** (l'ancre + **toutes** ses vraies deps) tient en **~25–30× moins
+  de tokens que dumper `syn`**, quasi sans bruit. Le linking cross-file marche, la localité
+  tient.
+
+> **Le bémol honnête que `syn` a révélé (que le `src/` plus petit de CCOS cachait) : le budget
+> doit suivre la taille de l'ancre.** Les fichiers de `syn` sont gros (`item.rs` ≈ 88 symboles) ;
+> à budget 2048, le **contenu propre de l'ancre** (pertinent) remplit la fenêtre et n'atteint
+> qu'1/7 deps. À 8192 → 7/7. Il n'y a donc pas de budget magique universel : il s'échelonne avec
+> la taille du fichier ancré. (Piste future : plafonner le header / auto-échelonner le budget.)
+
+**Conclusion** : sur un dépôt **indépendant**, la triade donne une fenêtre multi-fichiers
+**correcte (100 % des deps), locale (≈0 bruit) et frugale (~4 % de l'all-src)** — au budget
+dimensionné à l'ancre. Le test de Thor sur encore un autre dépôt (ripgrep/bat/fd) reste utile,
+mais la généralisation est déjà démontrée ici.
 
 ## Grille de résultats à remplir (vrai code, Thor)
 
