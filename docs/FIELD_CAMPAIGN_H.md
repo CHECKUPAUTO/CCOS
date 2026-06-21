@@ -318,6 +318,34 @@ fait *résoudre*.
   « cause » direct (`assert_eq!(cause(), valeur_correcte)`) défait le hack du symptôme : un
   patch local au symptôme passe 2/3 mais échoue ce test-là — seul un fix racine passe 3/3.
 
+### Round 2 — multi-modèles (3 bugs × 3 modèles, grader = `ccos_grade.py`)
+
+| Bug | qwen3-coder:30B | DeepSeek-V2-Lite (~16B) | qwen2.5-coder:1.5B |
+| --- | --------------- | ----------------------- | ------------------ |
+| JR1 `MIN_SCORE` (filter) | CCOS ✅ 3/3 / base ❌ CE | CCOS ✅ 3/3 / base ❌ 0/3 | CCOS ❌ CE / base ❌ CE |
+| JR2 `backoff` | CCOS ✅ 3/3 / base ❌ CE | CCOS ✅ 3/3 / base ❌ 0/3 | CCOS ❌ CE / base ❌ 1/3 |
+| JR3 `BUFFER_CAPACITY` | *(bug mal conçu — écarté)* | *(idem)* | *(idem)* |
+
+**Le résultat solide** : sur les bugs bien formés (JR1, JR2) × modèles **capables** (30B et
+16B), **CCOS résout 4/4, la baseline 0/4** — et l'asymétrie de patch est totale : la baseline
+patche **toujours** le fichier-symptôme (cause tronquée), CCOS **toujours** le fichier-cause.
+La suffisance **tient sur deux familles de modèles**.
+
+**Nuances honnêtes (corrections aux claims de la 1ʳᵉ synthèse) :**
+- Le gain **n'est pas** « model-independent » : à **1.5B les deux échouent** (le petit modèle
+  n'exploite aucun contexte ; il a même patché `lib.rs`, le mauvais fichier). C'est « robuste
+  sur modèles capables », pas universel. Le gap est **maximal à 16B** (3/3 vs 0/3) puis
+  **s'effondre à 1.5B** — non-monotone, un plancher de capacité existe.
+- **CCOS résout 4/9 cellules** (pas « 9/9 bon fichier » : sur JR3 il patche la bonne cause mais
+  ne résout pas ; à 1.5B il échoue). Le « bon fichier » ≠ « résolu ».
+- **Le format annoté gêne les petits modèles** (`// sym:` lu comme du code → compile error).
+  Piste : un **mode contexte brut** sans annotations pour les modèles faibles.
+- **JR3 mal conçu** : un test assert la valeur *buggée* (`len()==64`), donc corriger la racine
+  casse ce test. Écarté.
+- **Toujours synthétique** : pas encore de vrais commits minés (DeepSeek plantait en HTTP 500).
+  C'est le dernier pas — round 3 ci-dessous.
+
+
 ## Grille de résultats à remplir (vrai code, Thor)
 
 Refais les 5 bugs **mais greffés sur de vrais fichiers volumineux** (insère le mauvais
