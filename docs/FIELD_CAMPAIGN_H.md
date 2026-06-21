@@ -206,28 +206,38 @@ Le protocole H, appliqué non plus à des crates-jouets mais au **propre `src/` 
    creuse `a→b→c→d` (degré 1), `damp=1`, donc la cause à 3 sauts `d.rs` est **toujours**
    atteinte — le degré-conscient préserve la portée profonde là où baisser la profondeur
    l'aurait perdue. (`CCOS_FAILURE_FANOUT` ajustable.)
-3. **Domination du hub.** `memory.rs` (utilisé par presque tout) accumule la pression de
-   tous les côtés ; ses nœuds whole-file **surclassent le symptôme** (`sym:memory.rs`
-   score 0.910 > `file:mcp.rs`). Il faut un **down-weighting par degré inverse (IDF)** pour
-   qu'un hub ne gagne pas *toutes* les régions.
+3. **Domination du hub & bruit de composante. ✅ CORRIGÉ.** Diagnostic initial : `memory.rs`
+   (utilisé par presque tout) surclassait le symptôme. La **partie hub a été réglée par #2**
+   (le symptôme `mcp.rs` est repassé #1). Restait une imprécision **mesurée plus finement** :
+   la région de `mcp.rs` est **31 fichiers sur 32** (le vrai graphe `use crate::` de CCOS est
+   quasi entièrement connexe). Ce **n'était donc pas** un pont `dep:`/std (le clustering les
+   exclut déjà) mais une **composante dense sans terme de proximité** : sans pression d'échec
+   forte, la *récence* fait qu'un nœud lointain (`use:commands_demo`, ~3 sauts) **égalait** les
+   vraies deps (1 saut). Correctif livré : **décroissance par proximité** dans `around`/`task`
+   — score `×= proximity_decay^(distance au point d'ancrage)`, distance par BFS bidirectionnel
+   **qui ne relaie pas à travers les hubs `dep:`**. Résultat : le bruit `commands_demo` (rang 3
+   à 0.444) **sort** ; le top devient symptôme → ses 2 deps réelles → ses propres symboles. Le
+   symptôme + 2/2 deps tiennent toujours en 2045 tokens, et la chaîne creuse garde ses 3 sauts.
+   (`CCOS_PROXIMITY_DECAY` / `CCOS_PROXIMITY_HOPS` ajustables.)
 
 **Le verdict frugalité, sans fard (diagnostic d'origine)** : les 3 fichiers pertinents =
 **20 405 tokens**. CCOS exigeait un budget de **32 768** pour les livrer (taxe de
 duplication) **et seulement** à `depth=1` ; au **défaut `depth=3`, il ne les atteignait sous
 aucun budget testé** — il servait le hub.
 
-> **MISE À JOUR (causes #1 et #2 corrigées).** Avec la granularité symbole **et** la
-> propagation degré-consciente, la même mesure donne : **défaut `depth=3`, budget 2048 →
-> symptôme + 2/2 deps en 2035 tokens** (region complète 15× → 1.2× ; flood 518 → 37). CCOS
-> livre désormais les 3 bons fichiers **et dit lesquels** sous un budget serré, au réglage
-> par défaut. Reste la cause **#3** (le `around` traverse encore les hubs `dep:`/std partagés
-> — un nœud `use:commands_demo` non pertinent entre par cette voie). C'est le dernier levier.
+> **MISE À JOUR (les trois causes corrigées).** Granularité symbole (#1) + propagation
+> degré-consciente (#2) + proximité d'ancrage (#3). La même mesure donne maintenant, au
+> **réglage par défaut, budget 2048** : **symptôme #1, ses 2 deps réelles, ses symboles —
+> en ~2045 tokens, sans bruit de composante.** Bilan avant→après : region complète 15× → 1.2× ;
+> flood 518 → 37 ; couverture deps 0/2 → 2/2 ; le nœud non pertinent `commands_demo` évincé.
+> CCOS livre les bons fichiers **et dit lesquels**, frugalement, par défaut, sur du vrai code.
 
 Ce n'était pas un échec de la machinerie (event-sourcing, time-travel, persistance, audit
 fonctionnent) : c'était l'**assemblage de contexte** — le cœur de la thèse — qui ne
-survivait pas à l'échelle réelle tant que la granularité symbole et la propagation
-degré-consciente n'étaient pas faites. **Deux des trois sont livrées** ; ces items sont
-passés de « roadmap spéculative » à « corrigés, avec les chiffres avant/après ».
+survivait pas à l'échelle réelle. **Les trois leviers sont livrés**, chacun avec test de
+régression et chiffres avant/après ; ces items sont passés de « roadmap spéculative » à
+« corrigés et mesurés ». Reste à **confirmer sur un autre dépôt** (Thor : ripgrep/bat/fd) que
+le gain n'est pas propre au `src/` de CCOS.
 
 ➡️ Le test de Thor sur un **autre** vrai dépôt (ripgrep/bat/fd) reste utile comme
 confirmation indépendante, mais la conclusion est déjà nette ici.

@@ -66,7 +66,7 @@ use crate::region_engine::ContextRegionEngine;
 use crate::util::sha256_hex;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
 /// Errors returned by memory operations.
@@ -429,8 +429,52 @@ impl CcosMemory {
         node.content.clone()
     }
 
-    /// Score, order (by `(score, uri)`), and budget-truncate a set of nodes.
-    fn assemble_window(&self, strategy: &str, ids: Vec<NodeId>, budget: usize) -> RecallWindow {
+    /// Hop distance from `anchor` to each node reachable within `max_hops` over
+    /// edges in **both** directions, **without relaying through `dep:` hubs** (a
+    /// shared `std` import must not make two unrelated files "close"). Plain BFS,
+    /// so each node's distance is the true shortest hop count; unreachable nodes
+    /// (or those only reachable through a hub) are simply absent.
+    fn hop_distances(&self, anchor: &NodeId, max_hops: u32) -> HashMap<NodeId, u32> {
+        let mut dist: HashMap<NodeId, u32> = HashMap::new();
+        let mut queue: VecDeque<NodeId> = VecDeque::new();
+        dist.insert(anchor.clone(), 0);
+        queue.push_back(anchor.clone());
+        while let Some(cur) = queue.pop_front() {
+            let d = dist[&cur];
+            // Stop relaying at the hop bound or at a pure-connector `dep:` hub
+            // (it is reached and recorded, but not expanded onward).
+            if d >= max_hops || cur.0.starts_with("dep:") {
+                continue;
+            }
+            for e in &self.graph.edges {
+                let nb = if e.source == cur {
+                    &e.target
+                } else if e.target == cur {
+                    &e.source
+                } else {
+                    continue;
+                };
+                if !dist.contains_key(nb) {
+                    dist.insert(nb.clone(), d + 1);
+                    queue.push_back(nb.clone());
+                }
+            }
+        }
+        dist
+    }
+
+    /// Score, order (by `(score, uri)`), and budget-truncate a set of nodes. When
+    /// `proximity` is `Some((dist, decay, max_hops))`, each node's score is scaled
+    /// by `decay^hops_from_anchor` so near neighbours outrank distant ones — the
+    /// locality term `around`/`task` need in a densely-connected repo (where the
+    /// causal region is nearly the whole graph; see `FIELD_CAMPAIGN_H.md` #3).
+    fn assemble_window(
+        &self,
+        strategy: &str,
+        ids: Vec<NodeId>,
+        budget: usize,
+        proximity: Option<(&HashMap<NodeId, u32>, f64, u32)>,
+    ) -> RecallWindow {
         let mut seen = BTreeSet::new();
         let mut scored: Vec<RecallItem> = Vec::new();
         for id in ids {
@@ -446,9 +490,14 @@ impl CcosMemory {
                 continue;
             }
             if let Some(node) = self.graph.nodes.get(&id) {
+                let mut score = self.graph.compute_node_score(node);
+                if let Some((dist, decay, max_hops)) = proximity {
+                    let hops = dist.get(&id).copied().unwrap_or(max_hops + 1);
+                    score *= decay.powi(hops as i32);
+                }
                 scored.push(RecallItem {
                     uri: id.0.clone(),
-                    score: self.graph.compute_node_score(node),
+                    score,
                     kind: format!("{:?}", node.node_type),
                     content: self.content_for(&id.0, node),
                 });
@@ -483,6 +532,27 @@ impl CcosMemory {
             tokens,
         }
     }
+}
+
+/// Per-hop attenuation of a node's recall score by its graph distance from the
+/// anchor (`around`/`task`). Default 0.85; override with `CCOS_PROXIMITY_DECAY`
+/// (clamped to `(0, 1]`).
+fn proximity_decay() -> f64 {
+    std::env::var("CCOS_PROXIMITY_DECAY")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|x| x.is_finite() && *x > 0.0 && *x <= 1.0)
+        .unwrap_or(0.85)
+}
+
+/// Hop radius for anchor-proximity weighting. Default 6; override with
+/// `CCOS_PROXIMITY_HOPS` (at least 1).
+fn proximity_hops() -> u32 {
+    std::env::var("CCOS_PROXIMITY_HOPS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|x| *x >= 1)
+        .unwrap_or(6)
 }
 
 /// Prefix a bare path with `file:`; leave known node-id prefixes untouched.
@@ -568,19 +638,27 @@ impl ExternalMemory for CcosMemory {
                     .into_iter()
                     .map(|(id, _)| id)
                     .collect();
-                self.assemble_window("working-set", ids, budget_tokens)
+                self.assemble_window("working-set", ids, budget_tokens, None)
             }
             Recall::Around(uri) => {
+                let anchor = NodeId(normalize(uri));
                 let ids = self.region_member_ids(uri);
-                self.assemble_window("region", ids, budget_tokens)
+                let hops = proximity_hops();
+                let dist = self.hop_distances(&anchor, hops);
+                let prox = (&dist, proximity_decay(), hops);
+                self.assemble_window("region", ids, budget_tokens, Some(prox))
             }
-            Recall::Task(text) => {
-                let ids = self
-                    .lexical_entry(text)
-                    .map(|e| self.region_member_ids(&e))
-                    .unwrap_or_default();
-                self.assemble_window("task-region", ids, budget_tokens)
-            }
+            Recall::Task(text) => match self.lexical_entry(text) {
+                Some(entry) => {
+                    let anchor = NodeId(normalize(&entry));
+                    let ids = self.region_member_ids(&entry);
+                    let hops = proximity_hops();
+                    let dist = self.hop_distances(&anchor, hops);
+                    let prox = (&dist, proximity_decay(), hops);
+                    self.assemble_window("task-region", ids, budget_tokens, Some(prox))
+                }
+                None => self.assemble_window("task-region", Vec::new(), budget_tokens, None),
+            },
         }
     }
 
@@ -686,6 +764,30 @@ mod tests {
         assert!(
             !files.contains(&"file:src/unrelated.rs"),
             "recall excludes unrelated code: {files:?}"
+        );
+    }
+
+    #[test]
+    fn around_proximity_ranks_near_neighbours_above_distant_ones() {
+        // FIELD_CAMPAIGN_H.md #3: in a connected region, a 1-hop dependency must
+        // outrank one three hops away (recency alone would tie them). Chain
+        // a→b→c→d via real imports; recall around a with a budget large enough to
+        // hold the whole region, then check the order.
+        let mut mem = CcosMemory::new();
+        mem.ingest_source("src/a.rs", "use crate::b;\npub fn a() -> i64 { b::b() }\n");
+        mem.ingest_source("src/b.rs", "use crate::c;\npub fn b() -> i64 { c::c() }\n");
+        mem.ingest_source("src/c.rs", "use crate::d;\npub fn c() -> i64 { d::d() }\n");
+        mem.ingest_source("src/d.rs", "pub fn d() -> i64 { 0 }\n");
+        let win = mem.recall(&Recall::around("file:src/a.rs"), 100_000);
+        let pos = |u: &str| {
+            win.items
+                .iter()
+                .position(|i| i.uri == u)
+                .unwrap_or_else(|| panic!("{u} should be in the window"))
+        };
+        assert!(
+            pos("file:src/b.rs") < pos("file:src/d.rs"),
+            "1-hop neighbour b.rs must rank above 3-hop d.rs"
         );
     }
 
