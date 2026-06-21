@@ -9,12 +9,14 @@ mod commands_runtime;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use ccos::adversarial::{AdversarialEngine, AdversarialMode};
+use ccos::agent_session::AgentSession;
 use ccos::context_policy::ContextPolicy;
+use ccos::context_region::file_of;
 use ccos::distributed_event_log::DistributedEventLog;
 use ccos::eval::{run_eval, EvalConfig};
 use ccos::event_log::{EventLog, EventPayload, EventReplayer, EventType, GraphReconstructor};
 use ccos::experiment::{run_experiment, ExperimentConfig};
-use ccos::external_memory::{CcosMemory, ExternalMemory, Recall};
+use ccos::external_memory::{CcosMemory, ExternalMemory, Recall, RecallWindow};
 use ccos::guard::{GuardConfig, GuardLayer};
 use ccos::incremental::IncrementalGraphEngine;
 use ccos::memory::{MemoryGraph, NodeId, ScoringWeights};
@@ -23,6 +25,7 @@ use ccos::query;
 use ccos::region_engine::{ContextRegionEngine, RegionQuery};
 use ccos::region_metrics;
 use ccos::trace::parse_cargo_test_output;
+use ccos::trace::ExecutionTrace;
 use ccos::util::sha256_hex;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -54,6 +57,7 @@ async fn main() {
             rest.get(1).map(String::as_str),
         ),
         "failure" => run_failure(&FailureOpts::parse(rest)),
+        "focus" => run_focus(&FocusOpts::parse(rest)),
         "chaos" => run_chaos(&ChaosOpts::parse(rest)),
         "top" => run_top(&TopOpts::parse(rest)),
         "blame" => run_blame(&BlameOpts::parse(rest)),
@@ -1417,6 +1421,229 @@ fn run_trace_cmd() -> i32 {
     0
 }
 
+/// Options for `ccos focus` — the human "attentional shield".
+struct FocusOpts {
+    path: String,
+    budget: usize,
+    json: bool,
+    input: Option<String>,
+}
+
+impl FocusOpts {
+    fn parse(args: &[String]) -> Self {
+        let mut path = None;
+        let mut budget = 2048usize;
+        let mut json = false;
+        let mut input = None;
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--budget" => {
+                    i += 1;
+                    if let Some(n) = args.get(i).and_then(|v| v.parse().ok()) {
+                        budget = n;
+                    }
+                }
+                "--input" => {
+                    i += 1;
+                    input = args.get(i).cloned();
+                }
+                "--json" => json = true,
+                s if !s.starts_with("--") => {
+                    if path.is_none() {
+                        path = Some(s.to_string());
+                    }
+                }
+                other => eprintln!("ccos: ignoring unknown flag '{other}'"),
+            }
+            i += 1;
+        }
+        Self {
+            path: path.unwrap_or_else(|| "src".to_string()),
+            budget,
+            json,
+            input,
+        }
+    }
+}
+
+/// A file's role in the focused view, relative to the failing trace.
+#[derive(Debug, PartialEq, Eq)]
+enum FocusRole {
+    /// A file the trace itself names — where the failure *manifests*.
+    Symptom,
+    /// The top file pulled in *causally* (not in the trace) — the likely root.
+    Cause,
+    /// Another file in the causal region.
+    Context,
+}
+
+/// One file in the focused view: the highest-scored window node from that file.
+struct FocusEntry {
+    file: String,
+    content: String,
+    score: f64,
+    role: FocusRole,
+}
+
+/// Reduce a recall window to one entry per file (highest score first), tagging the
+/// trace's own files as the *symptom* and the top causally-pulled file as the likely
+/// *cause* — the "skip to the root" signal a raw backtrace buries. Pure + testable.
+fn focus_view(window: &RecallWindow, trace: &ExecutionTrace) -> Vec<FocusEntry> {
+    let symptom_files: std::collections::BTreeSet<String> = trace.files().into_iter().collect();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out: Vec<FocusEntry> = Vec::new();
+    let mut cause_assigned = false;
+    for it in &window.items {
+        let file = file_of(&it.uri).to_string();
+        if file.is_empty() || !seen.insert(file.clone()) {
+            continue;
+        }
+        let role = if symptom_files.contains(&file) {
+            FocusRole::Symptom
+        } else if !cause_assigned {
+            cause_assigned = true;
+            FocusRole::Cause
+        } else {
+            FocusRole::Context
+        };
+        out.push(FocusEntry {
+            file,
+            content: it.content.clone(),
+            score: it.score,
+            role,
+        });
+    }
+    out
+}
+
+/// Crate-relative path in the form `cargo` reports (`src/…`): the tail from the last
+/// `src/` segment, so an absolute ingest path still matches a crate-relative trace path.
+fn crate_relative(p: &Path) -> String {
+    let s = p.to_string_lossy().replace('\\', "/");
+    match s.rfind("src/") {
+        Some(i) => s[i..].to_string(),
+        None => s,
+    }
+}
+
+/// `ccos focus [src] [--budget N] [--input FILE] [--json]` — the attentional shield.
+/// Pipe `cargo test` / panic output in; CCOS ingests the tree, page-faults on the
+/// trace, and shows the **causal region** (the likely root cause + its direct
+/// dependencies), hiding the backtrace noise and the unrelated files. The host can
+/// be a human (terminal) or an editor (`--json`).
+fn run_focus(opts: &FocusOpts) -> i32 {
+    let root = Path::new(&opts.path);
+    if !root.exists() {
+        eprintln!("ccos: path '{}' does not exist", opts.path);
+        return 1;
+    }
+    let mut files: Vec<PathBuf> = Vec::new();
+    if root.is_dir() {
+        collect_rs_files(root, &mut files);
+    } else if root.extension().and_then(|e| e.to_str()) == Some("rs") {
+        files.push(root.to_path_buf());
+    }
+    files.sort();
+    if files.is_empty() {
+        eprintln!("ccos: no .rs files under '{}'", opts.path);
+        return 1;
+    }
+
+    // Ingest under crate-relative URIs (`src/…`), matching how `cargo` reports paths
+    // in the trace — so a fault on `src/writer.rs` anchors regardless of whether the
+    // user passed `src` or an absolute path.
+    let mut session = AgentSession::new();
+    for f in &files {
+        if let Ok(src) = std::fs::read_to_string(f) {
+            session.ingest(&crate_relative(f), &src);
+        }
+    }
+
+    let output = match &opts.input {
+        Some(p) => std::fs::read_to_string(p).unwrap_or_default(),
+        None => {
+            use std::io::Read;
+            let mut s = String::new();
+            let _ = std::io::stdin().read_to_string(&mut s);
+            s
+        }
+    };
+
+    let trace = parse_cargo_test_output(&output);
+    let window = session.page_fault(&output, opts.budget);
+    let view = focus_view(&window, &trace);
+
+    if opts.json {
+        let entries: Vec<_> = view
+            .iter()
+            .map(|e| {
+                serde_json::json!({
+                    "file": e.file,
+                    "role": format!("{:?}", e.role).to_lowercase(),
+                    "score": e.score,
+                    "content": e.content,
+                })
+            })
+            .collect();
+        let report = serde_json::json!({
+            "message": trace.message,
+            "symptom_files": trace.files(),
+            "workspace_files": files.len(),
+            "tokens": window.tokens,
+            "entries": entries,
+        });
+        println!("{}", serde_json::to_string_pretty(&report).unwrap());
+        return 0;
+    }
+
+    render_focus_human(&trace, &view, files.len(), window.tokens);
+    0
+}
+
+/// Render the focused view for a human terminal — the cause first, noise hidden.
+fn render_focus_human(
+    trace: &ExecutionTrace,
+    view: &[FocusEntry],
+    total_files: usize,
+    tokens: usize,
+) {
+    println!(
+        "⚡ CCOS focus — {} files in workspace → {} in view (~{} tokens)\n",
+        total_files,
+        view.len(),
+        tokens
+    );
+    if !trace.message.is_empty() {
+        println!("  panicked: {}", truncate(trace.message.trim(), 76));
+    }
+    if let Some(h) = trace.hits.first() {
+        println!("  symptom:  {}:{}", h.file, h.line);
+    }
+    println!();
+
+    for e in view {
+        let tag = match e.role {
+            FocusRole::Cause => "◀ likely cause (pulled in causally)",
+            FocusRole::Symptom => "· symptom site",
+            FocusRole::Context => "· related",
+        };
+        println!("  ▸ {}   {tag}   [{:.2}]", e.file, e.score);
+        for line in e.content.lines().take(6) {
+            println!("      {line}");
+        }
+        if e.content.lines().count() > 6 {
+            println!("      …");
+        }
+        println!();
+    }
+
+    let hidden = total_files.saturating_sub(view.len());
+    if hidden > 0 {
+        println!("  hidden: {hidden} unrelated file(s) + the rest of the backtrace");
+    }
+}
+
 /// `ccos memory [--path FILE]` — drive the [`CcosMemory`] external-memory façade
 /// over **stdin JSON Lines**: one request object per line, one JSON response per
 /// line. Loads `FILE` (default `workspace.ccos`), applies each request, and
@@ -1764,6 +1991,9 @@ COMMANDS:\n\
     diff <a.json> <b.json>     Structural diff between two snapshots (+ score drift)\n\
     failure <snap> <node-id>   Inject a fault at a node and propagate it (--depth N,\n\
     \x20                          --max-nodes K, --bidirectional, --json)\n\
+    focus [src]                Pipe `cargo test` output in → show the causal region\n\
+    \x20                          (likely root cause + deps), hiding the noise (--budget,\n\
+    \x20                          --input FILE, --json for an editor client)\n\
     chaos [--iters N]          Fuzz the guard with adversarial payloads\n\
 \n\
   Inspection & export:\n\
@@ -1806,4 +2036,55 @@ EXAMPLES:\n\
     ccos benchmark --cycles 100000\n",
         env!("CARGO_PKG_VERSION")
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ccos::external_memory::RecallItem;
+    use ccos::trace::TraceHit;
+
+    #[test]
+    fn focus_view_tags_symptom_and_likely_cause() {
+        // The trace blames writer.rs (the symptom). The window (around writer.rs) holds
+        // writer.rs and config.rs; config.rs is not in the trace → the causally-pulled
+        // likely cause. One entry per file, symptom first, cause next.
+        let trace = ExecutionTrace {
+            message: "index out of bounds".to_string(),
+            hits: vec![TraceHit {
+                file: "src/writer.rs".to_string(),
+                line: 3,
+                frame_depth: 0,
+            }],
+        };
+        let item = |uri: &str, score: f64, content: &str| RecallItem {
+            uri: uri.to_string(),
+            score,
+            kind: "Module".to_string(),
+            content: content.to_string(),
+        };
+        let window = RecallWindow {
+            strategy: "region".to_string(),
+            items: vec![
+                item("file:src/writer.rs", 0.90, "pub fn render() {}"),
+                item(
+                    "sym:src/config.rs:buffer_size",
+                    0.60,
+                    "pub fn buffer_size() -> usize { 0 }",
+                ),
+                item("file:src/config.rs", 0.55, "// header"),
+            ],
+            tokens: 30,
+        };
+        let view = focus_view(&window, &trace);
+        assert_eq!(view.len(), 2, "one entry per distinct file");
+        assert_eq!(view[0].file, "src/writer.rs");
+        assert_eq!(view[0].role, FocusRole::Symptom);
+        assert_eq!(view[1].file, "src/config.rs");
+        assert_eq!(
+            view[1].role,
+            FocusRole::Cause,
+            "the top file not named by the trace is the likely cause"
+        );
+    }
 }
