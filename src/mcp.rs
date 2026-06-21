@@ -205,7 +205,19 @@ fn call_tool(session: &mut AgentSession, params: &Value) -> Result<Value, (i64, 
 
 /// Linearise a recalled window into a single text blob a host can drop straight
 /// into a system prompt (the auto-calibrated context chain).
-fn linearize_window(win: &RecallWindow) -> String {
+fn linearize_window(win: &RecallWindow, plain: bool) -> String {
+    // Plain mode emits ordinary multi-file source (`// path` + code), dropping the
+    // `[kind score]` annotations. A weak model (≤~3B) misreads a `// sym:…` header as code
+    // and miscompiles (Campaign J2 finding); annotations help a strong model rank, so they
+    // stay on by default. The caller decides via `CCOS_CONTEXT_PLAIN`.
+    if plain {
+        let mut out = String::new();
+        for it in &win.items {
+            let path = it.uri.split(':').nth(1).unwrap_or(&it.uri);
+            out.push_str(&format!("// {path}\n{}\n\n", it.content));
+        }
+        return out;
+    }
     let mut out = format!(
         "// CCOS context — {} ({} items, ~{} tokens)\n",
         win.strategy,
@@ -240,7 +252,10 @@ fn read_resource(session: &AgentSession, params: &Value) -> Result<Value, (i64, 
                 Some(anchor) => mem.recall(&Recall::around(anchor), budget),
                 None => mem.recall(&Recall::working_set(), budget),
             };
-            linearize_window(&window)
+            let plain = std::env::var("CCOS_CONTEXT_PLAIN")
+                .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
+                .unwrap_or(false);
+            linearize_window(&window, plain)
         }
         "ccos://session/timeline" => session.timeline().join("\n"),
         other => return Err((-32602, format!("unknown resource: {other}"))),
@@ -604,5 +619,31 @@ mod tests {
         assert!(!mutating("recall_what_if"));
         // Non-tools/call messages never checkpoint.
         assert!(!is_mutating_call(&json!({ "method": "resources/read" })));
+    }
+
+    #[test]
+    fn linearize_plain_drops_annotations() {
+        let win = crate::external_memory::RecallWindow {
+            strategy: "region".to_string(),
+            items: vec![crate::external_memory::RecallItem {
+                uri: "sym:src/config.rs:HEADER_SIZE".to_string(),
+                score: 0.87,
+                kind: "Symbol".to_string(),
+                content: "pub const HEADER_SIZE: usize = 24;".to_string(),
+            }],
+            tokens: 10,
+        };
+        let annotated = linearize_window(&win, false);
+        assert!(annotated.contains("[Symbol]") && annotated.contains("score="));
+        let plain = linearize_window(&win, true);
+        assert!(
+            plain.contains("// src/config.rs"),
+            "plain uses the file path: {plain}"
+        );
+        assert!(
+            !plain.contains("sym:") && !plain.contains("score="),
+            "plain drops the annotations a weak model misreads: {plain}"
+        );
+        assert!(plain.contains("pub const HEADER_SIZE"));
     }
 }

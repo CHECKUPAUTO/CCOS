@@ -44,7 +44,7 @@ def load_flat_src(crate_src):
     return files
 
 
-def ccos_context(ccos, files, failing_uri, budget, cargo_output):
+def ccos_context(ccos, files, failing_uri, budget, cargo_output, plain=False):
     """Ingest, pressure the failing file, recall around it; linearise the window."""
     ws = tempfile.mkdtemp(prefix="ccos_J_")
     reqs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}]
@@ -79,6 +79,15 @@ def ccos_context(ccos, files, failing_uri, budget, cargo_output):
             continue
         if m.get("id") == rec:
             win = json.loads(m["result"]["content"][0]["text"])
+    if plain:
+        # Plain mode: emit the window as ordinary multi-file source (`// path` + code),
+        # no `[kind score]` annotations — a weak model (≤~3B) reads `// sym:` headers as
+        # code and miscompiles (Campaign J2 finding). Group nothing; one marker per item.
+        out = []
+        for it in win["items"]:
+            path = it["uri"].split(":", 2)[1] if ":" in it["uri"] else it["uri"]
+            out.append("// %s\n%s" % (path, it["content"]))
+        return "\n\n".join(out), win["tokens"]
     out = ["// CCOS causal context around %s (~%d tokens, %d items)"
            % (failing_uri, win["tokens"], len(win["items"]))]
     for it in win["items"]:
@@ -105,6 +114,9 @@ def main():
     ap.add_argument("--cargo-output", default="", help="path to captured red `cargo test` output")
     ap.add_argument("--ccos", default="./target/release/ccos")
     ap.add_argument("--outdir", default="corpus_J/bug")
+    ap.add_argument("--plain", action="store_true",
+                    help="emit the CCOS context as plain `// path` + code (no [kind score] "
+                         "annotations) — for weak models that misread the annotations")
     args = ap.parse_args()
 
     if not os.path.exists(args.ccos):
@@ -118,7 +130,7 @@ def main():
         with open(args.cargo_output, encoding="utf-8", errors="replace") as f:
             cargo = f.read()
 
-    ccos_txt, ccos_tok = ccos_context(args.ccos, files, failing_uri, args.budget, cargo)
+    ccos_txt, ccos_tok = ccos_context(args.ccos, files, failing_uri, args.budget, cargo, args.plain)
     base_txt, base_tok = baseline_context(args.crate_src, files, failing_uri, args.budget)
 
     os.makedirs(args.outdir, exist_ok=True)
