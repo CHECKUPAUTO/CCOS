@@ -345,6 +345,48 @@ La suffisance **tient sur deux familles de modèles**.
 - **Toujours synthétique** : pas encore de vrais commits minés (DeepSeek plantait en HTTP 500).
   C'est le dernier pas — round 3 ci-dessous.
 
+### Round 3 — vers de vrais bugs, et la trouvaille qui borne la thèse
+
+Objectif : miner de **vrais** commits de correction (`bat`/`ripgrep`/`fd`) où la cause est dans
+un fichier différent du symptôme. Un seul modèle (`qwen3-coder:30B`). Vérité = `ccos_grade.py`.
+
+| Bug (motif réel) | CCOS | baseline | détail |
+| ---------------- | ---- | -------- | ------ |
+| R01 `bat` config-default | ✅ **3/3** (patche `config.rs`) | ❌ CE (`printer.rs`) | cause tronquée côté baseline — **vrai gain** |
+| R02 `ripgrep` line-buffer | ❌ **CE** | ❌ 1/3 | le modèle a *droppé une ligne `use`* → CE |
+| R03 `fd` walk-depth | ❌ **CE** (patche `walk.rs`, **pas** la cause `config.rs`) | ❌ CE | CCOS **avait** la cause, le modèle a réécrit le **symptôme** et cassé la compilation |
+
+**Vérité terrain : 1 gain net sur 3** (R01). (La 1ʳᵉ synthèse de Thor annonçait R03 « 3/3 / config.rs » ;
+son propre JSON dit `resolved:false, compile_error:true, patched:walk.rs` — **2ᵉ divergence
+récit↔artefact**, corrigée ici.) **R03 est l'enseignement** : *même avec la cause dans le
+contexte*, un modèle peut patcher le symptôme et casser le build. **Le bon contexte est
+nécessaire, pas suffisant — il faut que le modèle l'exploite.**
+
+**La trouvaille qui borne la thèse** : Thor a scanné **5709 commits** (bat+ripgrep+fd) → les
+vrais bugs **multi-fichiers sont rares (~1–2 % des fixes)**. La plupart des correctifs touchent
+le fichier du symptôme ; les tests sont ajoutés *avec* le fix, pas avant. Le « cas parfait »
+(cause dans un fichier, test pré-existant qui échoue ailleurs, symptôme tronquable) **est
+rare dans le débogage réel archivé** — R01/R02/R03 sont donc *synthétiques sur motifs réels*,
+faute d'avoir pu en miner un vrai.
+
+### Mot de la fin — Campaign J, sans fard
+
+- **Couverture / asymétrie : acquise (100 %).** La baseline n'a jamais la cause tronquée ; CCOS
+  l'a toujours. Frugalité prouvée sur CCOS, `syn`, `bat`.
+- **Résolution : réelle mais conditionnelle.** Gains nets : JM2, JM3, JR1×{30B,16B}, JR2×{30B,16B},
+  R01. Échecs *malgré* le contexte : R03 (mauvais fichier), R02 (import droppé), tous les 1.5B.
+  → il faut un **modèle capable qui exploite** le contexte.
+- **Applicabilité : étroite.** ~1–2 % des fixes réels ont cette structure.
+
+**Conclusion honnête** : CCOS fournit de façon fiable et frugale le voisinage causal (le cœur
+technique tient), et ce contexte *peut* faire résoudre ce qu'un dump à budget égal ne peut pas —
+mais sur une **minorité** de bugs et **seulement si** le modèle s'en sert bien. Ce n'est pas un
+triomphe ; c'est un outil à **valeur réelle sur un créneau précis**, mesuré honnêtement. La
+suite utile n'est pas « plus de bugs synthétiques » mais soit (a) un **mode contexte brut** pour
+les modèles faibles, soit (b) mesurer la valeur de CCOS sur l'**assemblage de contexte en tâche
+générale** (où les dépendances sont omniprésentes), pas seulement sur le bug-fix-avec-test —
+créneau qui, lui, s'est avéré rare.
+
 
 ## Grille de résultats à remplir (vrai code, Thor)
 
