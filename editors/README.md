@@ -46,21 +46,24 @@ opens it, `q`/`<Esc>` closes. Config: `ccos`, `src`, `workspace`, `budget`, `tes
 ## VS Code (`editors/vscode/`)
 
 ```sh
-cd editors/vscode && npm install && npm run compile
+cd editors/vscode && npm install && npm run compile && npm test
 ```
 Press **F5** to launch an Extension Development Host, then run **“CCOS: Focus on failure”** from
 the command palette. It runs the test command and opens a side panel, *CCOS Attentional Shield*;
 clicking the **likely cause** opens that file. Settings under `ccos.*` (binary, src, workspace,
 budget, testCommand).
 
+The `--workspace` checkpoint lands in `.ccos/` at the crate root — add `.ccos/` to your
+project's `.gitignore`.
+
 ## Status — honest
 
 - **Backend** (`ccos focus`, `--json`, `--workspace`): verified end-to-end on a multi-file bug
   (the cross-file cause is surfaced and tagged), unit-tested, in the main CI gate.
-- **VS Code render logic** (`src/render.ts`, the cause-first ordering + HTML/CSP/escaping): the
-  pure part is **node-tested against real `ccos focus --json` output** (compile `render.ts`, feed
-  a live payload — see the commit). The editor glue (`extension.ts`) uses the standard VS Code
-  API and needs `npm install` + the editor to run; it is **not** executed in CI.
+- **VS Code extension**: `extension.ts` **type-checks clean against the real `@types/vscode` API**
+  (`npm run compile`, tsc strict, exit 0), and the pure render logic (`src/render.ts`) **passes
+  its tests** (`npm test` — verified against real `ccos focus --json` output). The glue still
+  needs the editor (F5) to exercise the actual UI; only the compile + render tests run headless.
 - **Neovim plugin**: written against the same verified contract; **not** checked by a Lua
   interpreter here. Treat both clients as MVPs to F5/`:CcosFocus`, not shipped extensions.
 

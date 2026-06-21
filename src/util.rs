@@ -21,6 +21,15 @@ pub fn sha256_hex(input: &str) -> String {
 /// cache, so a power loss or daemon crash can corrupt or truncate the file. The
 /// extra cost is one `fsync`, negligible at an agent's inference cadence.
 pub fn write_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    // Ensure the target directory exists — a workspace path like `.ccos/ws.ccos`
+    // (an editor's default) must not fail to persist just because `.ccos/` was
+    // never created. Without this the checkpoint silently fails and every run is
+    // cold, defeating the whole `--workspace` O(Δ) freshness.
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
     let mut tmp = path.as_os_str().to_os_string();
     tmp.push(".tmp");
     let tmp = std::path::PathBuf::from(tmp);
@@ -74,5 +83,17 @@ mod tests {
             "temp sibling is renamed away, not left behind"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_durable_creates_a_missing_parent_dir() {
+        // An editor's default workspace path (`.ccos/ws.ccos`) must persist even
+        // when its directory does not exist yet.
+        let dir = std::env::temp_dir().join(format!("ccos-mkdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("nested").join("ws.ccos");
+        write_durable(&path, b"ok").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"ok");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
