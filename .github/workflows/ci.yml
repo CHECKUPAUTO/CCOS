@@ -62,7 +62,9 @@ jobs:
       - name: Docs
         env:
           RUSTDOCFLAGS: "-D warnings"
-        run: cargo doc --no-deps --locked
+        # `--all-features` so the feature-gated modules (llm/eval/workspace) and
+        # the intra-doc links that reference them resolve.
+        run: cargo doc --no-deps --all-features --locked
 
       - name: Smoke-test the CLI
         run: |
