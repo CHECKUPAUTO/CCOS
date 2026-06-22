@@ -264,6 +264,18 @@ impl AgentSession {
         self.live.ingest_source(uri, source)
     }
 
+    /// Bring `uri` up to date against a persisted workspace **without** logging a
+    /// redundant op when it is unchanged — for read-side tools (`ccos focus`) that
+    /// re-scan a tree each run. Records (and applies) an `Ingest` op only when the
+    /// content actually changed; returns whether it re-ingested.
+    pub fn sync(&mut self, uri: &str, source: &str) -> bool {
+        if self.live.file_unchanged(uri, source) {
+            return false;
+        }
+        self.ingest(uri, source);
+        true
+    }
+
     /// Record and apply a failure signal.
     pub fn signal_failure(&mut self, node: &str, depth: u32) -> Result<usize, MemoryError> {
         self.ops.push(Op::Failure {
@@ -682,6 +694,20 @@ mod tests {
     fn cleanup(path: &std::path::Path) {
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(super::oplog_sidecar(path));
+    }
+
+    #[test]
+    fn sync_reingests_only_changed_files() {
+        let mut s = AgentSession::new();
+        // First sight of a file → re-ingest (records an op).
+        assert!(s.sync("src/a.rs", "pub fn a() {}\n"));
+        let after_first = s.len();
+        // Same content again → no-op, no new op recorded.
+        assert!(!s.sync("src/a.rs", "pub fn a() {}\n"));
+        assert_eq!(s.len(), after_first, "unchanged file logs no op");
+        // Changed content → re-ingest.
+        assert!(s.sync("src/a.rs", "pub fn a() -> i32 { 1 }\n"));
+        assert_eq!(s.len(), after_first + 1);
     }
 
     #[test]

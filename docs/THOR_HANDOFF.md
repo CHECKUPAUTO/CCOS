@@ -100,3 +100,62 @@ bugs the dump can't, that is the sufficiency evidence the paper needs.
 Then `tar czf corpus_handoff.tar.gz corpus_I corpus_J` and send it — we analyse together.
 Note your model id and the Jetson power mode (`scripts/jetson_repro_env.sh`) so the numbers
 are reproducible.
+
+## Campaign J round 2 — what the first run showed, and how to scale it
+
+Round 1 (qwen3-coder:30b) gave the first **sufficiency** evidence: on multi-file bugs where
+the cause *value* lives in a budget-truncated file, **CCOS resolved 3/3 where the equal-budget
+dump failed** (JM2 1/3, JM3 0/3) — CCOS patched the cause file, the baseline hacked the
+symptom or invented a wrong file. Single-file / guessable bugs were parity (expected). See the
+"Suffisance (Q7)" table in `docs/FIELD_CAMPAIGN_H.md`. Two things to fix and scale:
+
+### Use the ground-truth grader (don't infer resolution from the patched file)
+
+Round 1 mis-scored a *passing* CCOS fix as unresolved. Grade from `cargo test`:
+
+```sh
+# after applying the model's diff to the crate (a git repo):
+python3 scripts/ccos_grade.py <crate_dir> --bug JM3 --context ccos --tokens <n> \
+    --out corpus_J/JM3/ccos_result.json
+# resolved iff cargo test ran >=1 test and none failed; records patched files via git diff
+```
+
+### Verified controlled recipe (decisive, and a symptom-hack can't pass it)
+
+A crate where the symptom file is padded past the budget and the cause is a constant in a dep,
+**plus a test that asserts the cause directly** so a local hack on the symptom fails it. Note
+the `i32` pad return — `u8` overflows past 255 and won't compile.
+
+```sh
+cargo new --lib jm && cd jm
+printf 'pub const MIN_SCORE: f64 = 0.0;   // ROOT CAUSE: should be 0.5\npub fn is_relevant(s: f64) -> bool { s >= MIN_SCORE }\n' > src/filter.rs
+printf 'use crate::filter;\npub fn keep(scores: &[f64]) -> usize { scores.iter().filter(|s| filter::is_relevant(**s)).count() }\n' > src/reader.rs
+python3 -c "open('src/reader.rs','a').write(''.join('pub fn pad%d() -> i32 { let _x = %d; _x }\n'%(i,i) for i in range(400)))"
+cat > src/lib.rs <<'RS'
+pub mod filter; pub mod reader;
+#[cfg(test)] mod tests {
+    use crate::{filter, reader};
+    #[test] fn keeps()    { assert_eq!(reader::keep(&[0.2, 0.6, 0.9]), 2); }   // fails if MIN_SCORE=0.0
+    #[test] fn boundary() { assert!(!filter::is_relevant(0.49)); }             // fails if MIN_SCORE=0.0
+    #[test] fn cause()    { assert_eq!(filter::MIN_SCORE, 0.5); }              // only a ROOT fix passes this
+}
+RS
+git add -A && git commit -qm bug
+cargo test > red.txt 2>&1                                   # RED
+python3 ~/CCOS/scripts/ccos_resolution_context.py src reader.rs --budget 2048 \
+    --cargo-output red.txt --ccos ~/CCOS/target/release/ccos --outdir corpus_J/JR1
+# feed each context to each model -> apply -> ccos_grade.py
+```
+
+### Scale it (this is what turns a demo into a result)
+
+- **Real bugs, not just synthetic.** Mine 5–8 real `bat`/`ripgrep`/`fd` fix-commits where the
+  fix file ≠ the failing-test file and the symptom file is large. Same two-context protocol.
+- **2–3 models** (e.g. qwen3-coder:30b, deepseek-coder, a smaller one) — does the CCOS win
+  hold as the model shrinks? (Hypothesis: the win *grows* on weaker models, which can't
+  guess the missing cause.)
+- Fill, per (bug × model × context): `resolved, tests_passed/failed, patched_file, tokens`.
+
+The decisive line stays: **does CCOS resolve multi-file bugs the equal-budget dump can't?**
+Round 1 says yes on controlled bugs; round 2 says whether it holds on real ones and across
+models.

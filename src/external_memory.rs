@@ -370,6 +370,14 @@ impl CcosMemory {
             .map(|(id, _)| id.0.clone())
     }
 
+    /// Whether `uri`'s already-ingested source equals `source` (so re-ingesting it
+    /// would be a no-op). Lets a read-side tool re-scan a tree against a persisted
+    /// workspace and re-parse only the files that actually changed.
+    pub fn file_unchanged(&self, uri: &str, source: &str) -> bool {
+        let uri = uri.strip_prefix("file:").unwrap_or(uri);
+        self.sources.get(&format!("file:{uri}")).map(String::as_str) == Some(source)
+    }
+
     fn write_to(&self, p: &Path) -> Result<(), MemoryError> {
         crate::util::write_durable(p, self.to_json()?.as_bytes())?;
         Ok(())

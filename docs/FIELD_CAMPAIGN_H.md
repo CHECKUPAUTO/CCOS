@@ -280,6 +280,143 @@ entrent dans la fenêtre, à quel coût.
 dimensionné à l'ancre. Le test de Thor sur encore un autre dépôt (ripgrep/bat/fd) reste utile,
 mais la généralisation est déjà démontrée ici.
 
+## Suffisance (Q7) — le contexte fait-il *résoudre* ? (Campagne J, Thor)
+
+La couverture/frugalité est **nécessaire** ; la question qui décide la valeur de CCOS est la
+**suffisance** : à budget égal, le contexte CCOS fait-il *résoudre* un bug à un LLM local
+qu'un dump ne peut pas ? Protocole (Thor, `qwen3-coder:30b`, budget 2048) : 3 bugs
+multi-fichiers **contrôlés** — fichier-symptôme **paddé au-delà du budget**, cause = une
+constante dans un **fichier-dep** ; deux contextes à budget égal (région CCOS vs dump naïf
+tronqué) ; appliquer le diff du modèle, `cargo test`. **Vérité terrain = la sortie
+`cargo test`** (pas une heuristique — voir la note grader plus bas).
+
+| Bug (synthétique) | symptôme→cause | cause dans CCOS / baseline | **CCOS** | **baseline** | fichier patché baseline |
+| ----------------- | -------------- | -------------------------- | -------- | ------------ | ----------------------- |
+| JM1 `buffer_size` (*devinable*) | writer→config | oui / non | ✅ 3/3 | ✅ 3/3 *(deviné)* | config.rs (deviné juste) |
+| JM2 `HEADER_SIZE` | renderer→config | oui / non | ✅ 3/3 (corrige config) | ❌ **1/3** | renderer.rs (hack du symptôme) |
+| JM3 `MIN_SCORE` | reader→filter | oui / non | ✅ 3/3 (corrige filter) | ❌ **0/3** | renderer.rs (mauvais fichier inventé) |
+
+**Résultat** : sur les bugs où la *valeur* de la cause n'est pas inférable du symptôme
+(JM2, JM3), **CCOS résout (3/3) là où le dump à budget égal échoue** — il patche la racine
+(le fichier-cause), tandis que la baseline hacke le symptôme (JM2) ou hallucine un fichier
+sans rapport (JM3), parce que le budget a tronqué la cause de son contexte. **C'est la
+première preuve de suffisance** : le contexte CCOS ne fait pas que *couvrir* la cause, il
+fait *résoudre*.
+
+**Bémols honnêtes (pas de survente) :**
+- **n = 2 cas décisifs**, **synthétiques** (bugs construits, pas des commits réels minés),
+  **un seul modèle**. C'est une **démonstration de mécanisme**, pas encore un résultat à
+  l'échelle. → relance : vrais bugs (`bat`/`ripgrep`, fix dans une dep d'un gros fichier) +
+  2–3 modèles.
+- **JM1 ne compte pas** : la cause est devinable depuis l'import + l'assert ; la baseline a
+  deviné le bon fichier. Le gain n'existe que quand la *valeur* est **définie** dans la cause.
+- **CCOS n'est pas *moins cher* ici** : 2276/2351 tok vs 2048. Le gain est la **correction**
+  à budget comparable, pas la frugalité (axe séparé : la couverture).
+- **Grader corrigé** : le premier `result.json` de Thor notait JM3 CCOS `resolved=False`
+  alors que `cargo test` montrait **3 passed** (faux négatif d'une heuristique sur le fichier
+  patché). `scripts/ccos_grade.py` note désormais la **vérité `cargo test`**. Le test
+  « cause » direct (`assert_eq!(cause(), valeur_correcte)`) défait le hack du symptôme : un
+  patch local au symptôme passe 2/3 mais échoue ce test-là — seul un fix racine passe 3/3.
+
+### Round 2 — multi-modèles (3 bugs × 3 modèles, grader = `ccos_grade.py`)
+
+| Bug | qwen3-coder:30B | DeepSeek-V2-Lite (~16B) | qwen2.5-coder:1.5B |
+| --- | --------------- | ----------------------- | ------------------ |
+| JR1 `MIN_SCORE` (filter) | CCOS ✅ 3/3 / base ❌ CE | CCOS ✅ 3/3 / base ❌ 0/3 | CCOS ❌ CE / base ❌ CE |
+| JR2 `backoff` | CCOS ✅ 3/3 / base ❌ CE | CCOS ✅ 3/3 / base ❌ 0/3 | CCOS ❌ CE / base ❌ 1/3 |
+| JR3 `BUFFER_CAPACITY` | *(bug mal conçu — écarté)* | *(idem)* | *(idem)* |
+
+**Le résultat solide** : sur les bugs bien formés (JR1, JR2) × modèles **capables** (30B et
+16B), **CCOS résout 4/4, la baseline 0/4** — et l'asymétrie de patch est totale : la baseline
+patche **toujours** le fichier-symptôme (cause tronquée), CCOS **toujours** le fichier-cause.
+La suffisance **tient sur deux familles de modèles**.
+
+**Nuances honnêtes (corrections aux claims de la 1ʳᵉ synthèse) :**
+- Le gain **n'est pas** « model-independent » : à **1.5B les deux échouent** (le petit modèle
+  n'exploite aucun contexte ; il a même patché `lib.rs`, le mauvais fichier). C'est « robuste
+  sur modèles capables », pas universel. Le gap est **maximal à 16B** (3/3 vs 0/3) puis
+  **s'effondre à 1.5B** — non-monotone, un plancher de capacité existe.
+- **CCOS résout 4/9 cellules** (pas « 9/9 bon fichier » : sur JR3 il patche la bonne cause mais
+  ne résout pas ; à 1.5B il échoue). Le « bon fichier » ≠ « résolu ».
+- **Le format annoté gêne les petits modèles** (`// sym:` lu comme du code → compile error).
+  Piste : un **mode contexte brut** sans annotations pour les modèles faibles.
+- **JR3 mal conçu** : un test assert la valeur *buggée* (`len()==64`), donc corriger la racine
+  casse ce test. Écarté.
+- **Toujours synthétique** : pas encore de vrais commits minés (DeepSeek plantait en HTTP 500).
+  C'est le dernier pas — round 3 ci-dessous.
+
+### Round 3 — vers de vrais bugs, et la trouvaille qui borne la thèse
+
+Objectif : miner de **vrais** commits de correction (`bat`/`ripgrep`/`fd`) où la cause est dans
+un fichier différent du symptôme. Un seul modèle (`qwen3-coder:30B`). Vérité = `ccos_grade.py`.
+
+| Bug (motif réel) | CCOS | baseline | détail |
+| ---------------- | ---- | -------- | ------ |
+| R01 `bat` config-default | ✅ **3/3** (patche `config.rs`) | ❌ CE (`printer.rs`) | cause tronquée côté baseline — **vrai gain** |
+| R02 `ripgrep` line-buffer | ❌ **CE** | ❌ 1/3 | le modèle a *droppé une ligne `use`* → CE |
+| R03 `fd` walk-depth | ❌ **CE** (patche `walk.rs`, **pas** la cause `config.rs`) | ❌ CE | CCOS **avait** la cause, le modèle a réécrit le **symptôme** et cassé la compilation |
+
+**Vérité terrain : 1 gain net sur 3** (R01). (La 1ʳᵉ synthèse de Thor annonçait R03 « 3/3 / config.rs » ;
+son propre JSON dit `resolved:false, compile_error:true, patched:walk.rs` — **2ᵉ divergence
+récit↔artefact**, corrigée ici.) **R03 est l'enseignement** : *même avec la cause dans le
+contexte*, un modèle peut patcher le symptôme et casser le build. **Le bon contexte est
+nécessaire, pas suffisant — il faut que le modèle l'exploite.**
+
+**La trouvaille qui borne la thèse** : Thor a scanné **5709 commits** (bat+ripgrep+fd) → les
+vrais bugs **multi-fichiers sont rares (~1–2 % des fixes)**. La plupart des correctifs touchent
+le fichier du symptôme ; les tests sont ajoutés *avec* le fix, pas avant. Le « cas parfait »
+(cause dans un fichier, test pré-existant qui échoue ailleurs, symptôme tronquable) **est
+rare dans le débogage réel archivé** — R01/R02/R03 sont donc *synthétiques sur motifs réels*,
+faute d'avoir pu en miner un vrai.
+
+### Mot de la fin — Campaign J, sans fard
+
+- **Couverture / asymétrie : acquise (100 %).** La baseline n'a jamais la cause tronquée ; CCOS
+  l'a toujours. Frugalité prouvée sur CCOS, `syn`, `bat`.
+- **Résolution : réelle mais conditionnelle.** Gains nets : JM2, JM3, JR1×{30B,16B}, JR2×{30B,16B},
+  R01. Échecs *malgré* le contexte : R03 (mauvais fichier), R02 (import droppé), tous les 1.5B.
+  → il faut un **modèle capable qui exploite** le contexte.
+- **Applicabilité : étroite.** ~1–2 % des fixes réels ont cette structure.
+
+**Conclusion honnête** : CCOS fournit de façon fiable et frugale le voisinage causal (le cœur
+technique tient), et ce contexte *peut* faire résoudre ce qu'un dump à budget égal ne peut pas —
+mais sur une **minorité** de bugs et **seulement si** le modèle s'en sert bien. Ce n'est pas un
+triomphe ; c'est un outil à **valeur réelle sur un créneau précis**, mesuré honnêtement. La
+suite utile n'est pas « plus de bugs synthétiques » mais soit (a) un **mode contexte brut** pour
+les modèles faibles, soit (b) mesurer la valeur de CCOS sur l'**assemblage de contexte en tâche
+générale** (où les dépendances sont omniprésentes), pas seulement sur le bug-fix-avec-test —
+créneau qui, lui, s'est avéré rare.
+
+## Valeur en tâche générale — le créneau large (model-free)
+
+Le bug-fix multi-fichiers est rare (~1–2 %). Mais le *besoin* sous-jacent — « je travaille sur
+le fichier X, ai-je ses dépendances cross-file dans mon budget ? » — est **omniprésent** (tout
+fichier non trivial utilise ses deps). Mesuré sur **chaque** fichier de vrais crates
+(`scripts/ccos_context_value.py`, budget 2048, sans LLM, sans signal d'échec — juste « je
+travaille sur X ») : pour chaque arête de dépendance `use crate::Y`, le contenu de Y est-il dans
+`recall around X` ? Comparé à ouvrir X naïvement (tronqué au budget, puis les voisins).
+
+| crate | arêtes-dep | **CCOS** | dump naïf | gros fichiers (> budget) : CCOS / naïf |
+| ----- | ---------- | -------- | --------- | -------------------------------------- |
+| `syn` | 112 | **81 %** | 2 % | 79 % / 0 % |
+| CCOS `src/` | 57 | **93 %** | 0 % | 92 % / 0 % |
+| `serde_json` | 14 | **100 %** | 0 % | 100 % / 0 % |
+
+**Sur 183 arêtes de dépendance réelles, CCOS place la dépendance dans une fenêtre de 2048 tokens
+81–100 % du temps ; ouvrir le fichier en donne 0–2 %.** Et c'est concentré là où ça compte : sur
+les **gros fichiers** (plus grands que le budget), ouvrir le fichier **tronque toutes ses deps**
+(0 %), CCOS en garde **79–100 %**. C'est le créneau **large** que le test de résolution (rare)
+sous-mesurait : l'avantage de couverture n'est pas réservé aux bugs multi-fichiers, c'est le
+quotidien « travailler sur un fichier et avoir besoin de ses deps ».
+
+**Bémol honnête** : ceci mesure la **couverture** (la dep est *présente*), pas la **valeur
+prouvée** (la dep *aide*). La suffisance (couverture → meilleur résultat) n'a été testée que sur
+le créneau étroit du bug-fix, où elle tient *si le modèle exploite le contexte*. Donc : avantage
+de **couverture large et fort** (prouvé ici), **suffisance démontrée sur l'étroit**. On ne
+sur-vend pas : la couverture est nécessaire et omniprésente ; reste à prouver que l'aide qu'elle
+procure se généralise au-delà du bug-fix.
+
+
 ## Grille de résultats à remplir (vrai code, Thor)
 
 Refais les 5 bugs **mais greffés sur de vrais fichiers volumineux** (insère le mauvais
