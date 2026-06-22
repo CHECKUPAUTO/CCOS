@@ -68,6 +68,7 @@ pub mod event_log;
 pub mod external_memory;
 pub mod guard;
 pub mod incremental;
+#[cfg(feature = "llm")]
 pub mod llm;
 pub mod mcp;
 pub mod memory;
@@ -83,11 +84,13 @@ pub mod agents;
 pub mod benchmark;
 pub mod persistence;
 pub mod scheduler;
+#[cfg(feature = "llm")]
 pub mod workspace;
 
 // ── CCOS v0.3 — Context Region Engine (spatial memory) ──────────────
 pub mod context_policy;
 pub mod context_region;
+#[cfg(feature = "llm")]
 pub mod eval;
 pub mod experiment;
 pub mod region_engine;

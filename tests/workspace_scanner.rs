@@ -1,6 +1,10 @@
 //! CCOS v0.3 — Real workspace scanner integration tests, including the
 //! canonical "modify one file → only that file is reparsed" scenario and a
 //! file-vanishes-mid-scan chaos case.
+//!
+//! The workspace scanner is async (`tokio::fs`), so these tests live behind the
+//! `llm` feature with the module.
+#![cfg(feature = "llm")]
 
 use ccos::incremental::IncrementalGraphEngine;
 use ccos::memory::MemoryGraph;
