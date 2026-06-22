@@ -39,3 +39,4 @@ criterion = "0.5"
 [[bench]]
 name = "delta_bench"
 harness = false
+license = "LicenseRef-CheckupAuto-Dual"

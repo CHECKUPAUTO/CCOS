@@ -226,6 +226,9 @@ A research prototype, not a production system. Known gaps (tracked in
 - The agent self-feed hook is a best-effort heuristic intercept, not a ground-truth
   tracer; use one writer per `workspace.ccos`.
 
+
+
+
 ## License
 
-Unlicensed research prototype. Add a license before any external use.
+Dual-licensed: [PolyForm Noncommercial 1.0.0](LICENSE.md) for noncommercial and personal use; commercial license required for any commercial use. See [LICENSING.md](LICENSING.md).
