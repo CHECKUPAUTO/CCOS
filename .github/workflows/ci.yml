@@ -56,6 +56,9 @@ jobs:
       - name: Test (syn-parser feature — real AST)
         run: cargo test --features syn-parser --locked
 
+      - name: Test (llm feature — async modules + binary)
+        run: cargo test --features llm --locked
+
       - name: Docs
         env:
           RUSTDOCFLAGS: "-D warnings"
@@ -63,17 +66,17 @@ jobs:
 
       - name: Smoke-test the CLI
         run: |
-          cargo run --locked -- version
-          cargo run --locked -- analyze src --out /tmp/run.json
-          cargo run --locked -- verify /tmp/run.json
-          cargo run --locked -- replay /tmp/run.json
-          cargo run --locked -- top src --limit 10
-          cargo run --locked -- blame /tmp/run.json file:src/lib.rs --depth 3
-          cargo run --locked -- export /tmp/run.json --out /tmp/ccos.graphml
-          cargo run --locked -- regions src
-          cargo run --locked -- regions src --activate file:src/lib.rs
-          cargo run --locked -- regions src --metrics file:src/lib.rs --json
-          cargo run --locked -- experiment --tasks 60
-          cargo run --locked -- eval --tasks 4
-          printf '%s\n' '{"op":"ingest","uri":"src/x.rs","source":"pub fn x() {}"}' '{"op":"recall","strategy":"working_set","budget":512}' '{"op":"verify"}' | cargo run --locked -- memory --path /tmp/mem.ccos
-          cargo run --locked -- chaos --iters 500
+          cargo run --locked --features llm -- version
+          cargo run --locked --features llm -- analyze src --out /tmp/run.json
+          cargo run --locked --features llm -- verify /tmp/run.json
+          cargo run --locked --features llm -- replay /tmp/run.json
+          cargo run --locked --features llm -- top src --limit 10
+          cargo run --locked --features llm -- blame /tmp/run.json file:src/lib.rs --depth 3
+          cargo run --locked --features llm -- export /tmp/run.json --out /tmp/ccos.graphml
+          cargo run --locked --features llm -- regions src
+          cargo run --locked --features llm -- regions src --activate file:src/lib.rs
+          cargo run --locked --features llm -- regions src --metrics file:src/lib.rs --json
+          cargo run --locked --features llm -- experiment --tasks 60
+          cargo run --locked --features llm -- eval --tasks 4
+          printf '%s\n' '{"op":"ingest","uri":"src/x.rs","source":"pub fn x() {}"}' '{"op":"recall","strategy":"working_set","budget":512}' '{"op":"verify"}' | cargo run --locked --features llm -- memory --path /tmp/mem.ccos
+          cargo run --locked --features llm -- chaos --iters 500
