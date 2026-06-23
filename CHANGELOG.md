@@ -8,6 +8,22 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Input hardening — deterministic Unicode de-obfuscation + an injection
+  signal** (`sanitizer`, `hashing_tokenizer`, `injection_classifier` modules).
+  Hidden-character injection vectors — Trojan-Source bidi overrides
+  (CVE-2021-42574), zero-width formatting, Unicode-Tags ASCII smuggling — are
+  surfaced as explicit, auditable literals (`[U+202E RLO]`) at ingest
+  (default-on in `ingest_source`; clean source is borrowed unchanged, zero
+  copy), with findings in `IngestReport.anomalies` and the event-log hash taken
+  over the cleaned form so a replay reproduces it. A deterministic
+  feature-hashing tokenizer feeds a linear log-space (multinomial-Naive-Bayes)
+  injection **signal** whose weights are locked in an immutable,
+  SHA-256-verified blob, with a forensic per-feature explanation of every score;
+  a held-out red-team measures F1 0.90 (precision 0.87, recall 0.93). Labelled a
+  *signal, not a shield* by design (evaded by paraphrase; no character pass
+  solves semantic injection). New `ccos sanitize` CLI command and the
+  `train_injection` / `injection_redteam` examples. See
+  [`docs/SECURITY.md`](docs/SECURITY.md).
 - **Reversible context compression pipeline** (`compressor` module) — the real
   *compression* pass CCOS historically lacked, sitting downstream of the causal
   MMU's selection so the graph, the scoring, the paging and the hash-chain

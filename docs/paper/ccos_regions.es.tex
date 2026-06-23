@@ -306,6 +306,27 @@ encadenado por hash y es a prueba de manipulación, de modo que el historial de
 regiones es auditable, y una prueba de 10\,000 ciclos no exhibe deriva alguna en el
 número de regiones ni en las temperaturas.
 
+\paragraph{Una frontera de entrada auditable.} El mismo sustrato determinista y
+reproducible endurece el texto que un agente ingiere. Los vectores de inyección
+por caracteres ocultos --- anulaciones bidireccionales (el ataque \emph{Trojan
+Source}, CVE-2021-42574), formato de ancho cero y el bloque Unicode \emph{Tags}
+usado para el contrabando de ASCII invisible --- se des-ofuscan en la ingesta a
+literales explícitos y visibles (\code{[U+202E RLO]}) en lugar de eliminarse en
+silencio, y los hallazgos se registran en el mismo registro encadenado por hash,
+de modo que una reproducción reconstruye el estado limpio. Un clasificador lineal
+en espacio logarítmico posterior --- la forma cerrada del Naïve Bayes multinomial,
+$\mathrm{logit}=b+W\!\cdot\!X$ sobre un vector de características por \emph{hashing
+trick}, con sus pesos fijados en un blob verificado por suma de comprobación ---
+añade una señal de inyección \emph{determinista y descomponible forensemente} (un
+red-team sobre datos reservados mide $F_1=0{,}90$; precisión $0{,}87$,
+exhaustividad $0{,}93$). Lo afirmamos de forma deliberada: es una \emph{señal, no
+una solución} --- un modelo de bolsa de características se evade con paráfrasis, y
+ninguna pasada a nivel de carácter aborda la inyección semántica; la mitigación
+real es la separación de privilegios en el host. La contribución no es un detector
+novedoso, sino que la des-ofuscación y la puntuación heredan la propiedad
+distintiva de CCOS: toda decisión de seguridad es reproducible y auditable hasta
+la característica exacta que la inclinó.
+
 \section{Sesiones event-sourced y depuración por viaje en el tiempo}\label{sec:timetravel}
 
 El determinismo no es solo una propiedad de corrección; es la base de la capacidad

@@ -84,6 +84,7 @@ async fn main() {
             }
         }
         "postmortem" => run_postmortem(rest),
+        "sanitize" => run_sanitize(rest),
         // ── CCOS v0.3 — Autonomous Context Runtime ──────────────────
         "scan" => commands_runtime::run_scan(rest).await,
         "agents" => commands_runtime::run_agents(rest).await,
@@ -2030,6 +2031,124 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// `ccos sanitize [path] [--json] [--strict]` — de-obfuscate hidden Unicode in a
+/// file (or stdin), surfacing Trojan-Source bidi overrides, zero-width formatting
+/// and Unicode-Tags ASCII smuggling as explicit literals, and score the cleaned
+/// residue for injection with a per-feature forensic decomposition. `--strict`
+/// exits non-zero when a high-severity anomaly or a flagged injection is found
+/// (handy as a pre-commit / CI gate).
+fn run_sanitize(args: &[String]) -> i32 {
+    use ccos::injection_classifier::InjectionDetector;
+    use ccos::sanitizer::{self, Severity};
+
+    let mut path: Option<String> = None;
+    let mut as_json = false;
+    let mut strict = false;
+    for a in args {
+        match a.as_str() {
+            "--json" => as_json = true,
+            "--strict" => strict = true,
+            s if !s.starts_with("--") => path = Some(s.to_string()),
+            other => {
+                eprintln!("ccos sanitize: unknown flag '{other}'");
+                return 2;
+            }
+        }
+    }
+
+    let input = match path.as_deref() {
+        None | Some("-") => {
+            use std::io::Read;
+            let mut s = String::new();
+            if std::io::stdin().read_to_string(&mut s).is_err() {
+                eprintln!("ccos sanitize: failed to read stdin");
+                return 1;
+            }
+            s
+        }
+        Some(p) => match std::fs::read_to_string(p) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("ccos sanitize: {p}: {e}");
+                return 1;
+            }
+        },
+    };
+
+    let (clean, report) = sanitizer::defang(&input);
+    let det = InjectionDetector::default();
+    let p_inj = det.injection_probability(&clean);
+    let ex = det.explain(&clean);
+    let flagged = p_inj >= 0.5;
+    let dangerous = report.highest_severity() == Some(Severity::High) || flagged;
+
+    if as_json {
+        let findings: Vec<serde_json::Value> = report
+            .findings
+            .iter()
+            .map(|f| {
+                serde_json::json!({
+                    "byte_offset": f.byte_offset,
+                    "char_index": f.char_index,
+                    "codepoint": format!("U+{:04X}", f.codepoint),
+                    "kind": f.kind.as_str(),
+                    "label": f.label,
+                    "literal": f.literal(),
+                })
+            })
+            .collect();
+        let top: Vec<serde_json::Value> = ex
+            .top_terms
+            .iter()
+            .take(6)
+            .map(|t| serde_json::json!({"feature": t.feature, "contribution": t.contribution}))
+            .collect();
+        let out = serde_json::json!({
+            "anomalies": findings,
+            "anomaly_summary": report.summary(),
+            "injection_probability": p_inj,
+            "injection_flagged": flagged,
+            "injection_margin": ex.margin,
+            "top_terms": top,
+            "dangerous": dangerous,
+        });
+        println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+    } else {
+        println!("hidden characters : {}", report.summary());
+        for f in &report.findings {
+            println!(
+                "  @byte {:>5} char {:>4}  {:<13} {}",
+                f.byte_offset,
+                f.char_index,
+                f.kind.as_str(),
+                f.literal()
+            );
+        }
+        println!(
+            "injection signal  : p={p_inj:.3}{}",
+            if flagged { "  [FLAGGED]" } else { "" }
+        );
+        if p_inj >= 0.2 && !ex.top_terms.is_empty() {
+            print!("  top terms       :");
+            for t in ex.top_terms.iter().take(5) {
+                print!(" {}({:+.2})", t.feature, t.contribution);
+            }
+            println!();
+        }
+        if report.is_clean() && !flagged {
+            println!("verdict           : clean");
+        } else if dangerous {
+            println!("verdict           : DANGEROUS");
+        }
+    }
+
+    if strict && dangerous {
+        1
+    } else {
+        0
+    }
+}
+
 fn print_help() {
     println!(
         "CCOS — Causal Context Operating System (v{})\n\n\
@@ -2071,6 +2190,12 @@ COMMANDS:\n\
     \x20                          (persistent if a workspace path is given; for MCP-compatible agents)\n\
     postmortem [workspace] [--json]  Time-travel debugger over a session timeline; --json\n\
     \x20                          dumps the field record (stats/timeline/integrity) and exits\n\
+\n\
+  Input hardening (de-obfuscation + injection signal):\n\
+    sanitize [path] [--json]   De-obfuscate hidden Unicode (Trojan-Source bidi,\n\
+    \x20                          zero-width, Tags ASCII-smuggling) into visible\n\
+    \x20                          literals + a forensic injection score; reads\n\
+    \x20                          stdin when no path. --strict exits non-zero on danger\n\
 \n\
   CCOS v0.3 — Autonomous Context Runtime:\n\
     scan <path>                Scan a real workspace and ingest the delta\n\

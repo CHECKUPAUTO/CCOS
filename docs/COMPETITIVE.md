@@ -10,6 +10,26 @@
 > dément. Headroom est activement développé (un portage Rust est en cours) : cette analyse
 > est un instantané et peut dériver.*
 
+> **⚠️ Mise à jour 2026-06-23 — CCOS a bougé depuis cette lecture.** Cette analyse a été
+> écrite *avant* que CCOS ne gagne des capacités qui **réduisent l'écart** là où je donnais
+> Headroom gagnant :
+> - **Compression réversible + CCR** (`src/compressor.rs`) : CCOS re-encode désormais le
+>   contenu (CausalCrusher/AST/Summ, déterministes) et garde les originaux récupérables via
+>   l'outil MCP `ccos_retrieve` — l'équivalent déterministe de `headroom_retrieve`. L'axe
+>   frugalité n'est plus *vide* côté CCOS (≈ 30–50 % mesuré sur du Rust réel, le plancher
+>   déterministe de la fourchette Headroom).
+> - **Embeddings INT4** (`src/embeddings.rs`) : recall **sémantique** déterministe (TF-IDF
+>   quantifié INT4, cosine). CCOS n'est donc plus « sans recall sémantique » — même si ça
+>   reste en deçà du RAG complet de Headroom (sqlite-vec + FTS5 + mem0).
+> - **Dé-obfuscation Unicode + signal d'injection** (`src/sanitizer.rs` + classifieur) : un
+>   **nouvel axe** que la lecture du code de Headroom n'a pas montré chez eux — défang
+>   déterministe/auditable des vecteurs Trojan-Source / zero-width / Tags, findings versés
+>   dans le log hash-chaîné. Voir [`SECURITY.md`](SECURITY.md).
+>
+> Les corrections de fond ci-dessous (Headroom *a* une vraie mémoire ; ses compresseurs
+> *sont* déterministes) restent valables. À re-vérifier des deux côtés avant tout usage
+> public daté.
+
 ---
 
 ## 0. TL;DR — verdict par axe
@@ -17,7 +37,8 @@
 | Axe | Qui gagne | En une ligne |
 |---|---|---|
 | **Frugalité / coût-tokens** | **Headroom**, nettement | Pipeline de compression *content-aware* mûr, Rust-backed, avec un vrai modèle ML. |
-| **Mémoire long-terme** | **Headroom** (sur le terrain RAG) | Vrai store vectoriel persistant (sqlite-vec + FTS5). CCOS n'a pas de recall sémantique. |
+| **Mémoire long-terme** | **Headroom** (RAG complet) | Store vectoriel persistant (sqlite-vec + FTS5 + mem0). CCOS a *désormais* un recall sémantique déterministe (INT4 TF-IDF) — en deçà, mais plus vide. |
+| **Dé-obfuscation Unicode / hardening de l'entrée** | **CCOS** | Défang déterministe + auditable (Trojan-Source / zero-width / Tags) + signal d'injection forensic. Non trouvé dans le code de Headroom. |
 | **Mémoire de travail *rejouable, auditable, debuggable post-mortem*** | **CCOS**, seul | *Confirmé par leur source* : Headroom n'a ni log hash-chaîné, ni replay déterministe, ni event-sourcing des évictions, ni watchpoint. |
 
 **Conclusion stratégique :** la repositionnement de CCOS vers le **« flight recorder » de la

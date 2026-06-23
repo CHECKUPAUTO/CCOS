@@ -285,6 +285,25 @@ This extends CCOS's existing guarantees: the primary event log is hash-chained a
 tamper-evident, so the region history is auditable, and a 10\,000-cycle test
 exhibits no drift in region count or temperatures.
 
+\paragraph{An auditable input boundary.} The same deterministic, replayable
+substrate hardens the text an agent ingests. Hidden-character injection vectors
+--- bidirectional overrides (the \emph{Trojan Source} attack, CVE-2021-42574),
+zero-width formatting, and the Unicode \emph{Tags} block used for invisible ASCII
+smuggling --- are de-obfuscated at ingest into explicit, visible literals
+(\code{[U+202E RLO]}) rather than silently stripped, and the findings are
+recorded against the same hash-chained log, so a replay reproduces the cleaned
+state. A downstream linear log-space classifier --- the closed form of
+multinomial Naive Bayes, $\mathrm{logit}=b+W\!\cdot\!X$ over a hashing-trick
+feature vector, its weights locked in a checksum-verified blob --- adds a
+\emph{deterministic, forensically decomposable} injection signal (a held-out
+red-team measures $F_1=0.90$; precision $0.87$, recall $0.93$). We are deliberate
+that this is a \emph{signal, not a solution}: a bag-of-features model is evaded by
+paraphrase, and no character-level pass addresses semantic injection --- the real
+mitigation is privilege separation in the host. The contribution is not a novel
+detector but that de-obfuscation and scoring inherit CCOS's defining property:
+every security decision is reproducible and auditable down to the exact feature
+that moved it.
+
 \section{Event-sourced sessions and time-travel debugging}\label{sec:timetravel}
 
 Determinism is not only a correctness property; it is the basis of the capability
