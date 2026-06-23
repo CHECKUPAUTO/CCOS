@@ -60,7 +60,11 @@ recuperación. Es la infraestructura que a una pila de recuperación le falta
 estructuralmente: una memoria de agente \emph{determinista, reproducible, auditable}
 en la que se puede rebobinar el estado exacto del contexto en cualquier paso y
 reproducirlo bajo parámetros distintos (\emph{depuración por viaje en el tiempo}).
-Publicamos el motor, el arnés de validación honesto y este artículo, etiquetando en
+Hasta donde sabemos, CCOS es el \emph{primer} sistema que trata la \emph{propia
+memoria de trabajo} de un agente como un subsistema transaccional --- determinista,
+encadenado por hash, reproducible bit a bit y \emph{depurable a posteriori}: una
+caja negra de la atención, con un punto de interrupción en el paso exacto en que la
+información correcta fue desalojada de la ventana. Publicamos el motor, el arnés de validación honesto y este artículo, etiquetando en
 todo momento lo que está \emph{probado} (estructura formal, determinismo,
 reproducción), \emph{medido} (cobertura de recuperación --- donde CCOS \emph{no}
 supera al RAG léxico en errores reales), y el único eje en el que CCOS \emph{sí}
@@ -115,7 +119,11 @@ Nuestras contribuciones son:
   recuerdo) queda registrada; el estado exacto del contexto en cualquier paso es
   reconstruible; y un recuerdo puede \emph{reproducirse bajo parámetros distintos}
   para preguntar si el agente habría decidido mejor --- la capacidad que a una pila de
-  recuperación probabilística le falta estructuralmente.
+  recuperación probabilística le falta estructuralmente. Hasta donde sabemos, es el
+  primer tratamiento del \emph{ensamblaje del contexto en sí} como un subsistema
+  reproducible y depurable a posteriori --- una \emph{caja negra de la atención de un
+  agente} --- con un \emph{punto de interrupción de desalojo} que nombra el paso y la
+  operación exactos en que la causa verdadera fue expulsada de la ventana acotada.
   \item Un \textbf{arnés de validación honesto y un resultado negativo}
   (\S\ref{sec:protocol}): sobre $70$ commits reales de corrección, la selección causal
   \emph{no} supera a un recuperador léxico TF-IDF al colocar los archivos de una
@@ -315,8 +323,21 @@ a ejecutar un recuerdo con una consulta $q$ o un presupuesto de tokens $b$ disti
 devolviendo la ventana que el agente \emph{habría} visto. Cuando un agente emite un
 mal parche en el paso 15, un operador puede reproducir su contexto exacto en el paso
 14, ampliar el presupuesto o cambiar el ancla, y observar si la decisión mejora --- un
-depurador de bucle cerrado y reproducible para la memoria de trabajo de un agente. Una
-pila RAG o de marco muta su almacén de forma probabilística a lo largo de una sesión y
+depurador de bucle cerrado y reproducible para la memoria de trabajo de un agente.
+
+\paragraph{Un punto de interrupción sobre la atención.} La reproducción también
+localiza la \emph{deriva}. El punto de observación \code{missing} recorre la línea de
+tiempo en busca del paso exacto en que un nodo dado --- típicamente la causa
+verdadera de un fallo --- fue expulsado de la ventana acotada por la presión
+competidora, nombrando la operación desencadenante y la diferencia de tokens; una
+vista \code{energy} complementaria revela la migración de calor causal por el grafo
+que un diff a nivel de archivo pasa por alto. Es, en efecto, un \emph{punto de
+interrupción sobre la atención de un agente}: el instante preciso en que la
+información correcta abandonó la ventana. Una pila de recuperación opaca solo puede
+mostrar el contexto final, corrupto; CCOS puede señalar el paso --- y la operación ---
+en que se torció.
+
+Una pila RAG o de marco muta su almacén de forma probabilística a lo largo de una sesión y
 no conserva ningún registro de transiciones canónico y reproducible, así que la misma
 pregunta (\emph{¿por qué, y cuándo, se corrompió la representación?}) no tiene
 respuesta allí. No afirmamos que esto mejore el éxito en las tareas; afirmamos que es
