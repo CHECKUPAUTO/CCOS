@@ -41,10 +41,21 @@ fn maybe_obfuscate(rng: &mut SplitMix64, s: &str) -> String {
     if !rng.chance(0.5) {
         return s.to_string();
     }
-    let hidden = ['\u{200B}', '\u{202E}', '\u{2069}', '\u{E0061}', '\u{200D}', '\u{00AD}'];
+    let hidden = [
+        '\u{200B}',
+        '\u{202E}',
+        '\u{2069}',
+        '\u{E0061}',
+        '\u{200D}',
+        '\u{00AD}',
+    ];
     let h = hidden[rng.below(hidden.len())];
     let bounds: Vec<usize> = s.char_indices().map(|(i, _)| i).collect();
-    let cut = if bounds.is_empty() { 0 } else { bounds[rng.below(bounds.len())] };
+    let cut = if bounds.is_empty() {
+        0
+    } else {
+        bounds[rng.below(bounds.len())]
+    };
     let mut out = String::with_capacity(s.len() + 4);
     out.push_str(&s[..cut]);
     out.push(h);
@@ -53,9 +64,30 @@ fn maybe_obfuscate(rng: &mut SplitMix64, s: &str) -> String {
 }
 
 fn gen_benign(rng: &mut SplitMix64) -> String {
-    let subj = ["the parser", "the scheduler", "the cache", "the migration", "the worker", "the planner"];
-    let verb = ["validates", "normalises", "batches", "retries", "logs", "truncates"];
-    let obj = ["the user input", "the payload", "the request", "the window", "the queue", "the buffer"];
+    let subj = [
+        "the parser",
+        "the scheduler",
+        "the cache",
+        "the migration",
+        "the worker",
+        "the planner",
+    ];
+    let verb = [
+        "validates",
+        "normalises",
+        "batches",
+        "retries",
+        "logs",
+        "truncates",
+    ];
+    let obj = [
+        "the user input",
+        "the payload",
+        "the request",
+        "the window",
+        "the queue",
+        "the buffer",
+    ];
     let tail = [
         "before the database call",
         "and records the latency",
@@ -85,7 +117,13 @@ fn gen_benign(rng: &mut SplitMix64) -> String {
     } else if r < 7 {
         rng.pick(&hard).to_string()
     } else {
-        format!("{} {} {} {}", rng.pick(&subj), rng.pick(&verb), rng.pick(&obj), rng.pick(&tail))
+        format!(
+            "{} {} {} {}",
+            rng.pick(&subj),
+            rng.pick(&verb),
+            rng.pick(&obj),
+            rng.pick(&tail)
+        )
     }
 }
 
@@ -128,7 +166,12 @@ fn gen_injection(rng: &mut SplitMix64) -> String {
     ];
     let r = rng.next_u64() % 100;
     if r < 45 {
-        format!("{} {} {}", rng.pick(&opener), rng.pick(&mid), rng.pick(&tail))
+        format!(
+            "{} {} {}",
+            rng.pick(&opener),
+            rng.pick(&mid),
+            rng.pick(&tail)
+        )
     } else if r < 70 {
         rng.pick(&subtle).to_string()
     } else {
@@ -179,14 +222,28 @@ fn main() {
         }
     }
 
-    let prec = if tp + fp > 0 { tp as f64 / (tp + fp) as f64 } else { 0.0 };
-    let rec = if tp + fn_ > 0 { tp as f64 / (tp + fn_) as f64 } else { 0.0 };
+    let prec = if tp + fp > 0 {
+        tp as f64 / (tp + fp) as f64
+    } else {
+        0.0
+    };
+    let rec = if tp + fn_ > 0 {
+        tp as f64 / (tp + fn_) as f64
+    } else {
+        0.0
+    };
     let acc = (tp + tn) as f64 / samples.len() as f64;
-    let f1 = if prec + rec > 0.0 { 2.0 * prec * rec / (prec + rec) } else { 0.0 };
+    let f1 = if prec + rec > 0.0 {
+        2.0 * prec * rec / (prec + rec)
+    } else {
+        0.0
+    };
 
     println!("== injection red-team (deterministic, seed=0xC0C05EED1234ABCD) ==");
     println!("samples        : {} ({} per class)", samples.len(), n_each);
-    println!("obfuscated     : {obfuscated} carried hidden chars; sanitizer surfaced {surfaced} of them");
+    println!(
+        "obfuscated     : {obfuscated} carried hidden chars; sanitizer surfaced {surfaced} of them"
+    );
     println!("confusion      : TP={tp} FP={fp} TN={tn} FN={fn_}");
     println!("precision      : {prec:.3}");
     println!("recall         : {rec:.3}");
@@ -194,9 +251,16 @@ fn main() {
     println!("accuracy       : {acc:.3}");
 
     // Deterministic forensic analysis of the misclassifications.
-    println!("\n-- forensic analysis of {} misclassification(s) --", misses.len());
+    println!(
+        "\n-- forensic analysis of {} misclassification(s) --",
+        misses.len()
+    );
     for (text, is_inj, p) in misses.iter().take(10) {
-        let kind = if *is_inj { "FALSE NEGATIVE" } else { "FALSE POSITIVE" };
+        let kind = if *is_inj {
+            "FALSE NEGATIVE"
+        } else {
+            "FALSE POSITIVE"
+        };
         let ex = det.explain(text);
         let trimmed: String = text.chars().take(70).collect();
         println!("\n[{kind}] p(injection)={p:.3}  margin={:.2}", ex.margin);

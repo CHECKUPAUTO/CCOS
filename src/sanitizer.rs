@@ -255,12 +255,12 @@ fn classify(c: char, cfg: &SanitizerConfig) -> Option<(AnomalyKind, String)> {
         0xE0000 | 0xE0080..=0xE00FF => Some((AnomalyKind::TagChar, "TAG".to_string())),
 
         // ── Other default-ignorable / covert-channel codepoints ────────────
-        0x2061..=0x2064 => other("INVIS-MATH"),     // invisible times / separator / plus / fn
-        0xFFF9..=0xFFFB => other("ANNOT"),          // interlinear annotation anchors
+        0x2061..=0x2064 => other("INVIS-MATH"), // invisible times / separator / plus / fn
+        0xFFF9..=0xFFFB => other("ANNOT"),      // interlinear annotation anchors
         0x115F | 0x1160 | 0x3164 | 0xFFA0 => other("HANGUL-FILLER"),
-        0xFE00..=0xFE0F => other("VS"),             // variation selectors 1–16
-        0xE0100..=0xE01EF => other("VS-SUPP"),      // variation selectors supplement
-        0x2028 | 0x2029 => other("LINE-SEP"),       // line / paragraph separator
+        0xFE00..=0xFE0F => other("VS"), // variation selectors 1–16
+        0xE0100..=0xE01EF => other("VS-SUPP"), // variation selectors supplement
+        0x2028 | 0x2029 => other("LINE-SEP"), // line / paragraph separator
 
         _ => None,
     }
@@ -478,6 +478,9 @@ mod tests {
         let src = "\u{202E}\u{200B}\u{200B}";
         let report = scan(src);
         // BTreeMap order: "bidi-control" < "zero-width"
-        assert_eq!(report.summary(), "3 hidden char(s): 1 bidi-control, 2 zero-width");
+        assert_eq!(
+            report.summary(),
+            "3 hidden char(s): 1 bidi-control, 2 zero-width"
+        );
     }
 }
