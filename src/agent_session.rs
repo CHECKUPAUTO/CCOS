@@ -35,6 +35,7 @@
 //! assert_eq!(s.replay_to(s.len()).stats().nodes, s.memory().stats().nodes);
 //! ```
 
+use crate::compressor::{CausalCompressor, CcrRef};
 use crate::external_memory::{
     CcosMemory, ExternalMemory, IngestReport, MemoryError, Recall, RecallWindow,
 };
@@ -118,6 +119,10 @@ pub struct AgentSession {
     /// Where the timeline sidecar lives (`<workspace>.oplog`); `None` for an
     /// in-memory [`new`](Self::new) session.
     oplog_path: Option<PathBuf>,
+    /// The reversible context-compression pipeline (CCR store). Owns the
+    /// originals cache so the host LLM can call `ccos_retrieve` across calls.
+    /// See [`crate::compressor`].
+    compressor: CausalCompressor,
 }
 
 impl Default for AgentSession {
@@ -135,6 +140,7 @@ impl AgentSession {
             baseline: None,
             folded: 0,
             oplog_path: None,
+            compressor: CausalCompressor::new(),
         }
     }
 
@@ -170,6 +176,7 @@ impl AgentSession {
                 baseline: t.baseline,
                 folded: t.folded,
                 oplog_path: Some(oplog_path),
+                compressor: CausalCompressor::new(),
             },
             None => {
                 let baseline = Some(live.to_json()?);
@@ -179,6 +186,7 @@ impl AgentSession {
                     baseline,
                     folded: 0,
                     oplog_path: Some(oplog_path),
+                    compressor: CausalCompressor::new(),
                 }
             }
         };
@@ -290,6 +298,59 @@ impl AgentSession {
         let window = self.live.recall(&recall, budget);
         self.ops.push(Op::Recall { recall, budget });
         window
+    }
+
+    /// Record and run a **compressed** recall: same selection as [`Self::recall`],
+    /// then each item's content is passed through the [`CausalCompressor`] and
+    /// the original is cached in the session's CCR store. The host LLM can call
+    /// [`retrieve_original`](Self::retrieve_original) (exposed as the
+    /// `ccos_retrieve` MCP tool) to fetch any original back — the CCOS
+    /// equivalent of headroom's reversible `headroom_retrieve`. This is the
+    /// real *compression* pass CCOS historically lacked; it is a pure
+    /// post-selection transform, so the causal graph, the scoring, the paging
+    /// and the hash-chain replay invariants are untouched.
+    pub fn recall_compressed(&mut self, recall: Recall, budget: usize) -> RecallWindow {
+        let window = self
+            .live
+            .recall_compressed(&recall, budget, &mut self.compressor);
+        self.ops.push(Op::Recall { recall, budget });
+        window
+    }
+
+    /// Retrieve an original content blob from the CCR store (backend for the
+    /// `ccos_retrieve` MCP tool). `None` when the ref is unknown or has been
+    /// evicted by the store's capacity cap.
+    pub fn retrieve_original(&self, ccr: &CcrRef) -> Option<&str> {
+        self.compressor.retrieve(ccr)
+    }
+
+    /// **Budget feedback loop** — compression-aware recall that re-spends the
+    /// tokens freed by compression on more causal nodes (up to `max_rounds`
+    /// passes). See [`CcosMemory::recall_compressed_with_feedback`]. This is
+    /// the CCOS differentiator vs headroom: headroom compresses a fixed
+    /// selection; CCOS grows the selection with the freed space, so the host
+    /// gets strictly more causal signal at the same emitted-token cost.
+    pub fn recall_compressed_with_feedback(
+        &mut self,
+        recall: Recall,
+        budget: usize,
+        max_rounds: usize,
+    ) -> RecallWindow {
+        let window = self.live.recall_compressed_with_feedback(
+            &recall,
+            budget,
+            &mut self.compressor,
+            max_rounds,
+        );
+        self.ops.push(Op::Recall { recall, budget });
+        window
+    }
+
+    /// Read-only access to the compression pipeline's last-run per-item stats
+    /// (algorithm, tokens before/after, ratio). Useful for a `ccos stats`-style
+    /// compression dashboard.
+    pub fn last_compression_stats(&self) -> &[crate::compressor::CompressionStat] {
+        &self.compressor.last_stats
     }
 
     /// **Context page fault**: feed `cargo test` / compiler output back into the

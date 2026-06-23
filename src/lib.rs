@@ -62,9 +62,12 @@
 
 pub mod adversarial;
 pub mod agent_session;
+pub mod compressor;
 pub mod consensus;
 pub mod distributed_event_log;
+pub mod embeddings;
 pub mod event_log;
+pub mod eviction_policy;
 pub mod external_memory;
 pub mod guard;
 pub mod incremental;
