@@ -60,7 +60,12 @@ produit pas sur du vrai code. La contribution n'est donc \emph{pas} une meilleur
 récupération. C'est l'infrastructure qui manque structurellement à une pile de
 récupération : une mémoire d'agent \emph{déterministe, rejouable, auditable} dans
 laquelle on peut rembobiner l'état exact du contexte à n'importe quelle étape et le
-rejouer sous d'autres paramètres (\emph{débogage par voyage dans le temps}). Nous
+rejouer sous d'autres paramètres (\emph{débogage par voyage dans le temps}). À notre
+connaissance, CCOS est le \emph{premier} système à traiter la \emph{mémoire de travail
+elle-même} d'un agent comme un sous-système transactionnel --- déterministe, chaîné
+par hachage, rejouable bit-à-bit et \emph{déboguable a posteriori} : un enregistreur
+de vol de l'attention, avec un point d'arrêt sur l'étape exacte où la bonne
+information a été évincée de la fenêtre. Nous
 publions le moteur, le harnais de validation honnête et cet article, en étiquetant
 partout ce qui est \emph{prouvé} (structure formelle, déterminisme, rejeu),
 \emph{mesuré} (couverture de récupération --- où CCOS ne bat \emph{pas} le RAG
@@ -117,7 +122,11 @@ par hachage, si bien que la mémoire n'est pas une boîte noire mais un artefact
   d'échec, rappel) est journalisée ; l'état exact du contexte à toute étape est
   reconstructible ; et un rappel peut être \emph{rejoué sous d'autres paramètres}
   pour demander si l'agent aurait mieux décidé --- la capacité qui manque
-  structurellement à une pile de récupération probabiliste.
+  structurellement à une pile de récupération probabiliste. À notre connaissance,
+  c'est le premier traitement de l'\emph{assemblage du contexte lui-même} comme un
+  sous-système rejouable et déboguable a posteriori --- un \emph{enregistreur de vol
+  de l'attention} --- doté d'un \emph{point d'arrêt d'éviction} qui nomme l'étape et
+  l'opération exactes où la vraie cause a été expulsée de la fenêtre budgétée.
   \item Un \textbf{harnais de validation honnête et un résultat négatif}
   (\S\ref{sec:protocol}) : sur $70$ commits réels de correction de bogues, la
   sélection causale \emph{ne bat pas} un récupérateur lexical TF-IDF pour placer les
@@ -321,6 +330,18 @@ renvoyant la fenêtre que l'agent \emph{aurait} vue. Quand un agent émet un mau
 correctif à l'étape 15, un opérateur peut rejouer son contexte exact à l'étape 14,
 élargir le budget ou changer l'ancre, et observer si la décision s'améliore --- un
 débogueur en boucle fermée et reproductible pour la mémoire de travail d'un agent.
+
+\paragraph{Un point d'arrêt sur l'attention.} Le rejeu localise aussi la
+\emph{dérive}. Le point d'observation \code{missing} parcourt la chronologie pour
+trouver l'étape exacte où un nœud donné --- typiquement la vraie cause d'un échec ---
+a été expulsé de la fenêtre budgétée par la pression concurrente, en nommant
+l'opération déclenchante et l'écart de jetons ; une vue \code{energy} complémentaire
+révèle la migration de chaleur causale à travers le graphe qu'un diff au niveau
+fichier manque. C'est, de fait, un \emph{point d'arrêt sur l'attention d'un agent} :
+l'instant précis où la bonne information a quitté la fenêtre. Une pile de récupération
+opaque ne peut montrer que le contexte final, corrompu ; CCOS peut désigner l'étape
+--- et l'opération --- où cela a déraillé.
+
 Une pile RAG ou de framework mute son magasin de façon probabiliste au cours d'une
 session et ne conserve aucun journal de transitions canonique et rejouable, de sorte
 que la même question (\emph{pourquoi, et quand, la représentation s'est-elle

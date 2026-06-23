@@ -12,6 +12,17 @@ self-bounding, linearised context window a host can inject into its prompt, plus
 post-mortem debugger to rewind to exactly where the agent's attention went off the
 rails.
 
+**What's genuinely new.** Many systems page code into a context window; the
+distinctive contribution of CCOS is to treat the agent's **working memory itself**
+as a transactional subsystem — *deterministic, hash-chained, replayable bit-for-bit,
+and post-mortem debuggable*. To our knowledge it is the **first to make an agent's
+attention a "flight recorder"**: you can rewind to the exact step its representation
+of the project corrupted, replay that window under different parameters, and a
+`missing <node>` watchpoint names the **precise moment the real cause was evicted**
+from the budgeted window. (Every other axis — paging, causal graphs, frugal
+retrieval — has prior art; *this* deterministic, replayable, attention-level
+debugger is the part a probabilistic RAG/agent stack structurally lacks.)
+
 **What it is, honestly.** CCOS's measured advantage is **coverage of the right context,
 frugally**. When you work on a real source file, its causal recall puts that file's
 cross-file dependencies into a tight (2048-token) window **81–100 %** of the time, where

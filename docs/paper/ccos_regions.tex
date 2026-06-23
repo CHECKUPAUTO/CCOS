@@ -54,7 +54,11 @@ reproduces it --- but that regime does not occur on real code. The contribution 
 therefore \emph{not} better retrieval. It is the infrastructure a retrieval stack
 structurally lacks: a \emph{deterministic, replayable, auditable} agent memory in
 which one can rewind the exact context state at any step and replay it under
-different parameters (\emph{time-travel debugging}). We release the engine, the
+different parameters (\emph{time-travel debugging}). To our knowledge CCOS is the
+first system to treat an agent's \emph{working memory itself} as a transactional
+subsystem --- deterministic, hash-chained, replayable bit-for-bit, and
+\emph{post-mortem debuggable}: a flight recorder for attention, with a breakpoint
+on the exact step at which the right information was evicted from the window. We release the engine, the
 honest validation harness, and this paper, labelling throughout what is
 \emph{proven} (formal structure, determinism, replay), \emph{measured} (retrieval
 coverage --- where CCOS does \emph{not} beat lexical RAG on real bugs), and the one
@@ -104,7 +108,11 @@ recorded in a hash-chained event log, so the memory is not a black box but an
   recall) is logged; the exact context state at any step is reconstructible; and a
   recall can be \emph{replayed under different parameters} to ask whether the agent
   would have decided better --- the capability a probabilistic retrieval stack
-  structurally lacks.
+  structurally lacks. To our knowledge this is the first treatment of context
+  assembly \emph{itself} as a replayable, post-mortem-debuggable subsystem --- a
+  \emph{flight recorder for an agent's attention} --- with an \emph{eviction
+  watchpoint} that names the exact step and operation at which the true cause was
+  squeezed out of the budgeted window.
   \item An \textbf{honest validation harness and a negative result}
   (\S\ref{sec:protocol}): on $70$ real bug-fix commits, causal selection
   \emph{does not} beat a lexical TF-IDF retriever at placing a fix's files in the
@@ -294,7 +302,18 @@ query $q$ or token budget $b$, returning the window the agent \emph{would} have
 seen. When an agent emits a bad patch at step 15, an operator can replay its exact
 context at step 14, widen the budget or change the anchor, and observe whether the
 decision improves --- a closed-loop, reproducible debugger for an agent's working
-memory. A RAG or framework stack mutates its store probabilistically across a
+memory.
+
+\paragraph{A breakpoint on attention.} Replay also localises \emph{drift}. The
+\code{missing} watchpoint scans the timeline for the exact step at which a given
+node --- typically the true cause of a failure --- was squeezed out of the budgeted
+window by competing pressure, naming the triggering operation and the token gap;
+a complementary \code{energy} view surfaces the causal-heat migration through the
+graph that a file-level diff misses. It is, in effect, a \emph{breakpoint on an
+agent's attention}: the precise moment the right information left the window. An
+opaque retrieval stack can show only the final, corrupted context; CCOS can point
+to the step --- and the operation --- at which it went wrong. A RAG or framework
+stack mutates its store probabilistically across a
 session and keeps no canonical, replayable transition log, so the same question
 (\emph{why, and when, did the representation corrupt?}) has no answer there. We do
 not claim this improves task success; we claim it is a property the alternatives do
