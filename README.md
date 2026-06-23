@@ -215,6 +215,10 @@ hash-chained logs detect any mutation, reorder, insertion or deletion).
 - [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) — **bare-metal notes**: durable
   checkpoints, the Jetson reproducible-measurement script, and the honest triage of
   which low-level knobs actually matter for a <1%-of-the-loop kernel.
+- [`docs/COMPETITIVE.md`](docs/COMPETITIVE.md) — **honest competitive read**: what a
+  source-code reading of Headroom (the closest competitor) actually shows — where it is
+  stronger (compression, RAG memory) and the one axis it does not occupy (a replayable,
+  auditable, post-mortem-debuggable working memory).
 - [`docs/context_regions.md`](docs/context_regions.md), [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md),
   [`CONTRIBUTING.md`](CONTRIBUTING.md), [`CHANGELOG.md`](CHANGELOG.md),
   [`ROADMAP.md`](ROADMAP.md), [`docs/BIBLIOGRAPHY.md`](docs/BIBLIOGRAPHY.md).
