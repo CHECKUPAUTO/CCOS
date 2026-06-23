@@ -175,6 +175,43 @@ only `serde_json` (already a CCOS dep) and std. The SCIRUST counterparts the
 algorithms were distilled from live in `scirust-nlp-advanced`
 (`bloom`, `lsh`, `trie`, `huffman`, `similarity`, `keyword`).
 
+### 6. Input hardening — deterministic de-obfuscation + an injection signal
+
+The context an agent reads is an attack surface. CCOS de-obfuscates ingested
+text **at the boundary**, deterministically and auditably — the same axis as the
+rest of the system, applied to security.
+
+- **Unicode de-obfuscation (`src/sanitizer.rs`).** Hidden-character attacks that
+  a human reviewer cannot see but a model still tokenises are **surfaced as
+  explicit visible literals** (`[U+202E RLO]`, `[U+200B ZWSP]`,
+  `[U+E0048 TAG:H]`) rather than silently stripped: **Trojan-Source** bidi
+  overrides (CVE-2021-42574), zero-width formatting, **Unicode-Tags ASCII
+  smuggling** (decoded back to the ASCII it shadows), and raw controls. This
+  closes the hidden-character class *completely* — the category-**Cf** vectors
+  that `guard.rs`'s output-side `is_control()` strip is blind to. It runs
+  default-on in `ingest_source` (clean source is borrowed unchanged, zero copy);
+  findings ride back in `IngestReport.anomalies` and the event-log hash is taken
+  over the cleaned form, so **replay reproduces the de-obfuscated state**.
+- **Injection *signal* (`src/hashing_tokenizer.rs` + `src/injection_classifier.rs`).**
+  A deterministic feature-hashing tokenizer → a linear log-space
+  (multinomial-Naive-Bayes) score `W·X + b`, with weights **locked into an
+  immutable, SHA-256-verified blob** and a **forensic** per-feature
+  decomposition of every decision. Held-out red-team
+  (`cargo run --example injection_redteam`): **precision 0.868, recall 0.933,
+  F1 0.900**. We label it a *signal, not a shield* — and the forensic output
+  shows exactly why (false positives on benign trigger-word mentions; false
+  negatives on novel paraphrase, the structural blind spot of any
+  bag-of-features model). No character pass — and no bag-of-words model — solves
+  prompt injection; privilege separation in the host remains the real mitigation.
+
+```bash
+ccos sanitize path/to/file.rs            # de-obfuscate + score (human / --json)
+ccos sanitize --strict path/to/file.rs   # non-zero exit on danger (CI / pre-commit)
+```
+
+See [`docs/SECURITY.md`](docs/SECURITY.md) for the full threat model and the
+honest scope (what it does *not* cover: homoglyphs, semantic paraphrase).
+
 ## Quickstart — give your agent a memory
 
 ```bash
@@ -275,6 +312,9 @@ hash-chained logs detect any mutation, reorder, insertion or deletion).
 - [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) — **bare-metal notes**: durable
   checkpoints, the Jetson reproducible-measurement script, and the honest triage of
   which low-level knobs actually matter for a <1%-of-the-loop kernel.
+- [`docs/SECURITY.md`](docs/SECURITY.md) — **input hardening**: the deterministic
+  Unicode de-obfuscation pass and the injection *signal*, with the threat model
+  and the honest scope (and the measured red-team numbers).
 - [`docs/COMPETITIVE.md`](docs/COMPETITIVE.md) — **honest competitive read**: what a
   source-code reading of Headroom (the closest competitor) actually shows — where it is
   stronger (compression, RAG memory) and the one axis it does not occupy (a replayable,

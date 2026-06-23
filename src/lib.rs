@@ -23,6 +23,15 @@
 //!   retries and a deterministic offline fallback.
 //! - [`guard`] — validation/sanitization layer that rejects malformed model
 //!   output and substitutes a safe, valid-JSON fallback.
+//! - [`sanitizer`] — deterministic Unicode de-obfuscation of ingested text:
+//!   surfaces hidden-character injection vectors (Trojan-Source bidi overrides,
+//!   zero-width formatting, Unicode-Tags ASCII smuggling) as explicit, auditable
+//!   literals rather than silently stripping them.
+//! - [`hashing_tokenizer`] — vocabulary-free, fixed-size, deterministic feature
+//!   hashing (the "hashing trick") turning text into the vector `X`.
+//! - [`injection_classifier`] — a linear log-space (multinomial-Naive-Bayes)
+//!   *signal* over `X` with an immutable SHA-256-verified weight blob and a
+//!   forensic, per-feature explanation of every score.
 //! - [`consensus`] — majority and confidence-weighted multi-model voting.
 //! - [`adversarial`] — fault injector (JSON corruption, hallucination, prompt
 //!   injection, timeouts) used to harden the guard and the graph.
@@ -70,7 +79,9 @@ pub mod event_log;
 pub mod eviction_policy;
 pub mod external_memory;
 pub mod guard;
+pub mod hashing_tokenizer;
 pub mod incremental;
+pub mod injection_classifier;
 #[cfg(feature = "llm")]
 pub mod llm;
 pub mod mcp;
@@ -79,6 +90,7 @@ pub mod parser;
 pub mod persist;
 pub mod postmortem;
 pub mod query;
+pub mod sanitizer;
 pub mod trace;
 pub mod util;
 

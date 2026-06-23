@@ -312,6 +312,27 @@ chaîné par hachage et à l'épreuve de la falsification, si bien que l'histori
 régions est auditable, et un test de 10\,000 cycles n'exhibe aucune dérive du nombre
 de régions ni des températures.
 
+\paragraph{Une frontière d'entrée auditable.} Le même substrat déterministe et
+rejouable durcit le texte qu'un agent ingère. Les vecteurs d'injection par
+caractères cachés --- surcharges bidirectionnelles (l'attaque \emph{Trojan
+Source}, CVE-2021-42574), formatage de largeur nulle, et le bloc Unicode
+\emph{Tags} servant à la contrebande d'ASCII invisible --- sont dé-obfusqués à
+l'ingestion en littéraux explicites et visibles (\code{[U+202E RLO]}) plutôt que
+silencieusement supprimés, et les \emph{findings} sont consignés dans le même
+journal chaîné par hachage, de sorte qu'un rejeu reproduit l'état nettoyé. Un
+classifieur linéaire en log-espace en aval --- la forme close du Naïve Bayes
+multinomial, $\mathrm{logit}=b+W\!\cdot\!X$ sur un vecteur de caractéristiques
+par \emph{hashing trick}, ses poids verrouillés dans un blob vérifié par somme de
+contrôle --- ajoute un signal d'injection \emph{déterministe et décomposable
+forensiquement} (un red-team en données réservées mesure $F_1=0{,}90$ ; précision
+$0{,}87$, rappel $0{,}93$). Nous l'affirmons délibérément : c'est un \emph{signal,
+pas une solution} --- un modèle sac-de-caractéristiques est contourné par
+paraphrase, et aucune passe au niveau caractère ne traite l'injection sémantique ;
+la vraie mitigation est la séparation des privilèges dans l'hôte. La contribution
+n'est pas un détecteur inédit, mais que la dé-obfuscation et le score héritent de
+la propriété distinctive de CCOS : toute décision de sécurité est reproductible et
+auditable jusqu'à la caractéristique exacte qui l'a fait basculer.
+
 \section{Sessions event-sourced et débogage par voyage dans le temps}\label{sec:timetravel}
 
 Le déterminisme n'est pas seulement une propriété de correction ; il est le fondement

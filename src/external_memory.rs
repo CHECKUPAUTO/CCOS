@@ -65,6 +65,7 @@ use crate::incremental::IncrementalGraphEngine;
 use crate::memory::{GraphNode, MemoryGraph, NodeId};
 use crate::query::{self, Reached};
 use crate::region_engine::ContextRegionEngine;
+use crate::sanitizer::{self, Finding};
 use crate::util::sha256_hex;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -182,6 +183,11 @@ pub struct IngestReport {
     pub nodes_removed: usize,
     /// Edges added by this delta.
     pub edges_added: usize,
+    /// Hidden-character anomalies de-obfuscated out of the source on the way in
+    /// (Trojan-Source bidi overrides, zero-width formatting, Unicode-Tags ASCII
+    /// smuggling, raw controls). Empty for clean source — the common case.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub anomalies: Vec<Finding>,
 }
 
 /// Integrity status of the memory's hash-chained logs.
@@ -508,7 +514,10 @@ impl CcosMemory {
     /// workspace and re-parse only the files that actually changed.
     pub fn file_unchanged(&self, uri: &str, source: &str) -> bool {
         let uri = uri.strip_prefix("file:").unwrap_or(uri);
-        self.sources.get(&format!("file:{uri}")).map(String::as_str) == Some(source)
+        // Compare against the de-obfuscated form we actually store, so a file
+        // carrying hidden characters does not look "changed" on every re-scan.
+        let (clean, _) = sanitizer::defang(source);
+        self.sources.get(&format!("file:{uri}")).map(String::as_str) == Some(clean.as_ref())
     }
 
     fn write_to(&self, p: &Path) -> Result<(), MemoryError> {
@@ -799,6 +808,14 @@ impl ExternalMemory for CcosMemory {
         // copies a node id back from `recall`, which returns `file:<path>`); without
         // this, `ingest("file:src/a.rs")` would double-prefix to `file:file:src/a.rs`.
         let uri = uri.strip_prefix("file:").unwrap_or(uri);
+        // De-obfuscate at the boundary: hidden-character injection vectors are
+        // surfaced as explicit, visible literals *before* anything is parsed,
+        // stored, hashed or paged — so the agent never sees an invisible
+        // instruction, the freshness/dedup hashes are computed over the clean
+        // form, and replay reproduces the de-obfuscated state. Clean source (the
+        // overwhelming common case) is borrowed unchanged: zero copy.
+        let (clean, scan) = sanitizer::defang(source);
+        let source = clean.as_ref();
         let file_key = format!("file:{uri}");
         let prev = self.sources.get(&file_key).cloned();
         let delta = self
@@ -826,6 +843,7 @@ impl ExternalMemory for CcosMemory {
             nodes_added: delta.nodes_added,
             nodes_removed: delta.nodes_removed,
             edges_added: delta.edges_added + cross_edges,
+            anomalies: scan.findings,
         }
     }
 
