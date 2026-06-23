@@ -2120,6 +2120,7 @@ mod tests {
             score,
             kind: "Module".to_string(),
             content: content.to_string(),
+            ccr_ref: None,
         };
         let window = RecallWindow {
             strategy: "region".to_string(),

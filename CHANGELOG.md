@@ -6,6 +6,74 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Reversible context compression pipeline** (`compressor` module) — the real
+  *compression* pass CCOS historically lacked, sitting downstream of the causal
+  MMU's selection so the graph, the scoring, the paging and the hash-chain
+  replay are untouched. Three deterministic compressors: `CausalCrusher`
+  (columnar JSON collapse + null-drop + string back-refs), `CausalAST`
+  (skeletonizes code — strips comments / blank lines / `use` imports, collapses
+  long signature runs, renames `_`-temporaries to `$n`), `CausalSumm` (TextRank
+  extractive summary **biased by the causal score**). No ML model, no
+  stochastic step: everything is seed-stable and total-order tie-broken, so
+  the replay / `postmortem` invariants hold. Measured on this repo's source:
+  30–50 % token reduction on real Rust code (run `cargo run --example
+  bench_compress --release`). Zero new dependencies.
+- **CCR store + `ccos_retrieve` MCP tool** — every compressed item carries a
+  12-char `ccr_ref` (truncated SHA-256 of the original); the host LLM calls
+  `ccos_retrieve` to fetch the full text on demand (the CCOS equivalent of
+  headroom's `headroom_retrieve`). Nothing is ever lost. `RecallItem` gains an
+  optional `ccr_ref` field (serde-skipped when absent, so old snapshots still
+  load).
+- **Cross-item near-duplicate suppression** — a distilled MinHash (64 hashes,
+  3-char shingles, FNV-1a + double-hashing, seed-stable) estimates Jaccard
+  similarity over the *compressed* forms within a window; near-dup items are
+  replaced by `// ~dup of <uri>` (their original stays retrievable). The causal
+  graph dedups cross-file; this dedups *within* a window.
+- **Budget feedback loop** (`CcosMemory::recall_compressed_with_feedback` /
+  `AgentSession::recall_compressed_with_feedback`) — when compression shrinks
+  the window below the token budget, the freed space is *re-spent* on more
+  causal nodes (a second recall pass with a grown effective budget), so the
+  host gets strictly more causal signal at the same emitted-token cost.
+  Monotonic and bounded (max 3 rounds); stops at convergence. Measured: +11
+  causal nodes on a 4096-token task recall vs a single compressed pass, while
+  staying under budget.
+- **`CausalAST` v2 knobs** — `enable_ast_v2` drops pure `use` lines (the causal
+  graph already encodes the dependency) and `ast_signature_collapse_after`
+  collapses a run of >N one-line `fn` signatures into the first N + `// (+M
+  more signatures)`. `pub use` re-exports are kept.
+- **Auto-tuner** (`CausalCompressor::auto_tune`) — deterministic coordinate
+  descent over the config knobs (dedup threshold/on, AST v2/collapse, summary
+  length, prose on, min-chars) to minimise the compressed-token count on a
+  representative sample. `eval_config` is public for external benchmarks.
+- **`ccos://session/context` compressed by default** — the resource now runs
+  through `recall_compressed` unless `CCOS_COMPRESS_CONTEXT=0` (A/B escape
+  hatch). The linearised form appends `// ccr_ref=… (call ccos_retrieve for
+  full)` so the host knows the handle.
+- **SCIRUST counterparts** — the algorithms were distilled from
+  `scirust-nlp-advanced`, which gains four new modules: `bloom` (Bloom filter),
+  `lsh` (MinHash-LSH band-and-bucket), `trie` (byte-radix shared-prefix
+  compaction), `huffman` (canonical reversible entropy coding).
+- **Causal embeddings** (`embeddings` module) — a zero-dependency TF-IDF
+  embedder with a hashed vocabulary (128-dim default) whose vectors are
+  **INT4-quantized** (distilled from SCIRUST's `elastic_kv_cache.rs` SLHAv2
+  scheme: grouped absmax symmetric INT4, cosine error < 0.01). The
+  [`CausalEmbeddings`] store is ~4× smaller than `f32` and powers a
+  [`CcosMemory::semantic_entry`] for `Recall::Task` that down-weights
+  ubiquitous tokens via IDF (catches "connection pool" → `db.rs` where a
+  raw lexical overlap is distracted by the ubiquitous `fn`). Deterministic:
+  the hashed vocab + `BTreeMap` store serialize bit-stable.
+- **RL eviction policy** (`eviction_policy` module) — a tabular Q-learning
+  agent (distilled from SCIRUST's `scirust-rl-algo::TabularQLearner`) that
+  learns when to evict a node from the paging window based on a 4-bucket
+  state (score / recency / failure-pressure / size). 162 cells max, serializes
+  as a `BTreeMap`, bit-reproducible. **Advisory**: [`should_evict`] returns
+  `false` when untrained, so the deterministic greedy stays the authority
+  until the policy has learned a preference — turning it on is never worse
+  than the status quo. Training is offline (`fit` over a replayed timeline
+  with reward shaping for keep/evict decisions).
+
 ### Changed
 
 - **Repositioned, honestly.** Measurements refute "causal regions retrieve better

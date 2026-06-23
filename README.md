@@ -93,10 +93,12 @@ measurements behind the numbers above are in
 ### 3. Standard MCP transport
 
 - **Stdio JSON-RPC server.** Native, synchronous, zero-network integration with any
-  MCP-compatible host (e.g. Claude Code). Eight tools: `ingest`, `recall`,
-  `signal_failure`, `page_fault`, `stats`, `verify`, `timeline`, `recall_what_if`.
+  MCP-compatible host (e.g. Claude Code). Nine tools: `ingest`, `recall`,
+  `signal_failure`, `page_fault`, `stats`, `verify`, `timeline`, `recall_what_if`,
+  `ccos_retrieve` (fetch the original of a compressed item).
 - **Dynamic resources.** `ccos://session/context` exposes the self-bounding working
-  set for the host to drop into its system prompt; `ccos://session/timeline` exposes
+  set, **reversibly compressed** by default (`CCOS_COMPRESS_CONTEXT=0` to disable for
+  A/B), for the host to drop into its system prompt; `ccos://session/timeline` exposes
   the cognitive journal.
 
 ### 4. Post-mortem debugging (`ccos postmortem`)
@@ -114,6 +116,64 @@ measurements behind the numbers above are in
   record (stats / integrity / timeline / working set) for archiving or fleet
   collection (`scripts/fleet_collect.sh`); a copied workspace replays bit-for-bit
   off-site. See [`docs/SELF_ANALYSIS.md`](docs/SELF_ANALYSIS.md).
+
+### 5. Reversible context compression (the CCOS ↔ headroom angle)
+
+CCOS historically *selected* the right nodes but never *re-encoded* their content
+— it paged a header or a symbol span verbatim into the prompt. The compressor
+module (`src/compressor.rs`) adds a real compression pass **downstream of the
+causal MMU**, without sacrificing the determinism / replay / auditability
+guarantees:
+
+- **Three deterministic compressors.** [`CausalCrusher`] collapses JSON
+  (columnar arrays, null-drop, string back-refs); [`CausalAST`] skeletonizes
+  code (strips comments / blank lines / `use` imports, collapses long
+  signature runs, renames `_`-temporaries to `$n`); [`CausalSumm`] is a
+  TextRank extractive summarizer **biased by the causal score** so sentences
+  touching high-pressure nodes surface first — the angle headroom's TextRank
+  lacks. No ML model, no stochastic step: everything is seed-stable and
+  total-order tie-broken, so the hash-chain replay and the `postmortem`
+  time-travel debugger remain bit-reproducible.
+- **Reversibility (CCR store).** Every compressed item carries a 12-char
+  `ccr_ref` (a truncated SHA-256 of the original); the host LLM calls the
+  `ccos_retrieve` MCP tool to fetch the full text on demand — the CCOS
+  equivalent of headroom's `headroom_retrieve`. Nothing is ever lost.
+- **Cross-item near-duplicate suppression.** A distilled MinHash (64 hashes,
+  3-char shingles) estimates Jaccard similarity over the *compressed* forms;
+  near-dup items are replaced by a one-line `// ~dup of <uri>` placeholder
+  (their original stays retrievable). The causal graph dedups cross-file; this
+  dedups *within* a window.
+- **Budget feedback loop** — CCOS's unique advantage over a pure compressor:
+  when compression shrinks the window below the token budget, the freed space
+  is *re-spent* on more causal nodes (a second recall pass with a grown
+  effective budget), so the host gets **strictly more causal signal at the
+  same emitted-token cost**. Measured on this repo's source: at a 4096-token
+  budget the loop recalls **+11 causal nodes** vs a single compressed pass,
+  while staying under budget.
+- **Auto-tuner.** `CausalCompressor::auto_tune(sample)` runs a deterministic
+  coordinate-descent over the knobs (dedup threshold, AST v2 on/off, signature
+  collapse point, summary length, min-chars) to minimise the compressed-token
+  count on a representative sample — bootstrap the config on a new corpus
+  without hand-tuning.
+
+**Measured on this repo's own source** (33 Rust files, ~600 KB; run
+`cargo run --example bench_compress --release`):
+
+| recall                | budget | raw tokens | compressed | reduction | shrink |
+| --------------------- | -----: | ---------: | ---------: | --------: | -----: |
+| working_set           |   2048 |        891 |        599 |      33 % | 1.51×  |
+| working_set           |   8192 |       7659 |       3865 |      49 % | 1.95×  |
+| around parser         |   4096 |       4111 |       2884 |      30 % | 1.43×  |
+| around external_mem   |   8192 |       8213 |       5602 |      32 % | 1.47×  |
+
+CausalAST alone delivers 30–50 % on real Rust code — the deterministic floor
+of headroom's 47–92 % range (headroom's upper band comes from its trained
+`Kompress-base` model, which CCOS does not ship by choice: it would break the
+deterministic-replay invariant). The budget feedback loop then *adds* causal
+nodes on top of the compression gain. Zero new dependencies; the module reuses
+only `serde_json` (already a CCOS dep) and std. The SCIRUST counterparts the
+algorithms were distilled from live in `scirust-nlp-advanced`
+(`bloom`, `lsh`, `trie`, `huffman`, `similarity`, `keyword`).
 
 ## Quickstart — give your agent a memory
 
