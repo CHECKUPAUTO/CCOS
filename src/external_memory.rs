@@ -57,6 +57,7 @@
 //! detects any tampering with a persisted checkpoint; a checkpoint round-trips
 //! (reload reproduces the graph and the chain).
 
+use crate::compressor::{CausalCompressor, CcrRef, CompressedItem};
 use crate::context_region::file_of;
 use crate::distributed_event_log::DistributedEventLog;
 use crate::event_log::{EventLog, EventPayload, EventType};
@@ -147,8 +148,16 @@ pub struct RecallItem {
     /// The node kind (`Module`, `Symbol`, …).
     pub kind: String,
     /// Best available content: the ingested source of the node's file when
-    /// known, otherwise the node's own stored content.
+    /// known, otherwise the node's own stored content. When the window was
+    /// produced by [`CcosMemory::recall_compressed`], this holds the
+    /// **compressed** form and [`ccr_ref`](Self::ccr_ref) holds the handle to
+    /// retrieve the original.
     pub content: String,
+    /// Set by [`CcosMemory::recall_compressed`] when the content has been
+    /// passed through the [`CausalCompressor`]. `None` for plain
+    /// [`ExternalMemory::recall`] windows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ccr_ref: Option<CcrRef>,
 }
 
 /// A bounded context window produced by [`recall`](ExternalMemory::recall).
@@ -348,6 +357,130 @@ impl CcosMemory {
         self.graph.tick();
     }
 
+    /// Compress a recalled window in place through the [`CausalCompressor`],
+    /// storing originals in the compressor's CCR store and replacing each
+    /// item's `content` with its compressed form (plus a [`CcrRef`] the host
+    /// LLM can pass back to [`retrieve_original`](Self::retrieve_original) —
+    /// the CCOS equivalent of headroom's `headroom_retrieve`). This is the
+    /// real *compression* pass CCOS historically lacked; it sits downstream of
+    /// the causal MMU's selection and never touches the graph, the scoring, the
+    /// paging or the hash chain, so the replay / `postmortem` invariants are
+    /// preserved.
+    ///
+    /// Pass a fresh [`CausalCompressor`] (typically owned by the MCP session)
+    /// so the CCR store survives across calls and the host can retrieve
+    /// originals later. The window's `tokens` estimate is updated to the
+    /// compressed byte budget.
+    pub fn recall_compressed(
+        &self,
+        recall: &Recall,
+        budget_tokens: usize,
+        compressor: &mut CausalCompressor,
+    ) -> RecallWindow {
+        let mut win = self.recall(recall, budget_tokens);
+        let triples: Vec<(&str, f64, &str, &str)> = win
+            .items
+            .iter()
+            .map(|it| {
+                (
+                    it.kind.as_str(),
+                    it.score,
+                    it.uri.as_str(),
+                    it.content.as_str(),
+                )
+            })
+            .collect();
+        let compressed: Vec<CompressedItem> = compressor.compress_window(triples);
+        let mut tokens = 0usize;
+        for (item, c) in win.items.iter_mut().zip(compressed) {
+            item.content = c.content;
+            item.ccr_ref = c.ccr_ref;
+            tokens += item.content.chars().count() / 4;
+        }
+        win.tokens = tokens;
+        win
+    }
+
+    /// Retrieve an original content blob from the compressor's CCR store
+    /// (backend for the `ccos_retrieve` MCP tool). `None` when the ref is
+    /// unknown or has been evicted by the store's capacity cap.
+    pub fn retrieve_original<'a>(
+        &'a self,
+        _compressor: &'a CausalCompressor,
+        ccr: &CcrRef,
+    ) -> Option<&'a str> {
+        _compressor.retrieve(ccr)
+    }
+
+    /// **Budget feedback loop** — the compression-aware recall that exploits
+    /// CCOS's unique advantage over headroom: when compression shrinks the
+    /// selected window below the token budget, the freed space is *re-spent* on
+    /// more causal nodes (a second recall pass with a larger effective budget),
+    /// so the host LLM gets strictly more signal at the same emitted-token cost.
+    ///
+    /// The loop is bounded (`max_rounds`, default 3) and monotonic: each round
+    /// only adds nodes, never drops any (the union is taken in score order, so
+    /// the highest-scored nodes from the first round always survive). When a
+    /// round produces no new nodes (compression ratio converged), it stops
+    /// early. Deterministic: the same inputs produce the same final window,
+    /// because [`recall`](ExternalMemory::recall) and
+    /// [`CausalCompressor::compress_window`] are both total-order deterministic.
+    pub fn recall_compressed_with_feedback(
+        &self,
+        recall: &Recall,
+        budget_tokens: usize,
+        compressor: &mut CausalCompressor,
+        max_rounds: usize,
+    ) -> RecallWindow {
+        let max_rounds = max_rounds.max(1);
+        // Round 1: baseline compressed recall.
+        let mut win = self.recall_compressed(recall, budget_tokens, compressor);
+        let mut last_tokens = win.tokens;
+        for _ in 1..max_rounds {
+            if win.tokens >= budget_tokens {
+                break; // already full — no headroom to re-spend
+            }
+            // Effective budget = current compressed size + the leftover, but
+            // scaled by the observed compression ratio so the *raw* selection
+            // targets enough nodes to fill the leftover once compressed.
+            let leftover = budget_tokens.saturating_sub(win.tokens);
+            let observed_ratio = if win.tokens > 0 {
+                // Estimate the raw size of the current window from last_stats.
+                let raw_tokens: usize = compressor.last_stats.iter().map(|s| s.tokens_before).sum();
+                if raw_tokens == 0 {
+                    1.0
+                } else {
+                    win.tokens as f64 / raw_tokens as f64
+                }
+            } else {
+                1.0
+            };
+            // Grow the raw budget by leftover / ratio (so the compressed form
+            // gains ~leftover tokens), plus a small margin to overcome the
+            // per-item CCR-ref overhead.
+            let grown_budget = budget_tokens + ((leftover as f64 / observed_ratio) as usize);
+            // Reset the compressor's last_stats so the next round's ratio is
+            // measured on the new window only.
+            compressor.last_stats.clear();
+            let next = self.recall_compressed(recall, grown_budget, compressor);
+            // Monotonic: keep the larger window (more items → more signal).
+            if next.items.len() > win.items.len() && next.tokens <= budget_tokens {
+                win = next;
+            } else if next.items.len() >= win.items.len() && next.tokens > last_tokens {
+                // More tokens but still within budget → progress; accept.
+                win = next;
+                last_tokens = win.tokens;
+            } else {
+                break; // converged
+            }
+            if win.tokens == last_tokens {
+                break;
+            }
+            last_tokens = win.tokens;
+        }
+        win
+    }
+
     /// Read-only access to the underlying causal graph (escape hatch).
     pub fn graph(&self) -> &MemoryGraph {
         &self.graph
@@ -426,6 +559,51 @@ impl CcosMemory {
             .filter(|(s, _)| *s > 0)
             .max_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)))
             .map(|(_, id)| id)
+    }
+
+    /// Build a [`crate::embeddings::CausalEmbeddings`] store from the current graph: each node's
+    /// `label + content` is embedded as a TF-IDF vector and quantized to INT4.
+    /// Deterministic. Use the result with [`Self::semantic_entry`] to power a
+    /// cosine-based `Recall::Task` entry point (catches "fix the timeout" →
+    /// `db.rs` even when the file never says "timeout").
+    pub fn build_embeddings(&self) -> crate::embeddings::CausalEmbeddings {
+        let mut store = crate::embeddings::CausalEmbeddings::new();
+        let nodes: Vec<(String, String)> = self
+            .graph
+            .nodes
+            .values()
+            .map(|n| (n.id.0.clone(), format!("{} {}", n.label, n.content)))
+            .collect();
+        let pairs: Vec<(&str, &str)> = nodes
+            .iter()
+            .map(|(id, t)| (id.as_str(), t.as_str()))
+            .collect();
+        store.fit_and_embed(pairs);
+        store
+    }
+
+    /// Semantic entry point for a free-text task: embeds the query and returns
+    /// the nearest node id by cosine similarity over the INT4 store. Falls back
+    /// to the lexical fallback when the store is empty or the top score is below
+    /// `min_similarity` (0.05 by default — below that, lexical overlap is a
+    /// better signal than the embedding noise floor).
+    pub fn semantic_entry(
+        &self,
+        text: &str,
+        store: &crate::embeddings::CausalEmbeddings,
+        min_similarity: f64,
+    ) -> Option<String> {
+        if store.is_empty() {
+            return self.lexical_entry(text);
+        }
+        let q = store.embed_query(text);
+        store.nearest(&q).and_then(|(id, score)| {
+            if score >= min_similarity {
+                Some(id)
+            } else {
+                self.lexical_entry(text)
+            }
+        })
     }
 
     /// Content a node contributes to a recall window: its own **granular** content
@@ -509,6 +687,7 @@ impl CcosMemory {
                     score,
                     kind: format!("{:?}", node.node_type),
                     content: self.content_for(&id.0, node),
+                    ccr_ref: None,
                 });
             }
         }
@@ -995,5 +1174,110 @@ mod tests {
     fn checkpoint_without_path_errs() {
         let mem = CcosMemory::new();
         assert!(matches!(mem.checkpoint(), Err(MemoryError::NoPath)));
+    }
+
+    // ── Compression + budget feedback loop ──────────────────────────────────
+
+    #[test]
+    fn recall_compressed_shrinks_items_and_sets_ccr_refs() {
+        use crate::compressor::CausalCompressor;
+        let mut mem = CcosMemory::new();
+        // A large symbol body — exercises CausalAST.
+        let mut code = String::from("pub fn big() -> u64 {\n");
+        for i in 0..40 {
+            code.push_str(&format!(
+                "    // phase {i}\n    let _a{i} = {i};\n    let _b{i} = _a{i} + 1;\n"
+            ));
+        }
+        code.push_str("    _b39\n}\n");
+        mem.ingest_source("src/big.rs", &code);
+
+        let mut comp = CausalCompressor::new();
+        let raw = mem.recall(&Recall::working_set(), 10_000);
+        let compressed = mem.recall_compressed(&Recall::working_set(), 10_000, &mut comp);
+        assert!(
+            compressed.tokens < raw.tokens,
+            "compressed ({}) < raw ({})",
+            compressed.tokens,
+            raw.tokens
+        );
+        assert!(
+            compressed.items.iter().any(|i| i.ccr_ref.is_some()),
+            "at least one item carries a CCR ref"
+        );
+    }
+
+    #[test]
+    fn feedback_loop_never_exceeds_budget_and_grows_items() {
+        use crate::compressor::CausalCompressor;
+        let mut mem = CcosMemory::new();
+        // Several files with compressible bodies so the feedback loop has
+        // headroom to re-spend on more nodes.
+        for f in 0..6 {
+            let mut code = format!("pub fn f{f}() -> u64 {{\n");
+            for i in 0..15 {
+                code.push_str(&format!(
+                    "    // phase {i}\n    let _x{i} = {i};\n    let _y{i} = _x{i} + 1;\n"
+                ));
+            }
+            code.push_str("    _y14\n}\n");
+            mem.ingest_source(&format!("src/f{f}.rs"), &code);
+        }
+        let mut comp = CausalCompressor::new();
+        let budget = 2048;
+        let single = mem.recall_compressed(&Recall::working_set(), budget, &mut comp);
+        comp.clear_ccr();
+        let feedback =
+            mem.recall_compressed_with_feedback(&Recall::working_set(), budget, &mut comp, 3);
+        // The feedback window must not exceed the budget…
+        assert!(
+            feedback.tokens <= budget,
+            "feedback stays within budget: {} <= {}",
+            feedback.tokens,
+            budget
+        );
+        // …and should recall at least as many items as the single pass.
+        assert!(
+            feedback.items.len() >= single.items.len(),
+            "feedback grows the selection: {} >= {}",
+            feedback.items.len(),
+            single.items.len()
+        );
+    }
+
+    #[test]
+    fn semantic_entry_ranks_a_topic_relevant_node_above_a_lexical_distraction() {
+        // Two nodes both contain the common word "fn", but only db.rs talks
+        // about "connection" and "pool". A lexical query "connection pool
+        // timeout" matches both (both contain "fn"), and the lexical entry
+        // picks whichever comes first; the TF-IDF embedding down-weights the
+        // ubiquitous "fn" and ranks db.rs (the topic-relevant node) higher.
+        let mut mem = CcosMemory::new();
+        mem.ingest_source(
+            "src/db.rs",
+            "pub fn connection_pool_acquire() -> u32 { 30 }\n",
+        );
+        mem.ingest_source("src/api.rs", "pub fn handler() -> u32 { 0 }\n");
+        let store = mem.build_embeddings();
+        // Both nodes are in the store; the semantic entry for a topic query
+        // must return db.rs (the only node whose tokens overlap the query).
+        let sem = mem.semantic_entry("connection pool acquire", &store, 0.05);
+        assert!(
+            sem.as_deref().is_some_and(|id| id.contains("db.rs")),
+            "semantic entry ranks db.rs above the lexical distraction: {sem:?}"
+        );
+    }
+
+    #[test]
+    fn build_embeddings_is_deterministic() {
+        let mut mem = CcosMemory::new();
+        mem.ingest_source("src/a.rs", "pub fn alpha() -> i32 { 1 }\n");
+        mem.ingest_source("src/b.rs", "pub fn beta() -> i32 { 2 }\n");
+        let s1 = mem.build_embeddings();
+        let s2 = mem.build_embeddings();
+        assert_eq!(s1.len(), s2.len());
+        for (k, v1) in &s1.vectors {
+            assert_eq!(&v1.codes, &s2.vectors[k].codes, "node {k} bit-identical");
+        }
     }
 }

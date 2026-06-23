@@ -18,6 +18,7 @@
 //! Point your MCP client's stdio transport at it.
 
 use crate::agent_session::AgentSession;
+use crate::compressor::CcrRef;
 use crate::external_memory::{ExternalMemory, Recall, RecallWindow};
 use serde_json::{json, Value};
 
@@ -104,6 +105,17 @@ fn tool_specs() -> Value {
                     "budget": {"type": "integer"}
                 },
                 "required": ["step"]
+            }
+        },
+        {
+            "name": "ccos_retrieve",
+            "description": "Retrieve the original (uncompressed) content of a previously-compressed context item. Pass the `ccr_ref` string returned alongside a compressed recall / context resource. Returns the full original text so the LLM can drill into a skeleton or summary CCOS emitted in its place.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "ccr_ref": {"type": "string", "description": "the 12-char hex ref returned with a compressed item"}
+                },
+                "required": ["ccr_ref"]
             }
         }
     ])
@@ -198,13 +210,37 @@ fn call_tool(session: &mut AgentSession, params: &Value) -> Result<Value, (i64, 
             let window = session.recall_what_if(step, &recall_from_args(&args), budget);
             serde_json::to_string(&window).unwrap_or_default()
         }
+        "ccos_retrieve" => {
+            let key = str_arg(&args, "ccr_ref");
+            if key.is_empty() {
+                return Err((-32602, "ccos_retrieve requires 'ccr_ref'".into()));
+            }
+            match session.retrieve_original(&CcrRef(key.clone())) {
+                Some(original) => {
+                    return Ok(json!({
+                        "content": [{ "type": "text", "text": original }],
+                        "ccr_ref": key,
+                        "bytes": original.len()
+                    }))
+                }
+                None => {
+                    return Ok(json!({
+                        "content": [{ "type": "text",
+                            "text": "ccr_ref not found (evicted or unknown)" }],
+                        "isError": true
+                    }))
+                }
+            }
+        }
         other => return Err((-32602, format!("unknown tool: {other}"))),
     };
     Ok(content(text))
 }
 
 /// Linearise a recalled window into a single text blob a host can drop straight
-/// into a system prompt (the auto-calibrated context chain).
+/// into a system prompt (the auto-calibrated context chain). When items carry a
+/// [`CcrRef`] (produced by [`AgentSession::recall_compressed`]), the ref is
+/// appended so the LLM knows it can call `ccos_retrieve` for the full original.
 fn linearize_window(win: &RecallWindow, plain: bool) -> String {
     // Plain mode emits ordinary multi-file source (`// path` + code), dropping the
     // `[kind score]` annotations. A weak model (≤~3B) misreads a `// sym:…` header as code
@@ -215,6 +251,12 @@ fn linearize_window(win: &RecallWindow, plain: bool) -> String {
         for it in &win.items {
             let path = it.uri.split(':').nth(1).unwrap_or(&it.uri);
             out.push_str(&format!("// {path}\n{}\n\n", it.content));
+            if let Some(r) = &it.ccr_ref {
+                out.push_str(&format!(
+                    "// ccr_ref={} (call ccos_retrieve for full)\n\n",
+                    r.0
+                ));
+            }
         }
         return out;
     }
@@ -229,12 +271,18 @@ fn linearize_window(win: &RecallWindow, plain: bool) -> String {
             "\n// {} [{}] score={:.3}\n{}\n",
             it.uri, it.kind, it.score, it.content
         ));
+        if let Some(r) = &it.ccr_ref {
+            out.push_str(&format!(
+                "// ccr_ref={} (call ccos_retrieve for full)\n",
+                r.0
+            ));
+        }
     }
     out
 }
 
 /// Execute a `resources/read`.
-fn read_resource(session: &AgentSession, params: &Value) -> Result<Value, (i64, String)> {
+fn read_resource(session: &mut AgentSession, params: &Value) -> Result<Value, (i64, String)> {
     let uri = params.get("uri").and_then(Value::as_str).unwrap_or("");
     let text = match uri {
         "ccos://session/context" => {
@@ -243,14 +291,26 @@ fn read_resource(session: &AgentSession, params: &Value) -> Result<Value, (i64, 
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(2048usize);
+            // Compression is on by default; set CCOS_COMPRESS_CONTEXT=0 to get
+            // the historical raw (uncompressed) context for A/B comparison.
+            let compress = std::env::var("CCOS_COMPRESS_CONTEXT")
+                .ok()
+                .map(|v| v != "0" && v != "false")
+                .unwrap_or(true);
             // Anchor on the workspace signal: if something is failing, inject the
             // causal *region* of that problem (far more useful on a real codebase
             // than the global working set, which a `use`-heavy repo fills with the
             // hottest file); otherwise fall back to the global working set.
             let mem = session.memory();
-            let window = match mem.hottest_failure_node() {
-                Some(anchor) => mem.recall(&Recall::around(anchor), budget),
-                None => mem.recall(&Recall::working_set(), budget),
+            let anchor = mem.hottest_failure_node();
+            let recall = match &anchor {
+                Some(a) => Recall::around(a.clone()),
+                None => Recall::working_set(),
+            };
+            let window = if compress {
+                session.recall_compressed(recall, budget)
+            } else {
+                session.recall(recall, budget)
             };
             let plain = std::env::var("CCOS_CONTEXT_PLAIN")
                 .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
@@ -421,6 +481,7 @@ mod tests {
             "verify",
             "timeline",
             "recall_what_if",
+            "ccos_retrieve",
         ] {
             assert!(names.contains(&n), "missing tool {n}");
         }
@@ -617,6 +678,7 @@ mod tests {
         assert!(!mutating("recall"));
         assert!(!mutating("stats"));
         assert!(!mutating("recall_what_if"));
+        assert!(!mutating("ccos_retrieve"));
         // Non-tools/call messages never checkpoint.
         assert!(!is_mutating_call(&json!({ "method": "resources/read" })));
     }
@@ -630,6 +692,7 @@ mod tests {
                 score: 0.87,
                 kind: "Symbol".to_string(),
                 content: "pub const HEADER_SIZE: usize = 24;".to_string(),
+                ccr_ref: None,
             }],
             tokens: 10,
         };
@@ -645,5 +708,181 @@ mod tests {
             "plain drops the annotations a weak model misreads: {plain}"
         );
         assert!(plain.contains("pub const HEADER_SIZE"));
+    }
+
+    // ── Compression: ccos_retrieve + compressed context resource ───────────
+
+    use std::sync::Mutex;
+    // The compression tests toggle a process-global env var, so they must not
+    // run in parallel with each other (or with any other test reading that var).
+    static COMPRESS_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Helper that ingests a Rust source file large enough to exercise the
+    /// CausalAST compressor (the route a real `sym:`/`file:` node takes).
+    fn ingest_code(s: &mut AgentSession, id: i64, uri: &str, code: &str) {
+        handle(
+            s,
+            &req(
+                id,
+                "tools/call",
+                json!({ "name": "ingest", "arguments": { "uri": uri, "source": code } }),
+            ),
+        )
+        .unwrap();
+    }
+
+    /// A Rust source fixture with one large function (comments, blank lines,
+    /// `_`-temporaries) — the structure CausalAST compresses best. Small
+    /// one-liners don't amortize the CCR ref overhead.
+    fn code_fixture() -> String {
+        let mut s = String::from("pub fn big_calc() -> u64 {\n");
+        for i in 0..60 {
+            s.push_str(&format!(
+                "    // phase {i} — accumulate intermediate\n    let _acc{i} = {i} * 2;\n    let _tmp{i} = _acc{i} + 1;\n"
+            ));
+        }
+        s.push_str("    _tmp59\n}\n");
+        s
+    }
+
+    #[test]
+    fn ccos_retrieve_returns_the_original_for_a_known_ref() {
+        let _guard = COMPRESS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut s = AgentSession::new();
+        let code = code_fixture();
+        ingest_code(&mut s, 1, "src/calc.rs", &code);
+
+        // The context resource uses recall_compressed by default
+        // (CCOS_COMPRESS_CONTEXT != "0").
+        std::env::set_var("CCOS_COMPRESS_CONTEXT", "1");
+        let read = handle(
+            &mut s,
+            &req(
+                2,
+                "resources/read",
+                json!({ "uri": "ccos://session/context" }),
+            ),
+        )
+        .unwrap();
+        let text = read["result"]["contents"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        std::env::remove_var("CCOS_COMPRESS_CONTEXT");
+
+        // The compressed context must carry at least one ccr_ref.
+        let ref_str = text
+            .lines()
+            .find_map(|l| l.strip_prefix("// ccr_ref="))
+            .map(|r| r.split_whitespace().next().unwrap_or(r).to_string());
+        assert!(
+            ref_str.is_some(),
+            "context resource emitted a ccr_ref: {text}"
+        );
+        let ref_str = ref_str.unwrap();
+
+        // Retrieve the original through the MCP tool. The "original" here is
+        // the node content CCOS selected (a file header of signatures, not the
+        // whole source — see docs/DESIGN_symbol_granularity.md); it must still
+        // be the *uncompressed* form, distinct from the skeletonized version
+        // the compressed resource showed.
+        let r = handle(
+            &mut s,
+            &req(
+                3,
+                "tools/call",
+                json!({ "name": "ccos_retrieve", "arguments": { "ccr_ref": ref_str } }),
+            ),
+        )
+        .unwrap();
+        assert!(
+            !r["result"]["isError"].as_bool().unwrap_or(false),
+            "retrieve succeeded: {r}"
+        );
+        let original = r["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            original.contains("big_calc"),
+            "retrieved the original node content: {original}"
+        );
+    }
+
+    #[test]
+    fn ccos_retrieve_unknown_ref_is_an_error_response() {
+        let mut s = AgentSession::new();
+        let r = handle(
+            &mut s,
+            &req(
+                1,
+                "tools/call",
+                json!({ "name": "ccos_retrieve", "arguments": { "ccr_ref": "deadbeefdead" } }),
+            ),
+        )
+        .unwrap();
+        assert!(r["result"]["isError"] == true, "unknown ref → isError: {r}");
+    }
+
+    #[test]
+    fn ccos_retrieve_requires_the_ref_argument() {
+        let mut s = AgentSession::new();
+        let r = handle(
+            &mut s,
+            &req(
+                1,
+                "tools/call",
+                json!({ "name": "ccos_retrieve", "arguments": {} }),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            r["error"]["code"], -32602,
+            "missing arg → JSON-RPC error: {r}"
+        );
+    }
+
+    #[test]
+    fn compressed_context_resource_is_smaller_than_raw() {
+        let _guard = COMPRESS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut s = AgentSession::new();
+        let code = code_fixture();
+        ingest_code(&mut s, 1, "src/calc.rs", &code);
+
+        std::env::set_var("CCOS_COMPRESS_CONTEXT", "0");
+        let raw = handle(
+            &mut s,
+            &req(
+                2,
+                "resources/read",
+                json!({ "uri": "ccos://session/context" }),
+            ),
+        )
+        .unwrap();
+        let raw_text = raw["result"]["contents"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        std::env::remove_var("CCOS_COMPRESS_CONTEXT");
+
+        std::env::set_var("CCOS_COMPRESS_CONTEXT", "1");
+        let compressed = handle(
+            &mut s,
+            &req(
+                3,
+                "resources/read",
+                json!({ "uri": "ccos://session/context" }),
+            ),
+        )
+        .unwrap();
+        let comp_text = compressed["result"]["contents"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        std::env::remove_var("CCOS_COMPRESS_CONTEXT");
+
+        assert!(
+            comp_text.chars().count() < raw_text.chars().count(),
+            "compressed context ({}) must be smaller than raw ({}):\nRAW={raw_text}\nCOMP={comp_text}",
+            comp_text.chars().count(),
+            raw_text.chars().count()
+        );
     }
 }
