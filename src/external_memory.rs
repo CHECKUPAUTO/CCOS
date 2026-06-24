@@ -518,6 +518,38 @@ impl CcosMemory {
         &self.graph
     }
 
+    /// Page the recall **anchor** (and its directly-linked cold neighbours) back
+    /// from the COLD tier into the resident graph, so a recall *around* a demoted
+    /// node returns a complete causal region instead of a lone resurrected node —
+    /// a page fault on the read path. Returns the number of nodes paged in; a
+    /// no-op for a resident or unknown anchor. The session layer
+    /// ([`crate::agent_session::AgentSession::recall`]) calls this before an
+    /// `Around` recall, so the cold tier is transparent to a recalling agent.
+    pub fn ensure_resident(&mut self, uri: &str) -> usize {
+        let id = NodeId(normalize(uri));
+        let neighbours = self.graph.cold_neighbours(&id);
+        let mut paged = 0usize;
+        if self.graph.page_in(&id) {
+            paged += 1;
+        }
+        for n in neighbours {
+            if self.graph.page_in(&n) {
+                paged += 1;
+            }
+        }
+        paged
+    }
+
+    /// Set the **resident-window cap** — the frugal "RAM" size for the active
+    /// graph. Nodes beyond it are demoted to the COLD tier; lowering the cap
+    /// re-pages immediately. Raising it lets more nodes stay resident but does
+    /// not auto-page cold nodes back (they return on demand via
+    /// [`page_in`](MemoryGraph::page_in) / [`ensure_resident`](Self::ensure_resident)).
+    pub fn set_max_resident(&mut self, max: usize) {
+        self.graph.max_in_memory_nodes = max.max(1);
+        self.graph.enforce_paging();
+    }
+
     /// The node currently under the most failure pressure — the workspace's active
     /// problem focus, and the natural anchor for "what should I be looking at".
     /// `None` when nothing is failing. Deterministic (ties break on the node id).
