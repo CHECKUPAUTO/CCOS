@@ -121,8 +121,10 @@ honesty code↔docs↔paper, tests/API). **Fixed in this pass:**
   via a shared detector, on the live ingest/MCP path.
 
 ### B — Collapse duplicated abstractions
-- One snapshot type: merge `persist::KernelSnapshot` and `persistence::RuntimeState`
-  (field-identical payloads). (M)
+- ✅ One snapshot type: `persistence::RuntimeState` is now a type alias for
+  `persist::KernelSnapshot` (the duplicate payload struct is gone); the
+  integrity check is shared via `KernelSnapshot::verify_integrity` (used by the
+  runtime restore and a new `KernelSnapshot::load_verified`).
 - One event chain: collapse `distributed_event_log` onto `event_log`'s chain, or
   document why two exist. (M)
 - One context selector: designate `CcosMemory::recall` canonical; demote
