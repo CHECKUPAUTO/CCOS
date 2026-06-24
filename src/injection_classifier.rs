@@ -374,6 +374,14 @@ impl InjectionDetector {
     }
 }
 
+/// A process-wide, lazily-initialised default detector (the embedded model +
+/// the default tokenizer). The detector is deterministic and stateless, so a
+/// singleton is safe and avoids rebuilding the ~16 KB model on every ingest.
+pub fn shared_detector() -> &'static InjectionDetector {
+    static DETECTOR: std::sync::OnceLock<InjectionDetector> = std::sync::OnceLock::new();
+    DETECTOR.get_or_init(InjectionDetector::default)
+}
+
 /// Dot product in index order (a stable, bit-reproducible reduction).
 fn dot(w: &[f32], x: &[f32]) -> f32 {
     w.iter().zip(x).map(|(a, b)| a * b).sum()

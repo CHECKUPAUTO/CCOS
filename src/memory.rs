@@ -1,3 +1,7 @@
+use crate::eviction_policy::{
+    bucket_pressure, bucket_recency, bucket_score, bucket_size, EvictionPolicy, PagingState, EVICT,
+    KEEP,
+};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
@@ -151,6 +155,15 @@ pub struct MemoryGraph {
     /// older snapshots (written before this field existed) loadable.
     #[serde(default)]
     pub scoring_weights: ScoringWeights,
+    /// Learned eviction policy consulted by [`enforce_paging`](Self::enforce_paging).
+    /// Default is **untrained**, in which case eviction is exactly the
+    /// deterministic greedy (lowest score first) — so enabling it is never worse.
+    /// Train it offline ([`EvictionPolicy::fit`]) and inject via
+    /// [`set_eviction_policy`](Self::set_eviction_policy). Serialised (a `BTreeMap`
+    /// Q-table) so a snapshot records the policy it paged under; `serde(default)`
+    /// keeps pre-existing snapshots loadable.
+    #[serde(default = "EvictionPolicy::new")]
+    pub eviction_policy: EvictionPolicy,
 }
 
 impl MemoryGraph {
@@ -162,7 +175,22 @@ impl MemoryGraph {
             max_in_memory_nodes,
             clock: 0,
             scoring_weights: ScoringWeights::default(),
+            eviction_policy: EvictionPolicy::new(),
         }
+    }
+
+    /// Replace the eviction policy consulted by [`enforce_paging`](Self::enforce_paging).
+    pub fn set_eviction_policy(&mut self, policy: EvictionPolicy) {
+        self.eviction_policy = policy;
+    }
+
+    /// Train the eviction policy in place from a replay of
+    /// `(state, action, reward, next_state)` paging transitions.
+    pub fn train_eviction_policy<I>(&mut self, transitions: I)
+    where
+        I: IntoIterator<Item = (PagingState, u8, f64, PagingState)>,
+    {
+        self.eviction_policy.fit(transitions);
     }
 
     /// Replace the scoring/decay coefficients (see [`ScoringWeights`]). Set these
@@ -319,15 +347,51 @@ impl MemoryGraph {
         if self.nodes.len() <= self.max_in_memory_nodes {
             return;
         }
+        let total = self.nodes.len();
+        // Recency rank (0 = most recently accessed), for the eviction-policy state.
+        let mut by_recency: Vec<(NodeId, f64)> = self
+            .nodes
+            .iter()
+            .map(|(id, n)| (id.clone(), n.recency))
+            .collect();
+        by_recency.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        let recency_rank: HashMap<NodeId, usize> = by_recency
+            .into_iter()
+            .enumerate()
+            .map(|(i, (id, _))| (id, i))
+            .collect();
+
+        let trained = self.eviction_policy.is_trained();
         let to_remove: Vec<NodeId> = {
+            // Eviction priority = base causal score, nudged by the learned
+            // policy's keep−evict preference. When the policy is untrained the
+            // nudge is exactly 0, so this is byte-identical to the deterministic
+            // greedy (lowest score first, ties broken by node id) and replay /
+            // snapshot hashes are unchanged.
             let mut entries: Vec<(&NodeId, f64)> = self
                 .nodes
                 .iter()
-                .map(|(id, node)| (id, self.compute_node_score(node)))
+                .map(|(id, node)| {
+                    let base = self.compute_node_score(node);
+                    let bias = if trained {
+                        let state = PagingState {
+                            score: bucket_score(base),
+                            recency: bucket_recency(recency_rank[id], total),
+                            pressure: bucket_pressure(node.failure_relevance),
+                            size: bucket_size((node.content.len() + node.label.len()) / 4),
+                        };
+                        self.eviction_policy.q_value(state, KEEP)
+                            - self.eviction_policy.q_value(state, EVICT)
+                    } else {
+                        0.0
+                    };
+                    (id, base + bias)
+                })
                 .collect();
-            // Deterministic eviction: lowest score first, ties broken by node id
-            // so replay and snapshot hashes are reproducible regardless of the
-            // (randomized) HashMap iteration order.
             entries.sort_by(|a, b| {
                 a.1.partial_cmp(&b.1)
                     .unwrap_or(Ordering::Equal)
@@ -1058,6 +1122,63 @@ mod tests {
             );
         }
         assert!(graph.node_count() <= 5);
+    }
+
+    #[test]
+    fn eviction_policy_is_wired_into_paging_and_can_override_the_greedy() {
+        use crate::eviction_policy::{EvictionPolicy, PagingState, KEEP};
+        // Two nodes, cap 1 → exactly one is evicted. `x` scores ~0 (bucket 0),
+        // `y` scores ~0.95 (bucket 2). Build at a high cap so setup doesn't
+        // auto-page, then tighten the cap and page manually.
+        let mut g = MemoryGraph::new(0.2, 100);
+        g.upsert_node("x".into(), "x".into(), "x".into(), NodeType::Symbol);
+        g.upsert_node("y".into(), "y".into(), "y".into(), NodeType::Symbol);
+        {
+            let x = g.nodes.get_mut(&NodeId("x".into())).unwrap();
+            x.base_importance = 0.0;
+            x.failure_relevance = 0.0;
+            x.recency = 0.0;
+            x.access_count = 1;
+        }
+        {
+            let y = g.nodes.get_mut(&NodeId("y".into())).unwrap();
+            y.base_importance = 1.0;
+            y.failure_relevance = 1.0;
+            y.recency = 1.0;
+            y.access_count = 1;
+        }
+        g.max_in_memory_nodes = 1;
+
+        // Untrained → deterministic greedy: the low-score `x` is evicted.
+        let mut greedy = g.clone();
+        greedy.enforce_paging();
+        assert!(
+            greedy.nodes.contains_key(&NodeId("y".into()))
+                && !greedy.nodes.contains_key(&NodeId("x".into())),
+            "greedy evicts the low-score node x"
+        );
+
+        // Train the policy to strongly KEEP x's exact state → x now outranks y,
+        // so y is evicted instead. Proves the policy is consulted by enforce_paging.
+        let mut trained = g.clone();
+        let mut policy = EvictionPolicy::new();
+        let x_state = PagingState {
+            score: 0,
+            recency: 1,
+            pressure: 0,
+            size: 0,
+        };
+        policy.q.insert((x_state, KEEP), 100.0);
+        trained.set_eviction_policy(policy);
+        trained.enforce_paging();
+        assert!(
+            trained.nodes.contains_key(&NodeId("x".into())),
+            "the trained policy protects x"
+        );
+        assert!(
+            !trained.nodes.contains_key(&NodeId("y".into())),
+            "the trained policy evicts y instead"
+        );
     }
 
     #[test]

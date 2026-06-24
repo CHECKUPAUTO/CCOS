@@ -209,6 +209,9 @@ ccos sanitize path/to/file.rs            # de-obfuscate + score (human / --json)
 ccos sanitize --strict path/to/file.rs   # non-zero exit on danger (CI / pre-commit)
 ```
 
+The signal also rides the live path: every `ingest` (CLI, façade, or MCP) returns
+an `injection_score` / `injection_flagged` alongside the de-obfuscation `anomalies`.
+
 See [`docs/SECURITY.md`](docs/SECURITY.md) for the full threat model and the
 honest scope (what it does *not* cover: homoglyphs, semantic paraphrase).
 
