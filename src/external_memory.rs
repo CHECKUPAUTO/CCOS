@@ -706,12 +706,18 @@ impl CcosMemory {
     /// `db.rs` even when the file never says "timeout").
     pub fn build_embeddings(&self) -> crate::embeddings::CausalEmbeddings {
         let mut store = crate::embeddings::CausalEmbeddings::new();
-        let nodes: Vec<(String, String)> = self
+        let mut nodes: Vec<(String, String)> = self
             .graph
             .nodes
             .values()
             .map(|n| (n.id.0.clone(), format!("{} {}", n.label, n.content)))
             .collect();
+        // Pin the corpus order by node id: `nodes` is a HashMap, so its iteration
+        // order is hasher-seeded. The TF-IDF default is per-node and order-free,
+        // but the LSA Gram-matrix sum (`learned-embed`) accumulates across rows in
+        // f64, so a fixed row order makes the learned projection bit-reproducible
+        // regardless of the hasher — preserving determinism even on that path.
+        nodes.sort_by(|a, b| a.0.cmp(&b.0));
         let pairs: Vec<(&str, &str)> = nodes
             .iter()
             .map(|(id, t)| (id.as_str(), t.as_str()))

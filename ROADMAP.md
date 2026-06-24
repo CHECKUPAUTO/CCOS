@@ -88,6 +88,26 @@ cognitive MMU, made real: page, don't drop.
   to the per-recall embed build, so it is an opt-in. **The better-retrieval arc is
   now complete (A·B·C).** (L)
 
+## ✅ Done — audit pass 4 (hardening the new arcs)
+
+Four adversarial auditors (determinism, `replay == live`, default-path byte-identity,
+resource bounds) **confirmed the crown invariants hold on the default path** for all
+seven new slices, and surfaced three real issues, now fixed:
+
+- **Spill-blob GC** — the on-disk spill store had no delete path, so re-ingest /
+  remove / compaction of a spilled node leaked its blob. Added a **dedup-safe**
+  reclaim (`release_blob_if_orphan`: delete only when the hash's last referent is
+  gone). The "future GC pass" the slice-3 comment promised now exists.
+- **Compaction floor** — un-shrinkable cold entries were re-tried (and re-read from
+  disk) every ingest; now parked via `ColdNode.at_floor` and skipped.
+- **LSA determinism** — `build_embeddings` pins corpus order by id, so the
+  `learned-embed` Gram-matrix f64 sum no longer depends on `HashMap` order.
+
+Deferred to the **perf pass** (documented, not regressions): per-ingest `O(cold)`
+budget re-scans, per-recall `cold_neighbours` scan, per-recall embedding-store
+rebuild — to be fixed with incremental counters/indices and a cached,
+dirty-invalidated embedding store.
+
 ## ✅ Done — audit pass 1 (correctness)
 
 - **Fixed critical edge leak.** `enforce_paging()` ran re-entrantly inside

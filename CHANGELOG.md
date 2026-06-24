@@ -194,6 +194,36 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   than the status quo. Training is offline (`fit` over a replayed timeline
   with reward shaping for keep/evict decisions).
 
+### Fixed
+
+- **Audit pass 4 (hardening the unbounded-memory + retrieval slices).** Four
+  adversarial auditors (one each for determinism, `replay == live`, default-path
+  byte-identity, and resource bounds) confirmed the crown invariants hold on the
+  default path, and surfaced three real issues now fixed:
+  - **Spill-blob garbage collection (was an unbounded disk leak).** The on-disk
+    spill store (`ColdSpill`) had no deletion path, so re-ingesting, removing, or
+    compacting a previously-spilled node orphaned its blob forever. Added
+    `ColdSpill::remove` and a **dedup-safe** `release_blob_if_orphan` (a blob is
+    deleted only once no COLD entry still references its hash), wired into
+    `upsert_node`, `remove_node`, and compaction. (Off by default — only matters
+    when a spill store is attached.)
+  - **Compaction floor no longer busy-loops.** An un-shrinkable cold entry was
+    re-selected (and its blob re-read from disk) on every ingest while the tier
+    stayed over budget. Such entries are now parked with a new `ColdNode.at_floor`
+    flag and excluded from future compaction candidates (a fresh ingest drops the
+    shadow, so the flag never goes stale). `skip_serializing_if` keeps the default
+    serialization byte-identical.
+  - **LSA corpus order pinned for determinism.** `build_embeddings` now sorts
+    nodes by id before fitting, so the `learned-embed` LSA Gram-matrix f64 sum is
+    independent of `HashMap` iteration order (the one place determinism rested on
+    float-associativity rather than a fixed order). The default TF-IDF path was
+    already order-free.
+
+  Deferred to a perf pass (documented, not regressions): per-ingest `O(cold)`
+  budget re-scans, per-recall `cold_neighbours` scan, and the per-recall
+  embedding-store rebuild — all to be addressed with incremental counters/indices
+  and a cached, dirty-invalidated embedding store.
+
 ### Changed
 
 - **Unified the two snapshot types.** `persistence::RuntimeState` was a
