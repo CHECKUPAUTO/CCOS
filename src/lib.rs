@@ -7,6 +7,19 @@
 //! transition is recorded in an append-only **event log** so a session can be
 //! replayed deterministically.
 //!
+//! ## Quick start
+//!
+//! The core entry types are re-exported at the crate root:
+//!
+//! ```
+//! use ccos::{CcosMemory, ExternalMemory, Recall};
+//!
+//! let mut mem = CcosMemory::new();
+//! mem.ingest_source("src/db.rs", "pub fn query() -> i64 { 0 }\n");
+//! let window = mem.recall(&Recall::working_set(), 1024);
+//! assert!(!window.items.is_empty());
+//! ```
+//!
 //! ## Modules
 //!
 //! - [`parser`] — dependency-light line-based AST extraction (modules, `use`
@@ -126,3 +139,17 @@ pub mod eval;
 pub mod experiment;
 pub mod region_engine;
 pub mod region_metrics;
+
+// ── Core re-exports ─────────────────────────────────────────────────
+//
+// The handful of entry types a library consumer needs, lifted to the crate root
+// so they can be reached as `ccos::CcosMemory` / `ccos::Recall` instead of the
+// full module path. The modules above remain public for everything else.
+pub use agent_session::AgentSession;
+pub use event_log::EventLog;
+pub use external_memory::{
+    CcosMemory, ExternalMemory, IngestReport, Integrity, MemoryError, Recall, RecallItem,
+    RecallWindow,
+};
+pub use memory::{EdgeType, GraphEdge, GraphNode, MemoryGraph, NodeId, NodeType, ScoringWeights};
+pub use persist::KernelSnapshot;

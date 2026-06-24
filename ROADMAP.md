@@ -137,8 +137,13 @@ honesty code↔docs↔paper, tests/API). **Fixed in this pass:**
   — external callers can no longer push a dangling edge or orphan a node and break
   the `edges ⊆ nodes²` invariant. *(Still `pub` and could get the same treatment:
   `EventLog.events`, the `DistributedEventLog` fields, the `LinearModel` fields.)*
-- `lib.rs` re-exports / prelude for the core types; `#[non_exhaustive]` on the error +
-  event enums and `Recall`, pre-1.0. (S)
+- ✅ `lib.rs` re-exports the core entry types at the crate root (`ccos::CcosMemory`,
+  `Recall`, `MemoryGraph`, `AgentSession`, `KernelSnapshot`, …) with a crate-level
+  doc-test; `#[non_exhaustive]` on the three **error** enums (`MemoryError`,
+  `PersistenceError`, `ModelError`). The event/`Recall`/`NodeType`/`EdgeType` enums
+  are **deliberately left exhaustive** — CCOS is its own only consumer, so the
+  compiler's exhaustiveness check (catch a new variant nobody handled) is worth
+  more here than cross-crate add-without-break.
 - Cache the recall-time region clustering instead of rebuilding it per `around`/`task`
   call. (M)
 

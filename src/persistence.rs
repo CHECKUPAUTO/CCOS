@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 
 /// Typed error for persistence operations.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum PersistenceError {
     Io(String),
     Serde(String),
