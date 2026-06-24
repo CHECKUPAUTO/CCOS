@@ -147,26 +147,26 @@ guarantees:
   when compression shrinks the window below the token budget, the freed space
   is *re-spent* on more causal nodes (a second recall pass with a grown
   effective budget), so the host gets **strictly more causal signal at the
-  same emitted-token cost**. Measured on this repo's source: at a 4096-token
-  budget the loop recalls **+11 causal nodes** vs a single compressed pass,
-  while staying under budget.
+  same emitted-token cost**. Measured on this repo's source: on `around
+  external_memory` at an 8192-token budget the loop recalls **+15 causal nodes**
+  vs a single compressed pass, while staying under budget.
 - **Auto-tuner.** `CausalCompressor::auto_tune(sample)` runs a deterministic
   coordinate-descent over the knobs (dedup threshold, AST v2 on/off, signature
   collapse point, summary length, min-chars) to minimise the compressed-token
   count on a representative sample — bootstrap the config on a new corpus
   without hand-tuning.
 
-**Measured on this repo's own source** (33 Rust files, ~600 KB; run
+**Measured on this repo's own source** (38 Rust files; run
 `cargo run --example bench_compress --release`):
 
 | recall                | budget | raw tokens | compressed | reduction | shrink |
 | --------------------- | -----: | ---------: | ---------: | --------: | -----: |
-| working_set           |   2048 |        891 |        599 |      33 % | 1.51×  |
-| working_set           |   8192 |       7659 |       3865 |      49 % | 1.95×  |
-| around parser         |   4096 |       4111 |       2884 |      30 % | 1.43×  |
-| around external_mem   |   8192 |       8213 |       5602 |      32 % | 1.47×  |
+| working_set           |   2048 |        895 |        595 |      34 % | 1.50×  |
+| working_set           |   8192 |       6783 |       3450 |      49 % | 1.97×  |
+| around parser         |   4096 |       4096 |       3291 |      20 % | 1.24×  |
+| around external_mem   |   8192 |       8192 |       5563 |      32 % | 1.47×  |
 
-CausalAST alone delivers 30–50 % on real Rust code — the deterministic floor
+CausalAST-led compression delivers ≈20–50 % on real Rust code — the deterministic floor
 of headroom's 47–92 % range (headroom's upper band comes from its trained
 `Kompress-base` model, which CCOS does not ship by choice: it would break the
 deterministic-replay invariant). The budget feedback loop then *adds* causal
@@ -288,7 +288,7 @@ Module reference: `cargo doc --open` (every module has rustdoc), or
 ## Testing
 
 ```bash
-cargo test                     # 285 unit, integration & doc tests
+cargo test                     # 364 unit, integration & doc tests (default features)
 cargo clippy --all-targets --all-features   # lint-clean (-D warnings in CI)
 cargo test -- --ignored        # opt-in: 1,000,000-cycle long-stability run
 ```

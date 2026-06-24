@@ -2024,11 +2024,20 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("…{}", &s[s.len().saturating_sub(max - 1)..])
+    let n = s.chars().count();
+    if n <= max {
+        return s.to_string();
     }
+    // Keep the last `max-1` *characters* (room for the leading ellipsis) and cut
+    // on a char boundary — a byte slice would panic on multi-byte UTF-8 (e.g. a
+    // non-ASCII identifier `fn café()` or an accented panic message).
+    let keep = max.saturating_sub(1);
+    let start = s
+        .char_indices()
+        .nth(n - keep)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len());
+    format!("…{}", &s[start..])
 }
 
 /// `ccos sanitize [path] [--json] [--strict]` — de-obfuscate hidden Unicode in a
@@ -2226,6 +2235,22 @@ mod tests {
     use super::*;
     use ccos::external_memory::RecallItem;
     use ccos::trace::TraceHit;
+
+    #[test]
+    fn truncate_cuts_on_char_boundaries_without_panicking() {
+        assert_eq!(truncate("hello", 10), "hello"); // under the cap: unchanged
+                                                    // Multi-byte input longer than the cap must not panic (the old byte-slice
+                                                    // bug panicked inside a multi-byte char).
+        let many = "é".repeat(20);
+        let out = truncate(&many, 10);
+        assert!(out.starts_with('…'));
+        assert!(out.chars().count() <= 10);
+        // max == 0 must not underflow `max - 1`.
+        assert_eq!(truncate("anything", 0), "…");
+        // A realistic non-ASCII node id past the cap.
+        let id = "file:src/café_handler_extra_long_name.rs";
+        assert!(truncate(id, 12).chars().count() <= 12);
+    }
 
     #[test]
     fn focus_view_tags_symptom_and_likely_cause() {

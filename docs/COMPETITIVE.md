@@ -18,9 +18,11 @@
 >   l'outil MCP `ccos_retrieve` — l'équivalent déterministe de `headroom_retrieve`. L'axe
 >   frugalité n'est plus *vide* côté CCOS (≈ 30–50 % mesuré sur du Rust réel, le plancher
 >   déterministe de la fourchette Headroom).
-> - **Embeddings INT4** (`src/embeddings.rs`) : recall **sémantique** déterministe (TF-IDF
->   quantifié INT4, cosine). CCOS n'est donc plus « sans recall sémantique » — même si ça
->   reste en deçà du RAG complet de Headroom (sqlite-vec + FTS5 + mem0).
+> - **Embeddings INT4** (`src/embeddings.rs`) : un *embedder* sémantique déterministe
+>   (TF-IDF quantifié INT4, cosine) **existe dans l'arbre** — mais ⚠️ il **n'est pas encore
+>   câblé sur le chemin de recall vif** (qui passe par l'entrée lexicale/causale, pas
+>   sémantique). Donc « CCOS a un recall sémantique » serait **prématuré** : la capacité est
+>   là, l'intégration non. (Et de toute façon en deçà du RAG complet de Headroom.)
 > - **Dé-obfuscation Unicode + signal d'injection** (`src/sanitizer.rs` + classifieur) : un
 >   **nouvel axe** que la lecture du code de Headroom n'a pas montré chez eux — défang
 >   déterministe/auditable des vecteurs Trojan-Source / zero-width / Tags, findings versés
@@ -37,7 +39,7 @@
 | Axe | Qui gagne | En une ligne |
 |---|---|---|
 | **Frugalité / coût-tokens** | **Headroom**, nettement | Pipeline de compression *content-aware* mûr, Rust-backed, avec un vrai modèle ML. |
-| **Mémoire long-terme** | **Headroom** (RAG complet) | Store vectoriel persistant (sqlite-vec + FTS5 + mem0). CCOS a *désormais* un recall sémantique déterministe (INT4 TF-IDF) — en deçà, mais plus vide. |
+| **Mémoire long-terme** | **Headroom** (RAG complet) | Store vectoriel persistant (sqlite-vec + FTS5 + mem0). CCOS a un *embedder* INT4 TF-IDF **dans l'arbre mais pas encore câblé** au recall vif (entrée lexicale/causale). |
 | **Dé-obfuscation Unicode / hardening de l'entrée** | **CCOS** | Défang déterministe + auditable (Trojan-Source / zero-width / Tags) + signal d'injection forensic. Non trouvé dans le code de Headroom. |
 | **Mémoire de travail *rejouable, auditable, debuggable post-mortem*** | **CCOS**, seul | *Confirmé par leur source* : Headroom n'a ni log hash-chaîné, ni replay déterministe, ni event-sourcing des évictions, ni watchpoint. |
 

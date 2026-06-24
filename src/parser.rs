@@ -186,7 +186,16 @@ impl ASTParser {
         for symbol in &result.symbols {
             let sym_id = NodeId(format!("sym:{}:{}", result.file_path, symbol.name));
             let (start, end) = symbol_span(&lines, symbol.line);
-            let body = lines[start - 1..end].join("\n");
+            // Clamp into the slice before indexing: with `--features syn-parser`
+            // a span line can land past EOF (trailing-newline / CRLF edge cases),
+            // and `lines[start-1..end]` would otherwise panic out of bounds.
+            let body = if lines.is_empty() {
+                String::new()
+            } else {
+                let s = start.clamp(1, lines.len());
+                let e = end.clamp(s, lines.len());
+                lines[s - 1..e].join("\n")
+            };
             graph.upsert_node(sym_id.clone(), symbol.name.clone(), body, NodeType::Symbol);
             graph.add_edge(file_id.clone(), sym_id.clone(), 0.6, EdgeType::Contains);
         }
@@ -610,7 +619,10 @@ fn header_symbol_cap() -> usize {
 fn symbol_span(lines: &[&str], start_line: usize) -> (usize, usize) {
     let n = lines.len();
     if start_line == 0 || start_line > n {
-        return (start_line.max(1), start_line.max(1));
+        // Out-of-range start (e.g. a syn span past EOF): return an in-bounds
+        // lone line so callers can slice without panicking.
+        let line = start_line.clamp(1, n.max(1));
+        return (line, line);
     }
     let s0 = start_line - 1; // 0-based
                              // Within a short signature window, find the body's opening brace — or a
@@ -931,6 +943,18 @@ mod tests {
             (1, 4),
             "nested braces must not close the span early"
         );
+    }
+
+    #[test]
+    fn symbol_span_clamps_a_line_past_eof() {
+        // A start line beyond EOF (a `--features syn-parser` span edge case) must
+        // return an in-bounds span so `lines[start-1..end]` never panics.
+        let lines = vec!["fn a() {}"];
+        let (s, e) = symbol_span(&lines, 9);
+        assert!(s >= 1 && s <= lines.len() && e >= s && e <= lines.len());
+        // Empty input must not panic either.
+        let empty: Vec<&str> = vec![];
+        let _ = symbol_span(&empty, 3);
     }
 
     #[test]

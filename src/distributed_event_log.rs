@@ -51,7 +51,7 @@ impl DistributedEventLog {
             .map(|link| link.hash.clone())
             .unwrap_or_else(|| String::from("GENESIS"));
 
-        let hash = Self::compute_link_hash(id, &payload, timestamp, &previous_hash);
+        let hash = Self::compute_link_hash(id, &payload, &previous_hash);
 
         let link = HashChainLink {
             event_id: id,
@@ -106,12 +106,7 @@ impl DistributedEventLog {
                 ));
             }
 
-            let recomputed = Self::compute_link_hash(
-                event.id,
-                &event.payload,
-                event.timestamp,
-                &link.previous_hash,
-            );
+            let recomputed = Self::compute_link_hash(event.id, &event.payload, &link.previous_hash);
 
             if recomputed != link.hash {
                 errors.push(format!(
@@ -143,11 +138,14 @@ impl DistributedEventLog {
         self.events.is_empty()
     }
 
-    fn compute_link_hash(id: u64, payload: &str, timestamp: u64, previous_hash: &str) -> String {
+    /// Link hash over the *replayable* content only — `id | payload |
+    /// previous_hash`. The wall-clock `timestamp` is deliberately **excluded**
+    /// (it is metrics-only), so the chain is reproducible across runs that ingest
+    /// identical inputs — mirroring [`crate::event_log::EventLog`]'s link hash.
+    fn compute_link_hash(id: u64, payload: &str, previous_hash: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(id.to_le_bytes());
         hasher.update(payload.as_bytes());
-        hasher.update(timestamp.to_le_bytes());
         hasher.update(previous_hash.as_bytes());
         format!("{:x}", hasher.finalize())
     }
@@ -242,5 +240,24 @@ mod tests {
             assert_eq!(a.payload, b.payload);
             assert_eq!(a.timestamp, b.timestamp);
         }
+    }
+
+    #[test]
+    fn chain_is_reproducible_across_runs_ignoring_wall_clock() {
+        // Two independent logs ingesting identical (payload, source) sequences
+        // must produce the SAME hash chain: the link hash excludes the wall-clock
+        // timestamp, so the chain is replay-reproducible across runs.
+        let build = || {
+            let mut log = DistributedEventLog::new();
+            log.append("file_hash_a".into(), "external-memory".into());
+            log.append("file_hash_b".into(), "external-memory".into());
+            log
+        };
+        let a = build();
+        let b = build();
+        let ha: Vec<&String> = a.hash_chain.iter().map(|l| &l.hash).collect();
+        let hb: Vec<&String> = b.hash_chain.iter().map(|l| &l.hash).collect();
+        assert_eq!(ha, hb, "chain must not depend on wall-clock time");
+        assert!(a.verify_integrity().valid && b.verify_integrity().valid);
     }
 }

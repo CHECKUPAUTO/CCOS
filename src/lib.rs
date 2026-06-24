@@ -61,6 +61,17 @@
 //!   hydrated as context windows, with a dynamic [`context_policy`] admission
 //!   policy and deterministic replay. See [`context_region`], [`region_metrics`].
 //!
+//! ## Not yet on the live path (in-tree, experimental)
+//!
+//! Built, tested and reachable from the library API and the examples, but **not
+//! yet wired into the live recall/ingest core** — treat as experimental:
+//! [`embeddings`] (semantic TF-IDF recall; the live recall uses lexical/causal
+//! entry, not embeddings), [`eviction_policy`] (a learned eviction policy; live
+//! paging is the deterministic greedy in [`memory`]), and [`injection_classifier`]
+//! (the injection *signal* runs in the `ccos sanitize` CLI, not during ingest).
+//! By contrast [`compressor`] (reversible CCR compression) and [`sanitizer`]
+//! (inline Unicode de-obfuscation at ingest) *are* on the live path.
+//!
 //! ## Invariants
 //!
 //! The memory graph maintains `edges ⊆ nodes × nodes` at all times (see

@@ -87,6 +87,67 @@ Prioritized roadmap from the audit. Effort: S/M/L.
 
 ---
 
+## Audit pass 3 — full-codebase review (2026-06-24)
+
+A four-axis read of the whole tree (correctness/determinism, architecture/redundancy,
+honesty code↔docs↔paper, tests/API). **Fixed in this pass:**
+
+- **`truncate()` UTF-8 panic** (`main.rs`) — byte-sliced a multi-byte char on any
+  non-ASCII id/message; now cuts on a char boundary (+ regression test).
+- **Non-reproducible distributed-log chain** — `compute_link_hash` hashed the
+  wall-clock timestamp; now excludes it (mirrors `EventLog`), so the chain is
+  replay-reproducible (+ test). *On-disk chain hashes change — a format bump.*
+- **`parser.rs` slice OOB** under `--features syn-parser` (a span line past EOF) —
+  clamped into the slice (+ test).
+- **`bench_compress` panicked** (hard-coded `/root/CCOS`) — derives the corpus from
+  `CARGO_MANIFEST_DIR`; README §5 table re-measured on the real 38-file corpus.
+- **Test/file counts reconciled** — docs disagreed (156/202/212/285/288); the real
+  default-feature `cargo test` count is **364**, fixed across README, PITCH,
+  ARCHITECTURE, PAPER.md and all six `.tex`; "33 Rust files" → 38.
+- **Honesty** — `mcp.rs` docstring now lists all 9 tools; `COMPETITIVE.md` no longer
+  implies *live* semantic recall; `lib.rs` documents which recent modules are in-tree
+  but **not yet on the live path**.
+
+**Remaining (decisions / larger work, not bugs):**
+
+### A — Wire in or retire the unwired recent modules
+- `embeddings` (semantic recall) and `eviction_policy` (learned paging) are built and
+  tested but unreachable from the live recall/ingest path. **Decide:** wire in (a
+  `Recall::Semantic`; blend the policy into `enforce_paging`) or remove. (M)
+- `injection_classifier` runs only in `ccos sanitize`. Decide whether to surface an
+  injection score in `IngestReport` or keep it CLI-only. (S)
+
+### B — Collapse duplicated abstractions
+- One snapshot type: merge `persist::KernelSnapshot` and `persistence::RuntimeState`
+  (field-identical payloads). (M)
+- One event chain: collapse `distributed_event_log` onto `event_log`'s chain, or
+  document why two exist. (M)
+- One context selector: designate `CcosMemory::recall` canonical; demote
+  `select_context_window` / `hot_set` / `hot_context` / `activate_region`. (M)
+- One snapshot-error type (unify on `MemoryError`). (S)
+
+### C — Encapsulation & API
+- Make `MemoryGraph.{nodes,edges}` (and `EventLog.events`, `LinearModel` fields)
+  `pub(crate)` + accessors — the only thing letting a caller break the
+  `edges ⊆ nodes²` invariant. (M)
+- `lib.rs` re-exports / prelude for the core types; `#[non_exhaustive]` on the error +
+  event enums and `Recall`, pre-1.0. (S)
+- Cache the recall-time region clustering instead of rebuilding it per `around`/`task`
+  call. (M)
+
+### D — Test coverage
+- The CLI binary + the 9 `Opts::parse` have zero coverage; add compressor
+  reversibility-under-eviction, `persist` disk save→load hash-stability, MCP
+  parse-error envelopes, and an equal-score eviction-order tie-break test. (M)
+
+### E — Hygiene
+- Extract `main.rs` (2.3 KLoC) into per-domain command modules. (S)
+- Consolidate the 3 license files; document the three-log taxonomy in `lib.rs`. (S)
+- Port the security subsection + originality framing into the zh/ko/ar papers (en/fr/es
+  have them) — *deferred by the maintainer; test counts already corrected.* (S)
+
+---
+
 ## Remaining
 
 ### P0 — Correctness

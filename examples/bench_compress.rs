@@ -3,13 +3,20 @@ use ccos::compressor::CausalCompressor;
 use ccos::external_memory::Recall;
 
 fn ingest_corpus() -> (AgentSession, Vec<(String, String)>) {
-    let files: Vec<(String, String)> = std::fs::read_dir("/root/CCOS/src")
-        .unwrap()
+    // Derive the corpus path from the crate root so the example runs from any
+    // checkout (it previously hard-coded /root/CCOS/src and panicked elsewhere).
+    let root = env!("CARGO_MANIFEST_DIR");
+    let src = format!("{root}/src");
+    let files: Vec<(String, String)> = std::fs::read_dir(&src)
+        .unwrap_or_else(|e| panic!("read_dir {src}: {e}"))
         .filter_map(|e| e.ok())
         .filter(|e| e.path().extension().map(|x| x == "rs").unwrap_or(false))
         .filter_map(|e| {
             let p = e.path();
-            let uri = p.strip_prefix("/root/CCOS/").unwrap().display().to_string();
+            let uri = p
+                .strip_prefix(root)
+                .map(|x| x.display().to_string())
+                .unwrap_or_else(|_| p.display().to_string());
             std::fs::read_to_string(&p).ok().map(|s| (uri, s))
         })
         .collect();
@@ -116,7 +123,11 @@ fn run_auto_tune() {
 }
 
 fn main() {
-    println!("Corpus: 33 Rust files from /root/CCOS/src (~600 KB)");
+    println!(
+        "Corpus: {} Rust files from {}/src",
+        ingest_corpus().1.len(),
+        env!("CARGO_MANIFEST_DIR")
+    );
     run("working_set @2048", Recall::working_set(), 2048);
     run("working_set @8192", Recall::working_set(), 8192);
     run(
