@@ -4,7 +4,7 @@ use crate::eviction_policy::{
 };
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BTreeMap, BinaryHeap, HashMap};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeId(pub String);
@@ -164,6 +164,26 @@ pub struct MemoryGraph {
     /// keeps pre-existing snapshots loadable.
     #[serde(default = "EvictionPolicy::new")]
     pub eviction_policy: EvictionPolicy,
+    /// The **COLD tier** — the "swap". Nodes evicted from the resident graph by
+    /// [`enforce_paging`](Self::enforce_paging) are *demoted* here instead of
+    /// dropped, with the edges incident to them at demotion time, so the working
+    /// memory is **non-destructive**: nothing is lost, anything can be
+    /// [`page_in`](Self::page_in)ed back on demand. The resident set
+    /// ([`node_count`](Self::node_count)) stays bounded by `max_in_memory_nodes`;
+    /// the backing store (this map) is the unbounded "virtual memory" behind it.
+    /// `BTreeMap` ⇒ deterministic iteration/serialization; `serde(default)` keeps
+    /// pre-existing snapshots loadable.
+    #[serde(default)]
+    cold: BTreeMap<NodeId, ColdNode>,
+}
+
+/// A node demoted out of the resident graph into the [`MemoryGraph`] COLD tier,
+/// kept with the edges incident to it at demotion time so a later `page_in` can
+/// restore its causal structure.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ColdNode {
+    node: GraphNode,
+    edges: Vec<GraphEdge>,
 }
 
 impl MemoryGraph {
@@ -176,6 +196,7 @@ impl MemoryGraph {
             clock: 0,
             scoring_weights: ScoringWeights::default(),
             eviction_policy: EvictionPolicy::new(),
+            cold: BTreeMap::new(),
         }
     }
 
@@ -213,6 +234,8 @@ impl MemoryGraph {
 
     pub fn upsert_node(&mut self, id: NodeId, label: String, content: String, node_type: NodeType) {
         let now = self.clock;
+        // A fresh ingest supersedes any demoted (COLD) shadow of this node.
+        self.cold.remove(&id);
         match self.nodes.get_mut(&id) {
             Some(existing) => {
                 existing.label = label;
@@ -277,6 +300,7 @@ impl MemoryGraph {
 
     pub fn remove_node(&mut self, id: &NodeId) {
         self.nodes.remove(id);
+        self.cold.remove(id); // explicit removal forgets the COLD shadow too
         self.edges.retain(|e| &e.source != id && &e.target != id);
     }
 
@@ -405,11 +429,95 @@ impl MemoryGraph {
                 .collect()
         };
         for id in &to_remove {
-            self.nodes.remove(id);
-            self.edges.retain(|e| &e.source != id && &e.target != id);
+            self.demote(id);
         }
         // Defensive: guarantee no edge survives pointing at an evicted node.
         self.prune_dangling_edges();
+    }
+
+    /// Demote a node out of the resident graph into the COLD tier, archiving the
+    /// edges incident to it so [`page_in`](Self::page_in) can later restore its
+    /// causal structure. Non-destructive: the node and its links are kept, just
+    /// no longer resident.
+    fn demote(&mut self, id: &NodeId) {
+        if let Some(node) = self.nodes.remove(id) {
+            let incident: Vec<GraphEdge> = self
+                .edges
+                .iter()
+                .filter(|e| &e.source == id || &e.target == id)
+                .cloned()
+                .collect();
+            self.edges.retain(|e| &e.source != id && &e.target != id);
+            self.cold.insert(
+                id.clone(),
+                ColdNode {
+                    node,
+                    edges: incident,
+                },
+            );
+        }
+    }
+
+    /// Restore a node from the **COLD tier** into the resident graph — a page-in
+    /// (a swap). The node is marked freshly accessed; if the resident set is at
+    /// capacity, the lowest-scored **other** node is demoted to make room — the
+    /// just-requested node is never the one bounced back out. Any archived edge
+    /// whose other endpoint is resident is re-linked. Returns `true` if the node
+    /// was cold and is now resident. Deterministic (tie-break on id).
+    pub fn page_in(&mut self, id: &NodeId) -> bool {
+        let Some(mut cold) = self.cold.remove(id) else {
+            return false;
+        };
+        cold.node.recency = 1.0;
+        cold.node.last_accessed = self.clock;
+        cold.node.access_count = cold.node.access_count.saturating_add(1);
+        self.nodes.insert(id.clone(), cold.node);
+        for e in cold.edges {
+            if self.nodes.contains_key(&e.source)
+                && self.nodes.contains_key(&e.target)
+                && !self.edges.iter().any(|x| {
+                    x.source == e.source && x.target == e.target && x.edge_type == e.edge_type
+                })
+            {
+                self.edges.push(e);
+            }
+        }
+        // Swap: while over capacity, demote the lowest-scored node *other* than
+        // the one just paged in (deterministic tie-break on id).
+        while self.nodes.len() > self.max_in_memory_nodes {
+            let victim = self
+                .nodes
+                .iter()
+                .filter(|(nid, _)| *nid != id)
+                .min_by(|(aid, an), (bid, bn)| {
+                    self.compute_node_score(an)
+                        .partial_cmp(&self.compute_node_score(bn))
+                        .unwrap_or(Ordering::Equal)
+                        .then_with(|| aid.cmp(bid))
+                })
+                .map(|(nid, _)| nid.clone());
+            match victim {
+                Some(v) => self.demote(&v),
+                None => break, // only `id` is resident and still over cap — keep it
+            }
+        }
+        self.prune_dangling_edges();
+        true
+    }
+
+    /// Number of nodes in the COLD tier (demoted but retrievable via [`page_in`](Self::page_in)).
+    pub fn cold_count(&self) -> usize {
+        self.cold.len()
+    }
+
+    /// Whether `id` is currently demoted to the COLD tier.
+    pub fn is_cold(&self, id: &NodeId) -> bool {
+        self.cold.contains_key(id)
+    }
+
+    /// The ids currently in the COLD tier, in sorted (deterministic) order.
+    pub fn cold_ids(&self) -> impl Iterator<Item = &NodeId> + '_ {
+        self.cold.keys()
     }
 
     /// Remove any edge whose endpoints are no longer present in the graph and
@@ -1232,6 +1340,51 @@ mod tests {
             !trained.nodes.contains_key(&NodeId("y".into())),
             "the trained policy evicts y instead"
         );
+    }
+
+    #[test]
+    fn eviction_demotes_to_cold_and_page_in_swaps_it_back() {
+        // Build at a high cap so setup does not auto-page, then tighten to 1.
+        let mut g = MemoryGraph::new(0.2, 100);
+        g.upsert_node("hot".into(), "hot".into(), "x".into(), NodeType::Symbol);
+        g.upsert_node("cold".into(), "cold".into(), "y".into(), NodeType::Symbol);
+        g.add_edge("hot".into(), "cold".into(), 0.6, EdgeType::Contains);
+        {
+            let h = g.nodes.get_mut(&NodeId("hot".into())).unwrap();
+            h.base_importance = 1.0;
+            h.recency = 1.0;
+        }
+        {
+            let c = g.nodes.get_mut(&NodeId("cold".into())).unwrap();
+            c.base_importance = 0.0;
+            c.recency = 0.0;
+        }
+        g.max_in_memory_nodes = 1;
+        g.enforce_paging();
+
+        // Non-destructive eviction: the victim is DEMOTED to COLD, not dropped.
+        assert_eq!(g.node_count(), 1, "resident set capped");
+        assert!(g.node(&NodeId("hot".into())).is_some());
+        assert!(g.node(&NodeId("cold".into())).is_none(), "out of resident");
+        assert!(
+            g.is_cold(&NodeId("cold".into())),
+            "kept in COLD — nothing lost"
+        );
+        assert_eq!(g.cold_count(), 1);
+        assert_eq!(g.edge_count(), 0, "incident edge archived on demotion");
+
+        // Page it back in: a swap — `cold` returns resident, `hot` demotes.
+        assert!(g.page_in(&NodeId("cold".into())));
+        assert!(g.node(&NodeId("cold".into())).is_some(), "paged back in");
+        assert!(!g.is_cold(&NodeId("cold".into())));
+        assert!(
+            g.is_cold(&NodeId("hot".into())),
+            "the lowest-scored other node swapped out, not the requested one"
+        );
+        assert_eq!(g.node_count(), 1, "resident set still capped (a swap)");
+
+        // page_in on an id that is not cold is a no-op.
+        assert!(!g.page_in(&NodeId("nope".into())));
     }
 
     #[test]

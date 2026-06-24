@@ -2,6 +2,37 @@
 
 Prioritized roadmap from the audit. Effort: S/M/L.
 
+## 🚀 Direction — unbounded working memory (frugality × available RAM)
+
+"Infinite" working memory is a **direction**, not a literal claim. CCOS keeps the
+resident window tiny (*frugality*) and uses the machine's RAM as the backing
+store, so the effective working memory is **as large as RAM allows relative to a
+small window** — and that ratio is how far we stretch toward the asymptote. The
+cognitive MMU, made real: page, don't drop.
+
+- ✅ **Slice 1 — non-destructive eviction → a COLD tier (the swap).** Eviction now
+  *demotes* a node (with its incident edges) into a COLD tier instead of dropping
+  it; the resident set stays bounded by `max_in_memory_nodes`, the backing store
+  grows into RAM, and `MemoryGraph::page_in` brings anything back. A failure on a
+  demoted node resurrects it (a page fault) rather than erroring. Observable via
+  `MemoryStats.cold`. Deterministic (sorted demotion, BTreeMap COLD store).
+- **Slice 2 — page-fault from COLD on every read path.** (Partly done: failures
+  resurrect.) Extend to `recall` anchors and the crash-trace pivot, so any
+  referenced cold node is paged back automatically. (M)
+- **Slice 3 — spill COLD to disk, compressed** (reuse the CCR store) → RAM-bounded,
+  disk-unbounded: push the ratio further. (M)
+- **Slice 4 — bound + compact COLD** (the final tier): summarise the coldest
+  entries (CausalSumm) so the backing store itself stays frugal. (M)
+
+## 🎯 Direction — better retrieval
+- **Slice A — hybrid entry fusion** (lexical ⊕ semantic ⊕ causal, reciprocal-rank)
+  before causal expansion. (M)
+- **Slice B — opt-in learned embedder** behind a feature flag; INT4 TF-IDF stays
+  the deterministic default (keep the replay invariant). (L)
+- **Slice C — self-improving retrieval from the replayable log**: learn recall
+  weights from which recalls actually *helped* — the auditable history as training
+  data. The CCOS-native gem (better retrieval *and* reinforces the moat). (L)
+
 ## ✅ Done — audit pass 1 (correctness)
 
 - **Fixed critical edge leak.** `enforce_paging()` ran re-entrantly inside

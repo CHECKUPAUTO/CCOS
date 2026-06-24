@@ -230,6 +230,10 @@ pub struct MemoryStats {
     pub nodes: usize,
     /// Edges currently in the graph.
     pub edges: usize,
+    /// Nodes demoted to the **COLD tier** (the swap) — not resident, but kept and
+    /// retrievable via a page-in. The resident `nodes` count stays bounded; this
+    /// is the unbounded backing store behind it.
+    pub cold: usize,
     /// Events appended to the primary log.
     pub events: usize,
     /// Files whose source is retained.
@@ -879,7 +883,13 @@ impl ExternalMemory for CcosMemory {
     fn signal_failure(&mut self, node: &str, depth: u32) -> Result<usize, MemoryError> {
         let id = NodeId(normalize(node));
         if !self.graph.nodes.contains_key(&id) {
-            return Err(MemoryError::NodeNotFound(id.0));
+            // A failure on a *demoted* node resurrects it from the COLD tier (a
+            // page fault) rather than erroring — the cause is paged back even if
+            // it was evicted from the resident window many steps ago. Only a
+            // genuinely unknown node still errors.
+            if !self.graph.page_in(&id) {
+                return Err(MemoryError::NodeNotFound(id.0));
+            }
         }
         self.graph.set_failure_relevance(&id, 0.95);
         self.graph.propagate_failure(&id, 0, depth);
@@ -960,6 +970,7 @@ impl ExternalMemory for CcosMemory {
         MemoryStats {
             nodes: self.graph.nodes.len(),
             edges: self.graph.edges.len(),
+            cold: self.graph.cold_count(),
             events: self.event_log.event_count(),
             files: self.sources.len(),
             clock: self.graph.clock,
@@ -1395,5 +1406,33 @@ mod tests {
             "obvious injection flags: {}",
             evil.injection_score
         );
+    }
+
+    #[test]
+    fn signal_failure_resurrects_a_demoted_node_from_cold() {
+        let mut mem = CcosMemory::new();
+        mem.ingest_source("src/db.rs", "pub fn query() -> i64 { 0 }\n");
+        mem.ingest_source(
+            "src/api.rs",
+            "use crate::db;\npub fn h() -> i64 { db::query() }\n",
+        );
+        // Tighten the resident cap and re-page → some nodes demote to COLD.
+        mem.graph.max_in_memory_nodes = 1;
+        mem.graph.enforce_paging();
+        assert!(mem.graph.cold_count() > 0, "eviction demoted nodes to COLD");
+
+        let cold_id = mem.graph.cold_ids().next().unwrap().0.clone();
+        assert!(mem.graph.is_cold(&NodeId(cold_id.clone())));
+
+        // A failure on the demoted node pages it back instead of erroring.
+        assert!(
+            mem.signal_failure(&cold_id, 1).is_ok(),
+            "a failure on a demoted node resurrects it from COLD"
+        );
+        assert!(
+            mem.graph.contains_node(&NodeId(cold_id.clone())),
+            "the cause is now resident"
+        );
+        assert!(!mem.graph.is_cold(&NodeId(cold_id)), "no longer cold");
     }
 }

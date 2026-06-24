@@ -8,6 +8,16 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Non-destructive eviction → a COLD tier (the "swap").** First slice of the
+  *unbounded working memory* direction (frugality × available RAM). Evicting a
+  node from the resident graph now **demotes** it — with its incident edges — into
+  a COLD tier instead of dropping it: the resident set stays capped by
+  `max_in_memory_nodes`, the backing store grows into RAM, and any node can be
+  paged back (`MemoryGraph::page_in`). A `signal_failure` on a demoted node
+  **resurrects it from COLD** (a page fault) instead of erroring. `MemoryStats.cold`
+  surfaces the tier (via `ccos stats` / the MCP `stats` tool). Deterministic
+  (sorted demotion, `BTreeMap` COLD store); snapshots stay reproducible. See
+  ROADMAP for the arc (disk-spill + compaction next).
 - **Wired the recent modules onto the live path.** Three capabilities that were
   in-tree but unreachable from the live recall/ingest core are now connected:
   (1) **semantic recall** — a new `Recall::Semantic` strategy resolves a
