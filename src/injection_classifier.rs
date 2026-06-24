@@ -44,6 +44,7 @@ pub const DEFAULT_MODEL_FINGERPRINT: &str =
 
 /// Errors decoding an immutable model blob.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ModelError {
     /// The leading magic bytes did not match — not a CCOS injection model.
     BadMagic,

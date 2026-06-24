@@ -77,6 +77,7 @@ use std::path::{Path, PathBuf};
 
 /// Errors returned by memory operations.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum MemoryError {
     /// A referenced node id is not present in the graph.
     NodeNotFound(String),
