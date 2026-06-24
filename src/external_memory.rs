@@ -74,6 +74,7 @@ use crate::region_engine::ContextRegionEngine;
 use crate::sanitizer::{self, Finding};
 use crate::util::sha256_hex;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -330,6 +331,21 @@ pub struct CcosMemory {
     sources: BTreeMap<String, String>,
     /// Bound checkpoint path, if any.
     path: Option<PathBuf>,
+    /// Monotonic counter bumped on every mutation of the resident graph. The
+    /// per-recall caches below are keyed on it: a recall reuses the cached region
+    /// clustering / embedding store iff the graph hasn't changed since they were
+    /// built. Over-invalidating (bumped even for changes that don't affect a given
+    /// cache) keeps it always-correct and never stale.
+    version: u64,
+    /// Cached region clustering (`(version, engine)`), so `region_member_ids` does
+    /// not re-`initialize_regions` over the whole graph on every recall — the
+    /// dominant per-recall cost for `around`/`task` recalls. Interior mutability so
+    /// `recall(&self)` can fill it; never serialised.
+    region_cache: RefCell<Option<(u64, ContextRegionEngine)>>,
+    /// Cached embedding store (`(version, store)`), so `build_embeddings` does not
+    /// re-fit TF-IDF (and, under `learned-embed`, re-run the LSA eigensolve) over
+    /// all nodes on every semantic/hybrid recall.
+    embed_cache: RefCell<Option<(u64, crate::embeddings::CausalEmbeddings)>>,
 }
 
 impl Default for CcosMemory {
@@ -348,7 +364,17 @@ impl CcosMemory {
             dist_log: DistributedEventLog::new(),
             sources: BTreeMap::new(),
             path: None,
+            version: 0,
+            region_cache: RefCell::new(None),
+            embed_cache: RefCell::new(None),
         }
+    }
+
+    /// Invalidate the per-recall caches by advancing the graph version. Called by
+    /// every method that mutates the resident graph (over-invalidating is safe:
+    /// it can never serve a stale cache).
+    fn bump_version(&mut self) {
+        self.version = self.version.wrapping_add(1);
     }
 
     /// Open a memory backed by `path`: load it if the file exists, otherwise
@@ -393,6 +419,9 @@ impl CcosMemory {
             dist_log: p.dist_log,
             sources: p.sources,
             path: None,
+            version: 0,
+            region_cache: RefCell::new(None),
+            embed_cache: RefCell::new(None),
         })
     }
 
@@ -416,6 +445,7 @@ impl CcosMemory {
 
     /// Advance the logical clock (applies recency decay).
     pub fn tick(&mut self) {
+        self.bump_version();
         self.graph.tick();
     }
 
@@ -556,6 +586,7 @@ impl CcosMemory {
     /// ([`crate::agent_session::AgentSession::recall`]) calls this before an
     /// `Around` recall, so the cold tier is transparent to a recalling agent.
     pub fn ensure_resident(&mut self, uri: &str) -> usize {
+        self.bump_version();
         let id = NodeId(normalize(uri));
         let neighbours = self.graph.cold_neighbours(&id);
         let mut paged = 0usize;
@@ -576,6 +607,7 @@ impl CcosMemory {
     /// not auto-page cold nodes back (they return on demand via
     /// [`page_in`](MemoryGraph::page_in) / [`ensure_resident`](Self::ensure_resident)).
     pub fn set_max_resident(&mut self, max: usize) {
+        self.bump_version();
         self.graph.max_in_memory_nodes = max.max(1);
         self.graph.enforce_paging();
     }
@@ -617,6 +649,7 @@ impl CcosMemory {
     /// that drive node scoring, selection, and eviction. Used by the session's
     /// log-tuned retrieval (slice C) to adopt learned weights.
     pub fn set_scoring_weights(&mut self, weights: crate::memory::ScoringWeights) {
+        self.bump_version();
         self.graph.set_scoring_weights(weights);
     }
 
@@ -662,12 +695,22 @@ impl CcosMemory {
     /// region, fall back to its k-hop causal neighbourhood (both directions).
     fn region_member_ids(&self, uri: &str) -> Vec<NodeId> {
         let anchor = normalize(uri);
-        let mut engine = ContextRegionEngine::new();
-        let mut sink = EventLog::new("recall".to_string());
-        engine.initialize_regions(&self.graph, &mut sink);
-        if let Some(rid) = engine.region_of(&anchor) {
-            if let Some(region) = engine.regions.get(&rid) {
-                return region.members.iter().map(|m| NodeId(m.clone())).collect();
+        // Reuse the cached region clustering unless the graph changed since it was
+        // built — `initialize_regions` over the whole graph is the dominant
+        // per-recall cost and is identical between calls at the same version.
+        {
+            let mut cache = self.region_cache.borrow_mut();
+            if cache.as_ref().map(|(v, _)| *v) != Some(self.version) {
+                let mut engine = ContextRegionEngine::new();
+                let mut sink = EventLog::new("recall".to_string());
+                engine.initialize_regions(&self.graph, &mut sink);
+                *cache = Some((self.version, engine));
+            }
+            let engine = &cache.as_ref().unwrap().1;
+            if let Some(rid) = engine.region_of(&anchor) {
+                if let Some(region) = engine.regions.get(&rid) {
+                    return region.members.iter().map(|m| NodeId(m.clone())).collect();
+                }
             }
         }
         // Region-less node: its neighbourhood (causes + impact), plus itself.
@@ -705,6 +748,15 @@ impl CcosMemory {
     /// cosine-based `Recall::Task` entry point (catches "fix the timeout" →
     /// `db.rs` even when the file never says "timeout").
     pub fn build_embeddings(&self) -> crate::embeddings::CausalEmbeddings {
+        // Reuse the cached store unless the graph changed since it was fitted —
+        // re-fitting TF-IDF (and, under `learned-embed`, re-running the LSA
+        // eigensolve) over every node on each recall is the per-recall cost here.
+        // The clone is far cheaper than the rebuild it replaces.
+        if let Some((v, store)) = self.embed_cache.borrow().as_ref() {
+            if *v == self.version {
+                return store.clone();
+            }
+        }
         let mut store = crate::embeddings::CausalEmbeddings::new();
         let mut nodes: Vec<(String, String)> = self
             .graph
@@ -729,6 +781,7 @@ impl CcosMemory {
         store.fit_and_embed(pairs);
         #[cfg(feature = "learned-embed")]
         store.fit_and_embed_lsa(pairs, 48);
+        *self.embed_cache.borrow_mut() = Some((self.version, store.clone()));
         store
     }
 
@@ -1043,6 +1096,7 @@ pub(crate) fn workspace_file(path: &Path) -> PathBuf {
 
 impl ExternalMemory for CcosMemory {
     fn ingest_source(&mut self, uri: &str, source: &str) -> IngestReport {
+        self.bump_version();
         // Tolerate a redundant `file:` namespace prefix on the uri (an agent often
         // copies a node id back from `recall`, which returns `file:<path>`); without
         // this, `ingest("file:src/a.rs")` would double-prefix to `file:file:src/a.rs`.
@@ -1094,6 +1148,7 @@ impl ExternalMemory for CcosMemory {
     }
 
     fn signal_failure(&mut self, node: &str, depth: u32) -> Result<usize, MemoryError> {
+        self.bump_version();
         let id = NodeId(normalize(node));
         if !self.graph.nodes.contains_key(&id) {
             // A failure on a *demoted* node resurrects it from the COLD tier (a
@@ -1572,6 +1627,30 @@ mod tests {
         assert!(
             sem.as_deref().is_some_and(|id| id.contains("db.rs")),
             "semantic entry ranks db.rs above the lexical distraction: {sem:?}"
+        );
+    }
+
+    #[test]
+    fn recall_caches_invalidate_on_mutation() {
+        // The per-recall region/embedding caches must never serve a stale result:
+        // a node ingested *after* the caches are warm must be visible to recall.
+        let mut mem = CcosMemory::new();
+        mem.ingest_source("src/a.rs", "pub fn alpha_thing() -> u32 { 0 }\n");
+        let _ = mem.recall(&Recall::hybrid("alpha"), 4096); // warm embed cache
+        let _ = mem.recall(&Recall::around("file:src/a.rs"), 4096); // warm region cache
+
+        mem.ingest_source("src/b.rs", "pub fn beta_thing() -> u32 { 1 }\n");
+
+        let w = mem.recall(&Recall::hybrid("beta"), 4096);
+        assert!(
+            w.items.iter().any(|i| i.uri.contains("b.rs")),
+            "post-cache ingest must be visible (embedding cache invalidated): {:?}",
+            w.items.iter().map(|i| &i.uri).collect::<Vec<_>>()
+        );
+        let r = mem.recall(&Recall::around("file:src/b.rs"), 4096);
+        assert!(
+            r.items.iter().any(|i| i.uri.contains("b.rs")),
+            "post-cache ingest must be visible to a region recall (region cache invalidated)"
         );
     }
 

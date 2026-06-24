@@ -6,6 +6,23 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Performance
+
+- **Per-recall caches make recall up to ~5700× faster at scale** (the perf pass —
+  measure-then-fix; see `docs/MEASUREMENT_latency.md`, reproduce with
+  `examples/recall_latency.rs`). A latency benchmark showed recall was super-linear
+  in corpus size because every query recall rebuilt derived structures from scratch:
+  `around`/`task` re-ran the whole **region clustering** (`initialize_regions`), and
+  `semantic`/`hybrid` additionally re-fit the **embedding store** (and the LSA
+  eigensolve under `learned-embed`). `CcosMemory` now memoises both behind a **graph
+  version counter** bumped on every resident-graph mutation; a cache is reused only
+  at the same version, so it is **never stale** and the result is byte-identical to a
+  fresh rebuild — **determinism and `replay == live` are preserved** (a new test
+  asserts a post-warm ingest is visible to the next recall; the full replay suite
+  still passes). At 2000 nodes: `around` 75 ms → 13 µs, `semantic` ~42×, `hybrid`
+  ~21×. (The first recall after a mutation still rebuilds; the win is on the repeated
+  recalls between mutations — the common pattern.)
+
 ### Added
 
 - **Recall-strategy measurement (`examples/recall_eval.rs`) + honest findings**

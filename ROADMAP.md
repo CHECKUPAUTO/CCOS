@@ -110,10 +110,20 @@ seven new slices, and surfaced three real issues, now fixed:
 - **LSA determinism** — `build_embeddings` pins corpus order by id, so the
   `learned-embed` Gram-matrix f64 sum no longer depends on `HashMap` order.
 
-Deferred to the **perf pass** (documented, not regressions): per-ingest `O(cold)`
-budget re-scans, per-recall `cold_neighbours` scan, per-recall embedding-store
-rebuild — to be fixed with incremental counters/indices and a cached,
-dirty-invalidated embedding store.
+## ✅ Done — perf pass (measure-then-fix)
+
+A latency benchmark (`examples/recall_latency.rs`, `docs/MEASUREMENT_latency.md`)
+showed recall was **super-linear** in corpus size because every query recall rebuilt
+derived structures: `around`/`task` re-ran the whole region clustering, and
+`semantic`/`hybrid` re-fit the embedding store (plus the LSA eigensolve). Fixed by
+memoising both behind a **graph version counter** on `CcosMemory` — reused only at
+the same version, so **never stale**, byte-identical to a rebuild, so
+**determinism / `replay == live` hold** (regression-tested). At 2000 nodes:
+`around` **75 ms → 13 µs** (~5700×), `semantic` ~42×, `hybrid` ~21×.
+
+Still deferred (confined to **opt-in / scale** paths, not the default hot path):
+per-ingest `O(cold)` budget re-scans and the `cold_neighbours` scan — both only
+when a spill store / compaction budget is attached or the COLD tier is populated.
 
 ## ✅ Done — audit pass 1 (correctness)
 
