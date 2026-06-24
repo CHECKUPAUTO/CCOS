@@ -41,9 +41,9 @@ fn no_dangling_edges_under_paging_pressure() {
         );
     }
 
-    let ids: HashSet<_> = graph.nodes.keys().cloned().collect();
+    let ids: HashSet<_> = graph.node_ids().cloned().collect();
     let dangling = graph
-        .edges
+        .edges()
         .iter()
         .filter(|e| !ids.contains(&e.source) || !ids.contains(&e.target))
         .count();
@@ -93,7 +93,7 @@ fn eviction_is_deterministic() {
                 NodeType::Unknown,
             );
         }
-        let mut survivors: Vec<String> = g.nodes.keys().map(|k| k.0.clone()).collect();
+        let mut survivors: Vec<String> = g.node_ids().map(|k| k.0.clone()).collect();
         survivors.sort();
         survivors
     }

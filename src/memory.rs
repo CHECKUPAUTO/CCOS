@@ -145,8 +145,8 @@ impl ScoringWeights {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryGraph {
-    pub nodes: HashMap<NodeId, GraphNode>,
-    pub edges: Vec<GraphEdge>,
+    pub(crate) nodes: HashMap<NodeId, GraphNode>,
+    pub(crate) edges: Vec<GraphEdge>,
     pub paging_threshold: f64,
     pub max_in_memory_nodes: usize,
     pub clock: u64,
@@ -535,6 +535,48 @@ impl MemoryGraph {
 
     pub fn edge_count(&self) -> usize {
         self.edges.len()
+    }
+
+    /// A node by id, if present. (Read accessor — `nodes` is `pub(crate)` so
+    /// external callers cannot break the `edges ⊆ nodes²` invariant by removing
+    /// a node out from under its edges.)
+    pub fn node(&self, id: &NodeId) -> Option<&GraphNode> {
+        self.nodes.get(id)
+    }
+
+    /// A mutable node by id. Editing a node's *fields* (score, recency, failure
+    /// pressure…) cannot break the structural invariant — only adding/removing
+    /// nodes or edges can — so this is safe to expose where the structural
+    /// mutators ([`add_edge`](Self::add_edge), [`upsert_node`](Self::upsert_node))
+    /// are not.
+    pub fn node_mut(&mut self, id: &NodeId) -> Option<&mut GraphNode> {
+        self.nodes.get_mut(id)
+    }
+
+    /// Whether a node with this id is present.
+    pub fn contains_node(&self, id: &NodeId) -> bool {
+        self.nodes.contains_key(id)
+    }
+
+    /// All node ids (unordered — sort if you need determinism).
+    pub fn node_ids(&self) -> impl Iterator<Item = &NodeId> + '_ {
+        self.nodes.keys()
+    }
+
+    /// All `(id, node)` pairs (unordered).
+    pub fn node_entries(&self) -> impl Iterator<Item = (&NodeId, &GraphNode)> + '_ {
+        self.nodes.iter()
+    }
+
+    /// All nodes (unordered).
+    pub fn node_values(&self) -> impl Iterator<Item = &GraphNode> + '_ {
+        self.nodes.values()
+    }
+
+    /// The edges as a **read-only** slice — callers can inspect but not push a
+    /// dangling edge or remove an endpoint.
+    pub fn edges(&self) -> &[GraphEdge] {
+        &self.edges
     }
 
     /// Resolve intra-crate imports into `file → file` dependency edges.

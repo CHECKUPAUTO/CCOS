@@ -104,6 +104,13 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Encapsulated `MemoryGraph.{nodes,edges}`** (now `pub(crate)`). External
+  callers go through read accessors — `node`, `node_mut`, `node_ids`,
+  `node_entries`, `node_values`, `contains_node`, `edges()` — instead of touching
+  the maps directly, so the `edges ⊆ nodes²` invariant can no longer be broken
+  from outside the crate (audit pass 3, section C). Internal behaviour is
+  unchanged; a minor breaking change for any external consumer that read the
+  fields.
 - **Repositioned, honestly.** Measurements refute "causal regions retrieve better
   than RAG": on 70 real bug-fix commits causal selection ties (and at a tight
   budget loses to) a lexical TF-IDF retriever, and the crash-trace pivot is beaten
