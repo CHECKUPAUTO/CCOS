@@ -716,7 +716,13 @@ impl CcosMemory {
             .iter()
             .map(|(id, t)| (id.as_str(), t.as_str()))
             .collect();
+        // Default: deterministic INT4 TF-IDF (the measured baseline, replayable).
+        // With `learned-embed`: distil it into a learned latent-semantic (LSA)
+        // projection — still deterministic, so the replay invariant holds.
+        #[cfg(not(feature = "learned-embed"))]
         store.fit_and_embed(pairs);
+        #[cfg(feature = "learned-embed")]
+        store.fit_and_embed_lsa(pairs, 48);
         store
     }
 

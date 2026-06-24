@@ -32,8 +32,10 @@
 //! nn stack and break the replay invariant (weights aren't bit-stable across
 //! builds). TF-IDF is deterministic, dependency-free, and good enough for
 //! code-retrieval where lexicon overlap is high. The module is the
-//! *deterministic floor*; a learned model can slot in later behind a feature
-//! flag without changing the API.
+//! *deterministic floor*; a **learned** embedder slots in behind the
+//! `learned-embed` feature without changing the API — a latent-semantic (LSA)
+//! projection distilled from the corpus by [`fit_and_embed_lsa`](CausalEmbeddings::fit_and_embed_lsa)
+//! (see [`crate::lsa`]), still zero-dependency and deterministic, so replay holds.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -285,6 +287,13 @@ impl Int4Embedding {
 pub struct CausalEmbeddings {
     pub embedder: TfidfEmbedder,
     pub vectors: BTreeMap<String, Int4Embedding>,
+    /// Learned latent-semantic projection (LSA) when the store was fitted via
+    /// [`fit_and_embed_lsa`](Self::fit_and_embed_lsa): a `rank × dim` matrix that
+    /// projects a raw TF-IDF vector into the latent space the stored vectors live
+    /// in. `None` (the default, and the only state from [`fit_and_embed`](Self::fit_and_embed)) ⇒ the
+    /// store holds raw TF-IDF vectors, byte-identical to before LSA existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    projection: Option<Vec<Vec<f32>>>,
 }
 
 impl CausalEmbeddings {
@@ -293,6 +302,7 @@ impl CausalEmbeddings {
         Self {
             embedder: TfidfEmbedder::default(),
             vectors: BTreeMap::new(),
+            projection: None,
         }
     }
 
@@ -301,6 +311,7 @@ impl CausalEmbeddings {
         Self {
             embedder: TfidfEmbedder::new(dim),
             vectors: BTreeMap::new(),
+            projection: None,
         }
     }
 
@@ -317,16 +328,61 @@ impl CausalEmbeddings {
         self.embedder
             .fit(&collected.iter().map(|(_, t)| t.clone()).collect::<Vec<_>>());
         self.vectors.clear();
+        self.projection = None;
         for (id, tokens) in &collected {
             let v = self.embedder.embed(tokens);
             self.vectors.insert(id.clone(), Int4Embedding::from_f32(&v));
         }
     }
 
+    /// Like [`fit_and_embed`](Self::fit_and_embed), but **distils** the TF-IDF
+    /// vectors into a learned **latent-semantic** space — the top-`rank`
+    /// truncated SVD of the document–term matrix ([`crate::lsa`]) — and stores the
+    /// *projected* node vectors. Queries are projected the same way in
+    /// [`embed_query`](Self::embed_query). The projection is learned from the
+    /// corpus's own term co-occurrence, so it captures synonymy/transitivity raw
+    /// TF-IDF cannot, yet it is **fully deterministic** (a fixed Jacobi sweep), so
+    /// the replay invariant holds. This is the opt-in `learned-embed` path; the
+    /// default [`fit_and_embed`](Self::fit_and_embed) is unchanged. `rank` is capped at the corpus size
+    /// (no point asking for more latent factors than there are documents).
+    pub fn fit_and_embed_lsa<'a, I>(&mut self, nodes: I, rank: usize)
+    where
+        I: IntoIterator<Item = (&'a str, &'a str)>,
+    {
+        let collected: Vec<(String, Vec<String>)> = nodes
+            .into_iter()
+            .map(|(id, text)| (id.to_string(), tokenize(text)))
+            .collect();
+        self.embedder
+            .fit(&collected.iter().map(|(_, t)| t.clone()).collect::<Vec<_>>());
+        let raw: Vec<Vec<f32>> = collected
+            .iter()
+            .map(|(_, t)| self.embedder.embed(t))
+            .collect();
+        let proj = crate::lsa::lsa_projection(&raw, rank.min(collected.len()));
+        self.vectors.clear();
+        for ((id, _), r) in collected.iter().zip(&raw) {
+            let latent = if proj.is_empty() {
+                r.clone()
+            } else {
+                crate::lsa::project(r, &proj)
+            };
+            self.vectors
+                .insert(id.clone(), Int4Embedding::from_f32(&latent));
+        }
+        self.projection = (!proj.is_empty()).then_some(proj);
+    }
+
     /// Embed a query string at full precision (queries are transient, no need
-    /// to quantize).
+    /// to quantize). When the store was fitted with a learned LSA projection
+    /// ([`fit_and_embed_lsa`](Self::fit_and_embed_lsa)), the query is projected
+    /// into the same latent space so it is comparable to the stored vectors.
     pub fn embed_query(&self, text: &str) -> Vec<f32> {
-        self.embedder.embed_str(text)
+        let raw = self.embedder.embed_str(text);
+        match &self.projection {
+            Some(proj) => crate::lsa::project(&raw, proj),
+            None => raw,
+        }
     }
 
     /// The most similar node to `query` by cosine, with its score. `None` when
@@ -527,6 +583,51 @@ mod tests {
             let v2 = &s2.vectors[k];
             assert_eq!(v1.codes, v2.codes, "node {k} bit-identical");
             assert_eq!(v1.scales, v2.scales);
+        }
+    }
+
+    #[test]
+    fn lsa_embedding_surfaces_a_synonym_match_and_is_deterministic() {
+        // `car` and `automobile` co-occur (doc0), so the learned latent space
+        // links them — and links both to the rest of the "vehicle" cluster. A
+        // query for `automobile` should then rank doc1 (`car wheel road`, which
+        // never says `automobile`) above the unrelated "food" docs — a match raw
+        // TF-IDF, needing a literal shared term, scores at exactly zero. Rank 2
+        // (< the 6 documents) is what exposes the latent factor.
+        let corpus = [
+            ("v0_bridge", "car automobile fast"),
+            ("v1_car", "car wheel road"),
+            ("v2_auto", "automobile engine speed"),
+            ("f0", "banana smoothie fruit"),
+            ("f1", "banana yogurt bowl"),
+            ("f2", "apple orange juice"),
+        ];
+        let mut lsa = CausalEmbeddings::new();
+        lsa.fit_and_embed_lsa(corpus.iter().copied(), 2);
+        let q = lsa.embed_query("automobile");
+        let ranked = lsa.nearest_k(&q, 6);
+        let pos = |id: &str| ranked.iter().position(|(k, _)| k == id).unwrap();
+        assert!(
+            pos("v1_car") < pos("f0") && pos("v1_car") < pos("f1"),
+            "LSA ranks the synonym-bridged `car` doc above the unrelated food docs: {ranked:?}"
+        );
+        // Raw TF-IDF sees no shared term between `automobile` and the `car` doc.
+        let mut raw = CausalEmbeddings::new();
+        raw.fit_and_embed(corpus.iter().copied());
+        let raw_car = raw.vectors["v1_car"].cosine_f32(&raw.embed_query("automobile"));
+        assert_eq!(
+            raw_car, 0.0,
+            "raw TF-IDF scores the `car` doc at zero for `automobile`"
+        );
+
+        // Deterministic: same corpus ⇒ bit-identical latent store.
+        let mut lsa2 = CausalEmbeddings::new();
+        lsa2.fit_and_embed_lsa(corpus.iter().copied(), 2);
+        for (k, v1) in &lsa.vectors {
+            assert_eq!(
+                v1.codes, lsa2.vectors[k].codes,
+                "node {k} latent bit-identical"
+            );
         }
     }
 }

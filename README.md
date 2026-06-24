@@ -82,6 +82,14 @@ measurements behind the numbers above are in
   for what's failing — so it abstains on a quiet graph and pulls the active problem region in
   once you signal a failure. Deterministic; reachable via the MCP `recall` tool
   (`strategy:"hybrid"`).
+- **Opt-in learned embedder (`learned-embed`).** The semantic signal defaults to
+  deterministic INT4 TF-IDF (the measured baseline). Build with `--features learned-embed`
+  and it's distilled into a **learned latent-semantic (LSA) projection** — the top singular
+  vectors of the corpus's own term co-occurrence, via a fixed Jacobi sweep — so a query term
+  that only *co-occurs* with a file's terms still matches it (synonymy raw TF-IDF can't see).
+  **Zero new dependencies, fully deterministic** (the replay invariant holds); the default
+  build is byte-identical. (Honestly: it's a *linear* distillation, not a neural model — it
+  helps when there are enough files to truncate, and it's opt-in because the eigensolve costs.)
 - **Non-destructive eviction (the "swap").** When the resident set exceeds its cap, CCOS
   **demotes** the coldest nodes — with their edges — into a **COLD tier** instead of dropping
   them, so the working memory is *unbounded-backed*: the resident window stays small
