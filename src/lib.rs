@@ -113,6 +113,7 @@ pub mod incremental;
 pub mod injection_classifier;
 #[cfg(feature = "llm")]
 pub mod llm;
+pub mod lsa;
 pub mod mcp;
 pub mod memory;
 pub mod parser;

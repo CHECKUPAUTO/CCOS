@@ -365,7 +365,7 @@ core. The public surface is: \code{ContextRegionEngine} (\code{cluster\_nodes},
 (\code{RegionCreated}, \code{RegionActivated}, \code{RegionMerged},
 \code{RegionEvicted}, \code{ContextWindowGenerated}). A \code{ccos regions} CLI
 exposes clustering, activation and the locality report. The whole crate builds
-warning-clean under \code{clippy -D warnings} and passes 420 tests.
+warning-clean under \code{clippy -D warnings} and passes 425 tests.
 
 \paragraph{The cognitive MMU, made real.} Paging lives in the code, not only the
 prose: eviction is \emph{non-destructive}. When the resident node set exceeds its
@@ -404,7 +404,12 @@ bias when scores are flat) and speaks for the active problem region once a failu
 is signalled---the CCOS-native attention signal rather than a generic importance
 prior. Deterministic, and an honest improvement to \emph{entry selection} only:
 the downstream region expansion and the evaluation of \S\ref{sec:eval} are
-unchanged.
+unchanged. The semantic signal itself is, by default, deterministic INT4 TF-IDF;
+an opt-in build distils it into a learned \emph{latent-semantic} projection (LSA /
+truncated SVD of the corpus's document--term matrix, via a fixed Jacobi sweep),
+which captures synonymy raw TF-IDF cannot while remaining zero-dependency and
+deterministic --- the ``distil, don't couple'' rule that lets a learned component
+respect the replay invariant.
 
 \section{Evaluation: what we can measure today}\label{sec:eval}
 

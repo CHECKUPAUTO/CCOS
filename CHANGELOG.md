@@ -8,6 +8,19 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Opt-in learned semantic embedder (`learned-embed` feature)** — slice B of better
+  retrieval, completing the arc. A new `src/lsa.rs` distils the deterministic INT4
+  TF-IDF into a learned **latent-semantic (LSA / truncated-SVD) projection**: the top
+  singular vectors of the corpus's document–term matrix, found by a fixed
+  cyclic-Jacobi sweep (zero new dependencies, fully deterministic). It captures
+  synonymy/transitivity raw TF-IDF can't — a query term that only *co-occurs* with a
+  document's terms still matches it. `CausalEmbeddings::fit_and_embed_lsa` stores the
+  projected vectors and `embed_query` projects queries the same way;
+  `build_embeddings` uses it only under `--features learned-embed`, so the **default
+  build stays raw INT4 TF-IDF, byte-identical and replayable** (the embedder's
+  `projection` field is `skip_serializing_if = None`). *Honest scope:* LSA is a
+  linear distillation, not a neural model; it helps most with enough documents to
+  truncate; the eigensolve adds per-build cost, hence opt-in.
 - **Self-improving retrieval from the replayable log** (slice C of better retrieval —
   the CCOS-native gem). A retrieval **reward** is read straight off the hash-chained
   timeline: for each recorded recall, was the node the agent engaged *next* (a

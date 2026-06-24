@@ -42,6 +42,12 @@ default = []
 llm = ["dep:tokio", "dep:reqwest"]
 syn-parser = ["dep:syn", "dep:proc-macro2"]
 mimalloc = ["dep:mimalloc"]
+# Opt-in **learned** semantic embedder: distil the deterministic INT4 TF-IDF into
+# a latent-semantic (LSA / truncated-SVD) projection learned from the corpus's own
+# term co-occurrence. Zero new dependencies and fully deterministic (a fixed Jacobi
+# sweep), so the replay invariant holds; the default build keeps raw TF-IDF, the
+# measured baseline. See `src/lsa.rs` and ROADMAP "better retrieval — slice B".
+learned-embed = []
 
 [dev-dependencies]
 proptest = "1"

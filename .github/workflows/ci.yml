@@ -59,6 +59,9 @@ jobs:
       - name: Test (llm feature — async modules + binary)
         run: cargo test --features llm --locked
 
+      - name: Test (learned-embed feature — LSA semantic embedder)
+        run: cargo test --features learned-embed --locked
+
       - name: Docs
         env:
           RUSTDOCFLAGS: "-D warnings"

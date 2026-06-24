@@ -74,8 +74,19 @@ cognitive MMU, made real: page, don't drop.
   a proxy (the next failing node = the context recall should have surfaced); the
   optimiser is greedy (a local optimum) over the four scoring weights; evaluation is
   one replay per candidate, so it is an offline/maintenance call. (L)
-- **Slice B — opt-in learned embedder** behind a feature flag; INT4 TF-IDF stays
-  the deterministic default (keep the replay invariant). (L) — *the remaining slice.*
+- ✅ **Slice B — opt-in learned embedder behind a feature flag.** A `learned-embed`
+  feature distils the deterministic INT4 TF-IDF into a learned **latent-semantic
+  (LSA / truncated-SVD) projection** — the top singular vectors of the corpus's own
+  document–term matrix, found by a fixed cyclic-Jacobi sweep (`src/lsa.rs`). It
+  captures synonymy/transitivity raw TF-IDF can't (a query term that only
+  *co-occurs* with a doc's terms still matches), yet is **zero-new-dependency and
+  fully deterministic**, so the replay invariant holds. INT4 TF-IDF stays the
+  default (the measured baseline); the projection is wired into `build_embeddings`
+  only under the feature, so the default build is byte-identical. **Honest scope:**
+  LSA is a *linear* distillation (not a neural model); it helps most when there are
+  enough documents to truncate (`rank < docs`); the Gram-matrix eigensolve adds cost
+  to the per-recall embed build, so it is an opt-in. **The better-retrieval arc is
+  now complete (A·B·C).** (L)
 
 ## ✅ Done — audit pass 1 (correctness)
 
