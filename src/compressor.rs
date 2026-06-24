@@ -189,6 +189,25 @@ impl CausalCompressor {
         content: &str,
         causal_score: f64,
     ) -> (String, Option<CcrRef>, CompressionStat) {
+        let (compressed, ccr_ref, stat) = self.compress_item_inner(kind, content, causal_score);
+        // Enforce capacity *after* producing the ref, never evicting it.
+        if let Some(r) = &ccr_ref {
+            let mut keep = std::collections::BTreeSet::new();
+            keep.insert(r.0.clone());
+            self.enforce_ccr_capacity(&keep);
+        }
+        (compressed, ccr_ref, stat)
+    }
+
+    /// The compression primitive: route, compress, and store the original —
+    /// **without** enforcing CCR capacity (the caller does that once per item or
+    /// window via [`enforce_ccr_capacity`](Self::enforce_ccr_capacity)).
+    fn compress_item_inner(
+        &mut self,
+        kind: &str,
+        content: &str,
+        causal_score: f64,
+    ) -> (String, Option<CcrRef>, CompressionStat) {
         let tokens_before = content.chars().count() / 4;
         if content.len() < self.config.min_chars {
             return (content.to_string(), None, passthrough(tokens_before));
@@ -236,19 +255,37 @@ impl CausalCompressor {
         )
     }
 
-    /// Store an original, evicting the oldest entries if over capacity.
+    /// Store an original and return its content-hash ref. Capacity is **not**
+    /// enforced here — that happens in [`enforce_ccr_capacity`](Self::enforce_ccr_capacity)
+    /// *after* a whole item/window is produced, so a ref just handed back is
+    /// never evicted mid-operation (the bug this split fixes).
     fn store(&mut self, original: &str) -> CcrRef {
         let r = CcrRef::of(original);
         self.ccr.insert(r.0.clone(), original.to_string());
-        if self.config.ccr_capacity > 0 && self.ccr.len() > self.config.ccr_capacity {
-            // Evict the first (oldest, since BTreeMap is sorted by key) entry.
-            // Keys are content-hash prefixes, so "oldest" is really
-            // "lowest hash" — deterministic, which is what we need for replay.
-            if let Some(first) = self.ccr.keys().next().cloned() {
-                self.ccr.remove(&first);
+        r
+    }
+
+    /// Evict lowest-hash entries **not** in `keep` until the store is within
+    /// `ccr_capacity`. The `keep` set — the refs produced by the current item or
+    /// window — is never evicted, so the "nothing is lost" guarantee holds even
+    /// when a single window has more items than the capacity (the cap is a floor
+    /// against *older* entries, not a hard limit that can drop a live ref).
+    /// Deterministic: eviction order is by ascending hash key.
+    fn enforce_ccr_capacity(&mut self, keep: &std::collections::BTreeSet<String>) {
+        let cap = self.config.ccr_capacity;
+        if cap == 0 {
+            return;
+        }
+        while self.ccr.len() > cap {
+            match self.ccr.keys().find(|k| !keep.contains(*k)).cloned() {
+                Some(victim) => {
+                    self.ccr.remove(&victim);
+                }
+                // Everything left is live for this operation — keep it all; the
+                // capacity is a floor, not a guillotine for the current window.
+                None => break,
             }
         }
-        r
     }
 
     /// Compress every item in a `RecallWindow`-like vector in place. Each
@@ -271,7 +308,7 @@ impl CausalCompressor {
         let mut compressed: Vec<(String, f64, String, Option<CcrRef>, CompressionStat)> =
             Vec::new();
         for (kind, score, uri, content) in items {
-            let (c, ccr_ref, stat) = self.compress_item(kind, content, score);
+            let (c, ccr_ref, stat) = self.compress_item_inner(kind, content, score);
             compressed.push((uri.to_string(), score, c, ccr_ref, stat));
         }
         // Phase 2: cross-item near-duplicate suppression.
@@ -329,6 +366,13 @@ impl CausalCompressor {
             self.last_stats.push(stat);
             out.push(CompressedItem { content, ccr_ref });
         }
+        // Enforce CCR capacity once, keeping every ref this window handed back —
+        // so "nothing is lost" holds even when the window exceeds the capacity.
+        let keep: std::collections::BTreeSet<String> = out
+            .iter()
+            .filter_map(|it| it.ccr_ref.as_ref().map(|r| r.0.clone()))
+            .collect();
+        self.enforce_ccr_capacity(&keep);
         out
     }
 
@@ -1364,6 +1408,42 @@ pub fn compute(rows: &[Row]) -> i64 {
             assert!(r.is_some(), "item {i} stored");
         }
         assert_eq!(c.ccr_len(), 3, "evicted down to capacity");
+    }
+
+    #[test]
+    fn compress_window_keeps_every_ref_retrievable_below_capacity() {
+        // A single window with MORE stored items than ccr_capacity must still
+        // hand back refs that ALL resolve — "nothing is lost" holds
+        // unconditionally. (The old per-store eviction dropped live refs
+        // mid-window once the window exceeded the capacity.)
+        let cfg = CompressorConfig {
+            ccr_capacity: 2,
+            min_chars: 1,
+            enable_prose: false,
+            enable_code: false,
+            enable_dedup: false,
+            ..CompressorConfig::default()
+        };
+        let mut c = CausalCompressor::with_config(cfg);
+        let originals: Vec<String> = (0..5).map(|i| format!(r#"{{"i":{i}}}"#)).collect();
+        let uris: Vec<String> = (0..5).map(|i| format!("u{i}")).collect();
+        let out = c.compress_window(
+            originals
+                .iter()
+                .zip(&uris)
+                .map(|(o, u)| ("Tool", 0.0, u.as_str(), o.as_str())),
+        );
+        assert_eq!(out.len(), 5);
+        for (i, item) in out.iter().enumerate() {
+            let r = item.ccr_ref.as_ref().expect("item stored");
+            assert_eq!(
+                c.retrieve(r),
+                Some(originals[i].as_str()),
+                "ref for item {i} must remain retrievable within the window"
+            );
+        }
+        // 5 live refs > capacity 2 → the cap is a floor; all five are kept.
+        assert_eq!(c.ccr_len(), 5);
     }
 
     #[test]
