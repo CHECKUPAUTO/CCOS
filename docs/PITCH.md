@@ -93,7 +93,7 @@ tête, masque le reste. Le même flux alimente :
 | **Frugalité** | Le voisinage causal complet = **~4 % du coût** d'envoyer tout le dépôt (**25–30× moins de jetons**). | crate `syn` (191 000 jetons) |
 | **Résolution de bugs multi‑fichiers** | Un LLM local **corrige la cause racine** là où un « dump » de même budget échoue (**3/3 vs 0/3**), sur 2 familles de modèles. | bugs contrôlés, qwen3‑coder 30B & DeepSeek‑V2‑Lite |
 | **Latence sur edge** | **~10 ms** pour rafraîchir le contexte sur un Jetson (mise à jour incrémentale O(Δ)). | matériel cible ARM |
-| **Fiabilité / audit** | Rejeu déterministe, journal infalsifiable, 288 tests verts en intégration continue. | base de code CCOS |
+| **Fiabilité / audit** | Rejeu déterministe, journal infalsifiable, 364 tests verts en intégration continue. | base de code CCOS |
 
 > **À lire honnêtement :** la **couverture** (donner le bon contexte, frugalement) est l'acquis
 > large et solide. Le **gain de résolution** est réel mais **étroit** : il se manifeste sur les
@@ -179,7 +179,7 @@ CCOS est exactement à cette intersection.
 
 *(Section volontairement franche — c'est un gage de sérieux, pas un aveu de faiblesse.)*
 
-- **Stade :** prototype de recherche solide, en Rust (édition 2021), 288 tests + lint stricts en
+- **Stade :** prototype de recherche solide, en Rust (édition 2021), 364 tests + lint stricts en
   CI. **Pré‑produit, pré‑revenu, pré‑traction.** Pas de clients à ce jour.
 - **Ce qui est prouvé :** la couverture frugale (large), le déterminisme/audit, le bouclier validé
   de bout en bout *sur le vrai matériel Jetson*.

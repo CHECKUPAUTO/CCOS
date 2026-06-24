@@ -6,8 +6,9 @@
 //! memory lives in an [`AgentSession`], so the whole interaction is event-sourced
 //! and replayable.
 //!
-//! Tools: `ingest`, `recall`, `signal_failure`, `page_fault`, `stats`, `verify`,
-//! plus the time-travel pair `timeline` / `recall_what_if`. It also exposes two
+//! Nine tools: `ingest`, `recall`, `signal_failure`, `page_fault`, `stats`,
+//! `verify`, the time-travel pair `timeline` / `recall_what_if`, and
+//! `ccos_retrieve` (fetch the original of a compressed item). It also exposes two
 //! read-only **resources** — `ccos://session/context` (the current
 //! self-bounding working set, linearised for direct injection into a system
 //! prompt) and `ccos://session/timeline` (the cognitive journal).

@@ -115,7 +115,7 @@ or loaded from a snapshot (`blame`, `export`):
 
 ```bash
 cargo build --all-targets
-cargo test                    # 212 tests (218 with --features syn-parser)
+cargo test                    # 364 tests (default features; a few more with --features syn-parser/llm)
 cargo clippy --all-targets    # warning-clean (CI denies warnings)
 cargo doc --open              # rendered module docs
 ```
