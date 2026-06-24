@@ -104,6 +104,13 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Unified the two snapshot types.** `persistence::RuntimeState` was a
+  field-for-field duplicate of `persist::KernelSnapshot`; it is now a type alias
+  for it (one state type, two on-disk layouts — single-file vs three-file
+  directory). The load-time integrity check (both hash chains valid + no dangling
+  edges) moved into the shared `KernelSnapshot::verify_integrity`, now also
+  reachable via `KernelSnapshot::load_verified` and reused by the runtime restore.
+  No caller changes (audit pass 3, section B).
 - **Encapsulated `MemoryGraph.{nodes,edges}`** (now `pub(crate)`). External
   callers go through read accessors — `node`, `node_mut`, `node_ids`,
   `node_entries`, `node_values`, `contains_node`, `edges()` — instead of touching

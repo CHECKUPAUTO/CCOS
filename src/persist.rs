@@ -50,6 +50,42 @@ impl KernelSnapshot {
         let data = std::fs::read_to_string(path)?;
         Self::from_json(&data).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
+
+    /// Verify the snapshot's integrity without mutating it: both hash chains
+    /// (the primary [`EventLog`] and the [`DistributedEventLog`]) must validate
+    /// and the graph must hold no dangling edges. Returns the first failure as a
+    /// message. This is the single integrity check shared by the load-and-verify
+    /// path here and by the runtime restore in [`crate::persistence`].
+    pub fn verify_integrity(&self) -> Result<(), String> {
+        let dist = self.dist_log.verify_integrity();
+        if !dist.valid {
+            return Err(format!(
+                "distributed-log chain invalid: {} error(s)",
+                dist.errors.len()
+            ));
+        }
+        let primary = self.event_log.verify_integrity();
+        if !primary.valid {
+            return Err(format!(
+                "event-log chain invalid: {} error(s)",
+                primary.errors.len()
+            ));
+        }
+        let dangling = self.graph.dangling_edge_count();
+        if dangling != 0 {
+            return Err(format!("{dangling} dangling edge(s) in graph"));
+        }
+        Ok(())
+    }
+
+    /// Load a snapshot **and** verify its integrity ([`verify_integrity`](Self::verify_integrity)),
+    /// failing with `InvalidData` if either hash chain or the graph is corrupt.
+    pub fn load_verified(path: &str) -> std::io::Result<Self> {
+        let snap = Self::load(path)?;
+        snap.verify_integrity()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        Ok(snap)
+    }
 }
 
 #[cfg(test)]
@@ -91,5 +127,20 @@ mod tests {
         assert_eq!(restored.event_log.event_count(), 1);
         assert!(restored.dist_log.verify_integrity().valid);
         assert_eq!(restored.version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn verify_integrity_passes_clean_and_rejects_a_tampered_chain() {
+        let mut graph = MemoryGraph::default();
+        graph.upsert_node("a".into(), "A".into(), "x".into(), NodeType::Module);
+        let mut dist_log = DistributedEventLog::new();
+        dist_log.append("e0".into(), "kernel".into());
+        let mut snap = KernelSnapshot::new(graph, EventLog::new("t".into()), dist_log);
+        assert!(snap.verify_integrity().is_ok(), "a clean snapshot verifies");
+        snap.dist_log.hash_chain[0].hash = "deadbeef".repeat(8);
+        assert!(
+            snap.verify_integrity().is_err(),
+            "a tampered chain is rejected"
+        );
     }
 }

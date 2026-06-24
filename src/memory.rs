@@ -579,6 +579,17 @@ impl MemoryGraph {
         &self.edges
     }
 
+    /// Count edges that violate `edges ⊆ nodes²` (an endpoint is missing),
+    /// **without** modifying the graph — the read-only counterpart of
+    /// [`prune_dangling_edges`](Self::prune_dangling_edges), used by integrity
+    /// checks that must not mutate the snapshot they verify.
+    pub fn dangling_edge_count(&self) -> usize {
+        self.edges
+            .iter()
+            .filter(|e| !self.nodes.contains_key(&e.source) || !self.nodes.contains_key(&e.target))
+            .count()
+    }
+
     /// Resolve intra-crate imports into `file → file` dependency edges.
     ///
     /// The parser records imports as `use:<file>:<path>` nodes but does not link

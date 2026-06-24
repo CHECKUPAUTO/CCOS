@@ -14,6 +14,7 @@
 use crate::distributed_event_log::DistributedEventLog;
 use crate::event_log::EventLog;
 use crate::memory::MemoryGraph;
+use crate::persist::KernelSnapshot;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -49,24 +50,14 @@ impl From<serde_json::Error> for PersistenceError {
 }
 
 /// The complete runtime state that survives a restart.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RuntimeState {
-    pub version: String,
-    pub graph: MemoryGraph,
-    pub event_log: EventLog,
-    pub dist_log: DistributedEventLog,
-}
-
-impl RuntimeState {
-    pub fn new(graph: MemoryGraph, event_log: EventLog, dist_log: DistributedEventLog) -> Self {
-        Self {
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            graph,
-            event_log,
-            dist_log,
-        }
-    }
-}
+///
+/// This is the **same payload**, field-for-field, as
+/// [`crate::persist::KernelSnapshot`] (they were duplicated), so `RuntimeState`
+/// is now a type alias for it: one state type, two on-disk layouts —
+/// [`PersistentRuntime`] stores it as a three-file directory, while
+/// [`KernelSnapshot::save`]/[`load`](KernelSnapshot::load) store it as a single
+/// file. The integrity check is shared via [`KernelSnapshot::verify_integrity`].
+pub type RuntimeState = KernelSnapshot;
 
 /// Reads/writes [`RuntimeState`] under a directory.
 #[derive(Debug, Clone)]
@@ -109,32 +100,16 @@ impl PersistentRuntime {
         let graph: MemoryGraph = read_json(&self.graph_path())?;
         let event_log: EventLog = read_json(&self.events_path())?;
         let dist_log: DistributedEventLog = read_json(&self.memory_path())?;
-        Ok(RuntimeState {
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            graph,
-            event_log,
-            dist_log,
-        })
+        Ok(KernelSnapshot::new(graph, event_log, dist_log))
     }
 
     /// Load **and verify** the runtime: the hash chain must validate and the
     /// graph must hold no dangling edges. Returns the ready-to-run state.
     pub fn restore_runtime(&self) -> Result<RuntimeState, PersistenceError> {
-        let mut state = self.load_state()?;
-
-        let report = state.dist_log.verify_integrity();
-        if !report.valid {
-            return Err(PersistenceError::Integrity(format!(
-                "hash chain invalid: {} error(s)",
-                report.errors.len()
-            )));
-        }
-        let dangling = state.graph.prune_dangling_edges();
-        if dangling != 0 {
-            return Err(PersistenceError::Integrity(format!(
-                "{dangling} dangling edge(s) in restored graph"
-            )));
-        }
+        let state = self.load_state()?;
+        state
+            .verify_integrity()
+            .map_err(PersistenceError::Integrity)?;
         Ok(state)
     }
 }
