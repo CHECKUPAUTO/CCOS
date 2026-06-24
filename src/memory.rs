@@ -250,6 +250,13 @@ impl ColdSpill {
         let text = String::from_utf8(bytes).ok()?;
         (sha256_hex(&text) == hash).then_some(text)
     }
+
+    /// Delete a blob by hash (best-effort; a missing file is fine). Used to
+    /// reclaim a spilled original once no COLD entry references it any more — the
+    /// content-addressed store's garbage collection.
+    fn remove(&self, hash: &str) {
+        let _ = std::fs::remove_file(self.dir.join(hash));
+    }
 }
 
 /// A node demoted out of the resident graph into the [`MemoryGraph`] COLD tier,
@@ -274,6 +281,15 @@ struct ColdNode {
     /// whenever nothing is compacted.
     #[serde(default, skip_serializing_if = "is_false")]
     compacted: bool,
+    /// When `true`, compaction tried this entry and could not make it any smaller
+    /// (its content is already at the summary/skeleton floor), so it is excluded
+    /// from future compaction candidates — otherwise every ingest would re-attempt
+    /// it (and re-read its blob from disk) for no gain, and a tier of only
+    /// un-shrinkable entries would busy-loop the enforcer. A fresh ingest of the
+    /// node drops the whole COLD shadow, so the flag never goes stale. Elided when
+    /// `false` (the default) — byte-identical serialization.
+    #[serde(default, skip_serializing_if = "is_false")]
+    at_floor: bool,
 }
 
 /// `skip_serializing_if` predicate: elide a `bool` field when it is `false`.
@@ -344,8 +360,13 @@ impl MemoryGraph {
 
     pub fn upsert_node(&mut self, id: NodeId, label: String, content: String, node_type: NodeType) {
         let now = self.clock;
-        // A fresh ingest supersedes any demoted (COLD) shadow of this node.
-        self.cold.remove(&id);
+        // A fresh ingest supersedes any demoted (COLD) shadow of this node;
+        // reclaim that shadow's spill blob if it was the last referent.
+        if let Some(old) = self.cold.remove(&id) {
+            if let Some(s) = old.spill {
+                self.release_blob_if_orphan(&s.hash);
+            }
+        }
         match self.nodes.get_mut(&id) {
             Some(existing) => {
                 existing.label = label;
@@ -410,7 +431,13 @@ impl MemoryGraph {
 
     pub fn remove_node(&mut self, id: &NodeId) {
         self.nodes.remove(id);
-        self.cold.remove(id); // explicit removal forgets the COLD shadow too
+        // Explicit removal forgets the COLD shadow too — and reclaims its spill
+        // blob if no other cold entry still references it.
+        if let Some(old) = self.cold.remove(id) {
+            if let Some(s) = old.spill {
+                self.release_blob_if_orphan(&s.hash);
+            }
+        }
         self.edges.retain(|e| &e.source != id && &e.target != id);
     }
 
@@ -569,6 +596,7 @@ impl MemoryGraph {
                     edges: incident,
                     spill: None,
                     compacted: false,
+                    at_floor: false,
                 },
             );
         }
@@ -820,6 +848,12 @@ impl MemoryGraph {
         self.cold.get(id).is_some_and(|c| c.compacted)
     }
 
+    /// Whether `id` is a COLD entry parked at the compaction floor — compaction
+    /// tried it and could not shrink it, so it is excluded from further attempts.
+    pub fn is_at_floor(&self, id: &NodeId) -> bool {
+        self.cold.get(id).is_some_and(|c| c.at_floor)
+    }
+
     /// Lossy compaction of one content blob, routed by node kind: code →
     /// skeleton, JSON → crushed, prose → extractive summary. Pure/deterministic.
     /// Returns the compact form (callers adopt it only when it is actually
@@ -840,6 +874,24 @@ impl MemoryGraph {
     /// original's on-disk blob is orphaned — reclaimed by a future GC pass). An
     /// entry that cannot be made smaller is skipped (the summary is the floor),
     /// so the budget is approached best-effort, never by dropping a node.
+    /// Reclaim the on-disk spill blob for `hash` **iff** no COLD entry still
+    /// references it. Safe with content-dedup (two cold nodes can share a blob):
+    /// the file is deleted only once its last referent is gone. A no-op without an
+    /// attached store. This is the GC that keeps the spill store from leaking
+    /// orphaned blobs when a spilled node is re-ingested, removed, or compacted.
+    fn release_blob_if_orphan(&self, hash: &str) {
+        let Some(cfg) = self.spill.as_ref() else {
+            return;
+        };
+        let still_referenced = self
+            .cold
+            .values()
+            .any(|c| c.spill.as_ref().is_some_and(|s| s.hash == hash));
+        if !still_referenced {
+            cfg.store.remove(hash);
+        }
+    }
+
     fn enforce_cold_content_budget(&mut self) {
         let Some(budget) = self.cold_content_budget else {
             return;
@@ -848,11 +900,12 @@ impl MemoryGraph {
         if total <= budget {
             return;
         }
-        // Coldest-first, not-yet-compacted candidates (scores computed up front).
+        // Coldest-first candidates: not already compacted, and not parked at the
+        // compaction floor (un-shrinkable — see `ColdNode::at_floor`).
         let mut candidates: Vec<(NodeId, f64)> = self
             .cold
             .iter()
-            .filter(|(_, c)| !c.compacted)
+            .filter(|(_, c)| !c.compacted && !c.at_floor)
             .map(|(id, c)| (id.clone(), self.compute_node_score(&c.node)))
             .collect();
         candidates.sort_by(|a, b| {
@@ -864,30 +917,40 @@ impl MemoryGraph {
             if total <= budget {
                 break;
             }
-            // Materialise the current content (faulting a spilled blob back in).
-            let (content, kind, old_len) = match self.cold.get(&id) {
+            // Materialise the current content (faulting a spilled blob back in),
+            // keeping the old spill hash so its blob can be reclaimed after.
+            let (content, kind, old_len, old_hash) = match self.cold.get(&id) {
                 Some(c) if !c.compacted => {
                     let kind = format!("{:?}", c.node.node_type);
                     match &c.spill {
                         Some(s) => match self.spill.as_ref().and_then(|cfg| cfg.store.get(&s.hash))
                         {
-                            Some(text) => (text, kind, s.len),
+                            Some(text) => (text, kind, s.len, Some(s.hash.clone())),
                             None => continue, // store detached / blob gone — leave it
                         },
-                        None => (c.node.content.clone(), kind, c.node.content.len()),
+                        None => (c.node.content.clone(), kind, c.node.content.len(), None),
                     }
                 }
                 _ => continue,
             };
             let compact = Self::compact_content(&kind, &content);
             if compact.len() >= content.len() {
-                continue; // already minimal — the summary is the floor
+                // Already at the floor: park it so later passes skip it (no repeat
+                // work, no repeat disk read) rather than re-attempting every ingest.
+                if let Some(entry) = self.cold.get_mut(&id) {
+                    entry.at_floor = true;
+                }
+                continue;
             }
             let new_len = compact.len();
             if let Some(entry) = self.cold.get_mut(&id) {
                 entry.node.content = compact;
-                entry.spill = None; // discard the full original (orphans any blob)
+                entry.spill = None; // discard the full original
                 entry.compacted = true;
+            }
+            // The original blob may now be orphaned — reclaim it if so.
+            if let Some(h) = old_hash {
+                self.release_blob_if_orphan(&h);
             }
             total = total.saturating_sub(old_len).saturating_add(new_len);
         }
@@ -2108,6 +2171,92 @@ mod tests {
             !a.is_empty(),
             "the budget should have forced some compaction"
         );
+    }
+
+    // ── audit pass 4: spill-blob GC (F1) and compaction floor (F5) ────────────
+
+    #[test]
+    fn removing_a_spilled_node_reclaims_its_blob() {
+        let mut g = MemoryGraph::new(0.2, 1);
+        for i in 0..3 {
+            let id = format!("n{i}");
+            g.upsert_node(
+                id.clone().into(),
+                id,
+                format!("c{i} {}", "p".repeat(80)),
+                NodeType::Symbol,
+            );
+        }
+        let dir = spill_temp_dir("gc_remove");
+        g.attach_cold_spill(&dir, 0).unwrap(); // budget 0 ⇒ spill all cold content
+        let spilled: Vec<NodeId> = g
+            .cold_ids()
+            .filter(|id| g.is_spilled(id))
+            .cloned()
+            .collect();
+        assert!(spilled.len() >= 2, "expected several spilled nodes");
+        let before = std::fs::read_dir(&dir).unwrap().count();
+        let victim = spilled[0].clone();
+        g.remove_node(&victim);
+        let after = std::fs::read_dir(&dir).unwrap().count();
+        assert_eq!(
+            after,
+            before - 1,
+            "removing a spilled node reclaims exactly its (unshared) blob: {before} -> {after}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn gc_keeps_a_blob_shared_by_another_cold_node() {
+        // a and b have IDENTICAL content ⇒ one deduplicated blob. Removing a must
+        // NOT delete it, because b still references it.
+        let mut g = MemoryGraph::new(0.2, 1);
+        let shared = format!("shared body {}", "x".repeat(80));
+        g.upsert_node("a".into(), "a".into(), shared.clone(), NodeType::Symbol);
+        g.upsert_node("b".into(), "b".into(), shared.clone(), NodeType::Symbol);
+        g.upsert_node(
+            "c".into(),
+            "c".into(),
+            format!("other {}", "y".repeat(80)),
+            NodeType::Symbol,
+        );
+        let dir = spill_temp_dir("gc_dedup");
+        g.attach_cold_spill(&dir, 0).unwrap();
+        assert!(
+            g.is_spilled(&NodeId("a".into())) && g.is_spilled(&NodeId("b".into())),
+            "a and b should both be spilled (and dedup to one blob)"
+        );
+        g.remove_node(&NodeId("a".into()));
+        // b's shared blob must have survived: it still faults back losslessly.
+        assert!(
+            g.page_in(&NodeId("b".into())),
+            "b's shared blob must survive a's removal"
+        );
+        assert_eq!(g.node(&NodeId("b".into())).unwrap().content, shared);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn compaction_parks_unshrinkable_entries_at_the_floor() {
+        let mut g = MemoryGraph::new(0.2, 1);
+        // Tiny content that cannot summarise/skeletonise smaller.
+        for i in 0..4 {
+            let id = format!("n{i}");
+            g.upsert_node(id.clone().into(), id, format!("x{i}"), NodeType::Symbol);
+        }
+        assert!(g.cold_count() >= 3);
+        g.set_cold_content_budget(Some(1)); // impossibly tight ⇒ nothing shrinks
+        let parked = g.cold_ids().filter(|id| g.is_at_floor(id)).count();
+        assert!(
+            parked > 0,
+            "un-shrinkable cold entries are parked at the floor, not re-tried forever"
+        );
+        // Nothing was actually compacted (they couldn't shrink), and re-enforcing
+        // is idempotent (the parked entries are skipped).
+        assert_eq!(g.cold_compacted_count(), 0);
+        g.set_cold_content_budget(Some(1));
+        assert_eq!(g.cold_ids().filter(|id| g.is_at_floor(id)).count(), parked);
     }
 
     #[test]
