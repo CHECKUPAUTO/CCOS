@@ -36,6 +36,9 @@
 //! - [`Recall::Semantic`] — a free-text task resolved by **semantic** similarity
 //!   (INT4 TF-IDF cosine over [`crate::embeddings`]), expanded to its region;
 //!   falls back to the lexical entry below the embedding noise floor.
+//! - [`Recall::Hybrid`] — a free-text task whose entry node is chosen by
+//!   **reciprocal-rank fusion** of the lexical, semantic, and causal rankings,
+//!   then expanded to its region. The most robust entry point.
 //!
 //! ## Example
 //!
@@ -131,6 +134,17 @@ pub enum Recall {
     /// file never says "timeout"; falls back to the lexical entry when the
     /// embedding signal is below the noise floor.
     Semantic(String),
+    /// A free-text task resolved by **hybrid fusion**: three independent rankings
+    /// of the nodes — lexical token overlap, semantic (INT4 TF-IDF cosine), and
+    /// the causal active-failure focus — are combined by **reciprocal-rank
+    /// fusion** to pick the entry node, which is then expanded to its causal
+    /// region. No cross-signal score calibration is needed (RRF ranks, it does
+    /// not add scores), so a node strong on any one axis can still win, and a node
+    /// decent across *several* beats a node that spikes on one. The causal vote is
+    /// sparse — it speaks only for the active problem region — so on a quiet graph
+    /// this fuses lexical and semantic, and once a failure is signalled the
+    /// failing region joins the vote. The most robust entry point; deterministic.
+    Hybrid(String),
 }
 
 impl Recall {
@@ -150,6 +164,11 @@ impl Recall {
     /// Recall from a free-text task description.
     pub fn task(text: impl Into<String>) -> Self {
         Recall::Task(text.into())
+    }
+    /// Recall from a free-text task description by **hybrid fusion** of the
+    /// lexical, semantic, and causal rankings (reciprocal-rank fusion).
+    pub fn hybrid(text: impl Into<String>) -> Self {
+        Recall::Hybrid(text.into())
     }
 }
 
@@ -654,11 +673,7 @@ impl CcosMemory {
     /// Best lexical entry node for a free-text task (token overlap on
     /// label+content), or `None` if nothing matches.
     fn lexical_entry(&self, text: &str) -> Option<String> {
-        let q: Vec<String> = text
-            .split(|c: char| !c.is_alphanumeric() && c != '_')
-            .filter(|t| t.len() > 2)
-            .map(|t| t.to_lowercase())
-            .collect();
+        let q = query_tokens(text);
         self.graph
             .nodes
             .values()
@@ -715,6 +730,94 @@ impl CcosMemory {
                 self.lexical_entry(text)
             }
         })
+    }
+
+    /// Hybrid entry point: fuse three independent rankings of the nodes —
+    /// **lexical** token overlap, **semantic** INT4-TF-IDF cosine, and the
+    /// **causal** active-failure focus — by **reciprocal-rank fusion** (RRF) and
+    /// return the top-fused node id. RRF compares *ranks*, not raw scores, so the
+    /// three incomparable signals fuse without calibration: a node strong on any
+    /// single axis can still surface, while a node ranking decently across several
+    /// outranks one that spikes on a lone signal. Each signal contributes
+    /// `1/(K + rank)` per node it ranks (standard RRF, `K = 60`), considering only
+    /// its top entries. The causal signal is **sparse** — it ranks only nodes
+    /// under failure pressure, so it abstains on a quiet graph (no spurious
+    /// id-ordered bias) and speaks up for the active problem region when the
+    /// workspace is working one. Deterministic — ties break on the node id.
+    /// `None` only when no signal fires (empty graph / no lexical overlap, an
+    /// empty embedding store, and nothing failing).
+    fn hybrid_entry(
+        &self,
+        text: &str,
+        store: &crate::embeddings::CausalEmbeddings,
+    ) -> Option<String> {
+        const DEPTH: usize = 32; // per-signal rank depth considered
+        const RRF_K: f64 = 60.0; // standard RRF damping constant
+
+        // 1) Lexical: token-overlap count, descending (ties on id ascending).
+        let q = query_tokens(text);
+        let mut lexical: Vec<(usize, String)> = self
+            .graph
+            .nodes
+            .values()
+            .map(|n| {
+                let hay = format!("{} {}", n.label, n.content).to_lowercase();
+                let overlap = q.iter().filter(|t| hay.contains(t.as_str())).count();
+                (overlap, n.id.0.clone())
+            })
+            .filter(|(o, _)| *o > 0)
+            .collect();
+        lexical.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        let lexical: Vec<String> = lexical.into_iter().take(DEPTH).map(|(_, id)| id).collect();
+
+        // 2) Semantic: cosine over the INT4 store (already returned sorted).
+        let semantic: Vec<String> = if store.is_empty() {
+            Vec::new()
+        } else {
+            store
+                .nearest_k(&store.embed_query(text), DEPTH)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect()
+        };
+
+        // 3) Causal: the **active failure focus** — only nodes under failure
+        //    pressure, ranked by causal score. Deliberately *sparse*: it abstains
+        //    on a quiet graph (so it never injects an id-ordered bias when scores
+        //    are flat), and when the workspace is actually working a problem the
+        //    failing region gets a vote. This is the CCOS-native signal — attention
+        //    driven by what is failing — not a generic global-importance ranking.
+        let mut causal: Vec<(f64, String)> = self
+            .graph
+            .nodes
+            .values()
+            .filter(|n| n.failure_relevance > 0.0)
+            .map(|n| (self.graph.compute_node_score(n), n.id.0.clone()))
+            .collect();
+        causal.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| a.1.cmp(&b.1))
+        });
+        let causal: Vec<String> = causal.into_iter().take(DEPTH).map(|(_, id)| id).collect();
+
+        // Reciprocal-rank fusion over the three ranked lists.
+        let mut fused: BTreeMap<String, f64> = BTreeMap::new();
+        for list in [&lexical, &semantic, &causal] {
+            for (rank, id) in list.iter().enumerate() {
+                *fused.entry(id.clone()).or_default() += 1.0 / (RRF_K + (rank as f64) + 1.0);
+            }
+        }
+        // Top-fused; deterministic tie-break: smallest id wins (BTreeMap is
+        // id-ordered, and `b.0.cmp(&a.0)` makes the smaller id compare greater).
+        fused
+            .into_iter()
+            .max_by(|a, b| {
+                a.1.partial_cmp(&b.1)
+                    .unwrap_or(Ordering::Equal)
+                    .then_with(|| b.0.cmp(&a.0))
+            })
+            .map(|(id, _)| id)
     }
 
     /// Content a node contributes to a recall window: its own **granular** content
@@ -892,6 +995,16 @@ fn normalize(uri: &str) -> String {
     }
 }
 
+/// Tokenise a free-text query the same way the lexical and hybrid entry points
+/// do: lowercase alphanumeric/underscore runs longer than two chars. Shared so
+/// the two paths stay consistent.
+fn query_tokens(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|t| t.len() > 2)
+        .map(|t| t.to_lowercase())
+        .collect()
+}
+
 /// Resolve a workspace path to its state **file**. A plain path is used as-is; an
 /// existing directory becomes `<dir>/workspace.ccos` inside it (so a launcher that
 /// pre-creates the workspace as a directory works instead of erroring with "Is a
@@ -1025,6 +1138,20 @@ impl ExternalMemory for CcosMemory {
                     None => {
                         self.assemble_window("semantic-region", Vec::new(), budget_tokens, None)
                     }
+                }
+            }
+            Recall::Hybrid(text) => {
+                let store = self.build_embeddings();
+                match self.hybrid_entry(text, &store) {
+                    Some(entry) => {
+                        let anchor = NodeId(normalize(&entry));
+                        let ids = self.region_member_ids(&entry);
+                        let hops = proximity_hops();
+                        let dist = self.hop_distances(&anchor, hops);
+                        let prox = (&dist, proximity_decay(), hops);
+                        self.assemble_window("hybrid-region", ids, budget_tokens, Some(prox))
+                    }
+                    None => self.assemble_window("hybrid-region", Vec::new(), budget_tokens, None),
                 }
             }
         }
@@ -1453,6 +1580,80 @@ mod tests {
             win.items.iter().any(|i| i.uri.contains("db.rs")),
             "semantic window includes the topic file: {:?}",
             win.items.iter().map(|i| &i.uri).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn recall_hybrid_is_wired_and_resolves_a_region() {
+        let mut mem = CcosMemory::new();
+        mem.ingest_source(
+            "src/db.rs",
+            "pub fn connection_pool_acquire() -> u32 { 30 }\n",
+        );
+        mem.ingest_source("src/api.rs", "pub fn handler() -> u32 { 0 }\n");
+        let win = mem.recall(&Recall::hybrid("connection pool acquire"), 2048);
+        assert_eq!(win.strategy, "hybrid-region");
+        assert!(!win.items.is_empty(), "hybrid recall returns a window");
+        assert!(
+            win.items.iter().any(|i| i.uri.contains("db.rs")),
+            "hybrid window includes the topic file: {:?}",
+            win.items.iter().map(|i| &i.uri).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn recall_hybrid_is_deterministic() {
+        fn build() -> Vec<String> {
+            let mut mem = CcosMemory::new();
+            mem.ingest_source(
+                "src/db.rs",
+                "pub fn connection_pool_acquire() -> u32 { 30 }\n",
+            );
+            mem.ingest_source("src/api.rs", "pub fn handler_for_pool() -> u32 { 0 }\n");
+            mem.ingest_source("src/util.rs", "pub fn retry_once() -> u32 { 1 }\n");
+            mem.recall(&Recall::hybrid("connection pool retry"), 2048)
+                .items
+                .iter()
+                .map(|i| i.uri.clone())
+                .collect()
+        }
+        assert_eq!(build(), build(), "hybrid recall is deterministic");
+    }
+
+    #[test]
+    fn hybrid_fusion_outvotes_a_lexical_decoy_using_semantic_and_causal() {
+        // The query's common words (`handler`, `retry`) appear in several files
+        // (low IDF); its rare word (`pool`) appears in exactly one (high IDF).
+        let mut mem = CcosMemory::new();
+        // Decoy: the most *literal* matches (handler+retry), but generic and quiet.
+        mem.ingest_source("src/aaa_decoy.rs", "pub fn handler_retry() -> u32 { 0 }\n");
+        mem.ingest_source(
+            "src/b_util.rs",
+            "pub fn handler_retry_helper() -> u32 { 1 }\n",
+        );
+        mem.ingest_source(
+            "src/c_util.rs",
+            "pub fn handler_retry_worker() -> u32 { 2 }\n",
+        );
+        // Topic: the unique high-IDF term `pool`, and the active failing area.
+        mem.ingest_source("src/z_pool.rs", "pub fn pool_acquire() -> u32 { 30 }\n");
+        mem.signal_failure("file:src/z_pool.rs", 1).unwrap();
+
+        let query = "handler pool retry";
+        // Pure lexical overlap is maximised by the decoy (handler + retry).
+        let lexical = mem.recall(&Recall::task(query), 4096);
+        assert!(
+            lexical.items.iter().any(|i| i.uri.contains("aaa_decoy.rs")),
+            "pure lexical picks the decoy: {:?}",
+            lexical.items.iter().map(|i| &i.uri).collect::<Vec<_>>()
+        );
+        // Fusion outvotes it: the topic leads two signals (semantic on the rare
+        // term `pool`, causal via the failure) and so wins the fused entry.
+        let hybrid = mem.recall(&Recall::hybrid(query), 4096);
+        assert!(
+            hybrid.items.iter().any(|i| i.uri.contains("z_pool.rs")),
+            "hybrid fusion surfaces the high-IDF, failing topic instead: {:?}",
+            hybrid.items.iter().map(|i| &i.uri).collect::<Vec<_>>()
         );
     }
 

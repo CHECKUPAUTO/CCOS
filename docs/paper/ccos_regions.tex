@@ -350,7 +350,7 @@ core. The public surface is: \code{ContextRegionEngine} (\code{cluster\_nodes},
 (\code{RegionCreated}, \code{RegionActivated}, \code{RegionMerged},
 \code{RegionEvicted}, \code{ContextWindowGenerated}). A \code{ccos regions} CLI
 exposes clustering, activation and the locality report. The whole crate builds
-warning-clean under \code{clippy -D warnings} and passes 413 tests.
+warning-clean under \code{clippy -D warnings} and passes 416 tests.
 
 \paragraph{The cognitive MMU, made real.} Paging lives in the code, not only the
 prose: eviction is \emph{non-destructive}. When the resident node set exceeds its
@@ -377,6 +377,19 @@ the cold \emph{content} footprint, not the entry \emph{count}. Both spill and
 compaction are opt-in; the default path keeps them off and serialization
 byte-identical, so the determinism guarantees of \S\ref{sec:determinism} are
 untouched.
+
+\paragraph{Hybrid entry fusion.} A free-text recall resolves its entry node by
+\emph{reciprocal-rank fusion}~\cite{cormack2009reciprocal} of three independent
+rankings---lexical token overlap, semantic INT4-TF-IDF cosine, and a causal
+\emph{active-failure} focus---before the usual region expansion. RRF compares
+ranks, not raw scores, so the three incomparable signals fuse without
+calibration. The causal vote is deliberately \emph{sparse}: it ranks only nodes
+under failure pressure, so it abstains on a quiet graph (no spurious id-ordered
+bias when scores are flat) and speaks for the active problem region once a failure
+is signalled---the CCOS-native attention signal rather than a generic importance
+prior. Deterministic, and an honest improvement to \emph{entry selection} only:
+the downstream region expansion and the evaluation of \S\ref{sec:eval} are
+unchanged.
 
 \section{Evaluation: what we can measure today}\label{sec:eval}
 
@@ -756,6 +769,9 @@ Long Contexts. \emph{TACL}, 2024. arXiv:2307.03172.
 Language Model Serving with PagedAttention. \emph{SOSP}, 2023. arXiv:2309.06180.
 \bibitem{haber1991timestamp} S.~Haber and W.~S.~Stornetta. How to Time-Stamp a
 Digital Document. \emph{Journal of Cryptology}, 3(2), 1991.
+\bibitem{cormack2009reciprocal} G.~V.~Cormack, C.~L.~A.~Clarke, and S.~B\"uttcher.
+Reciprocal Rank Fusion Outperforms Condorcet and Individual Rank Learning Methods.
+\emph{SIGIR}, 2009.
 \bibitem{jimenez2023swebench} C.~E.~Jimenez et al. SWE-bench: Can Language Models
 Resolve Real-World GitHub Issues? \emph{ICLR}, 2024. arXiv:2310.06770.
 \end{thebibliography}
