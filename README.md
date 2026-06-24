@@ -78,8 +78,10 @@ measurements behind the numbers above are in
   **demotes** the coldest nodes — with their edges — into a **COLD tier** instead of dropping
   them, so the working memory is *unbounded-backed*: the resident window stays small
   (frugality), the backing store grows into available RAM, and **nothing is lost**. Any node
-  pages back on demand (`page_in`), and a `signal_failure` on a demoted node **resurrects it
-  from COLD** automatically (a page fault). The cognitive-MMU promise made literal — "infinite"
+  pages back on demand (`page_in`); on the read paths the tier is **transparent** — a
+  `signal_failure` or a `page_fault` resurrects a demoted faulting file, and a **recall around**
+  a demoted node pages it (and its cold neighbours) back automatically. The cognitive-MMU
+  promise made literal — "infinite"
   working memory as a *direction*, expressed concretely as **frugality × available RAM**
   (`MemoryStats.cold` surfaces the tier). Deterministic.
 

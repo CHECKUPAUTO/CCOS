@@ -293,8 +293,18 @@ impl AgentSession {
         self.live.signal_failure(node, depth)
     }
 
-    /// Record and run a recall (read-only, but logged so the timeline is complete).
+    /// Record and run a recall. Read-only for *selection*, with one deterministic
+    /// side effect: a recall *around* a node that was demoted to the COLD tier
+    /// pages it (and its cold neighbours) back first — a page fault on the read
+    /// path. The op is logged and the page-in is reproduced on replay, so the
+    /// timeline stays complete and `replay == live`.
     pub fn recall(&mut self, recall: Recall, budget: usize) -> RecallWindow {
+        // Page fault on the read path: a recall *around* a demoted node pages it
+        // (and its cold neighbours) back from the COLD tier first, so the cold
+        // tier is transparent to a recalling agent.
+        if let Recall::Around(uri) = &recall {
+            self.live.ensure_resident(uri);
+        }
         let window = self.live.recall(&recall, budget);
         self.ops.push(Op::Recall { recall, budget });
         window
@@ -310,6 +320,9 @@ impl AgentSession {
     /// post-selection transform, so the causal graph, the scoring, the paging
     /// and the hash-chain replay invariants are untouched.
     pub fn recall_compressed(&mut self, recall: Recall, budget: usize) -> RecallWindow {
+        if let Recall::Around(uri) = &recall {
+            self.live.ensure_resident(uri);
+        }
         let window = self
             .live
             .recall_compressed(&recall, budget, &mut self.compressor);
@@ -336,6 +349,9 @@ impl AgentSession {
         budget: usize,
         max_rounds: usize,
     ) -> RecallWindow {
+        if let Recall::Around(uri) = &recall {
+            self.live.ensure_resident(uri);
+        }
         let window = self.live.recall_compressed_with_feedback(
             &recall,
             budget,
@@ -424,7 +440,15 @@ impl AgentSession {
                         let _ = m.signal_failure(&format!("file:{f}"), *depth);
                     }
                 }
-                Op::Recall { .. } => {} // read-only: no state change
+                Op::Recall { recall, .. } => {
+                    // A recall is read-only for *selection*, but a recall *around*
+                    // a demoted node pages it (and its cold neighbours) back from
+                    // the COLD tier — a side effect on the resident/cold partition.
+                    // Reproduce it so replay matches live (deterministic page-in).
+                    if let Recall::Around(uri) = recall {
+                        m.ensure_resident(uri);
+                    }
+                }
             }
         }
         m
@@ -785,6 +809,58 @@ mod tests {
         let replayed = s.replay_to(s.len());
         assert_eq!(replayed.stats().nodes, s.memory().stats().nodes);
         assert!(s.timeline().last().unwrap().contains("PageFault"));
+    }
+
+    #[test]
+    fn recall_around_pages_a_demoted_anchor_back_from_cold() {
+        use crate::memory::NodeId;
+        let mut s = AgentSession::new();
+        s.ingest("src/db.rs", "pub fn query() -> i64 { 0 }\n");
+        s.ingest(
+            "src/api.rs",
+            "use crate::db;\npub fn h() -> i64 { db::query() }\n",
+        );
+        // Shrink the frugal resident window so some nodes demote to COLD.
+        s.live.set_max_resident(1);
+        assert!(
+            s.live.graph().cold_count() > 0,
+            "some nodes demoted to COLD"
+        );
+
+        let cold_id = s.live.graph().cold_ids().next().unwrap().0.clone();
+        assert!(s.live.graph().is_cold(&NodeId(cold_id.clone())));
+
+        // A recall *around* the demoted node pages it back from COLD first
+        // (the page fault on the read path) — transparent to the agent.
+        let _ = s.recall(Recall::around(&cold_id), 4096);
+        assert!(
+            s.live.graph().contains_node(&NodeId(cold_id.clone())),
+            "the cold anchor is paged back in by recall"
+        );
+        assert!(!s.live.graph().is_cold(&NodeId(cold_id)), "no longer cold");
+    }
+
+    #[test]
+    fn page_fault_resurrects_a_demoted_faulting_file() {
+        use crate::memory::NodeId;
+        let mut s = AgentSession::new();
+        s.ingest("src/db.rs", "pub fn query() -> i64 { 0 }\n");
+        s.ingest(
+            "src/api.rs",
+            "use crate::db;\npub fn h() -> i64 { db::query() }\n",
+        );
+        s.live.set_max_resident(1);
+        assert!(s.live.graph().cold_count() > 0);
+
+        // A crash trace blaming db.rs pages the (demoted) file back in before recall.
+        let win = s.page_fault("thread 'main' panicked at src/db.rs:1:1:\nboom\n", 4096);
+        assert!(
+            s.live
+                .graph()
+                .contains_node(&NodeId("file:src/db.rs".into())),
+            "the faulting file is resident after the page fault"
+        );
+        assert!(win.items.iter().any(|i| i.uri == "file:src/db.rs"));
     }
 
     /// A field finding: depth-2 propagation left a 3-hop cause un-pressurised. With

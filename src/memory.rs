@@ -4,7 +4,7 @@ use crate::eviction_policy::{
 };
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BinaryHeap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeId(pub String);
@@ -518,6 +518,30 @@ impl MemoryGraph {
     /// The ids currently in the COLD tier, in sorted (deterministic) order.
     pub fn cold_ids(&self) -> impl Iterator<Item = &NodeId> + '_ {
         self.cold.keys()
+    }
+
+    /// The **cold** neighbours of `id` — the other endpoints of any COLD-archived
+    /// edge incident to `id` that are themselves cold, i.e. the rest of `id`'s
+    /// causal region that would page in alongside it. Scans all COLD entries (an
+    /// edge is archived with whichever endpoint was demoted first, so a single
+    /// entry is not enough for a symmetric answer). Sorted (deterministic).
+    pub fn cold_neighbours(&self, id: &NodeId) -> Vec<NodeId> {
+        let mut out: BTreeSet<NodeId> = BTreeSet::new();
+        for c in self.cold.values() {
+            for e in &c.edges {
+                let other = if &e.source == id {
+                    &e.target
+                } else if &e.target == id {
+                    &e.source
+                } else {
+                    continue;
+                };
+                if other != id && self.cold.contains_key(other) {
+                    out.insert(other.clone());
+                }
+            }
+        }
+        out.into_iter().collect()
     }
 
     /// Remove any edge whose endpoints are no longer present in the graph and
@@ -1385,6 +1409,30 @@ mod tests {
 
         // page_in on an id that is not cold is a no-op.
         assert!(!g.page_in(&NodeId("nope".into())));
+    }
+
+    #[test]
+    fn cold_neighbours_is_symmetric_across_demotion_order() {
+        let mut g = MemoryGraph::new(0.2, 100);
+        for id in ["a", "b", "c"] {
+            g.upsert_node(id.into(), id.into(), "x".into(), NodeType::Symbol);
+        }
+        g.add_edge("a".into(), "b".into(), 0.6, EdgeType::DependsOn);
+        // Demote everything (a target resident set of 0).
+        g.max_in_memory_nodes = 0;
+        g.enforce_paging();
+        assert_eq!(g.node_count(), 0);
+        assert_eq!(g.cold_count(), 3);
+        // a–b are neighbours regardless of which was archived with the edge; c is isolated.
+        assert_eq!(
+            g.cold_neighbours(&NodeId("a".into())),
+            vec![NodeId("b".into())]
+        );
+        assert_eq!(
+            g.cold_neighbours(&NodeId("b".into())),
+            vec![NodeId("a".into())]
+        );
+        assert!(g.cold_neighbours(&NodeId("c".into())).is_empty());
     }
 
     #[test]

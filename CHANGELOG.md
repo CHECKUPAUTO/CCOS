@@ -8,6 +8,15 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Page-fault from the COLD tier on the read paths** (slice 2 of unbounded
+  working memory). A `page_fault` now resurrects cold *faulting* files (its
+  per-file `signal_failure` is cold-aware), and a `recall` **around** a demoted
+  node pages it — and its cold neighbours (`MemoryGraph::cold_neighbours`) — back
+  into the resident graph via the new `CcosMemory::ensure_resident`, wired into
+  `AgentSession::recall` / `recall_compressed` / `recall_compressed_with_feedback`.
+  The page-in is a deterministic, **replayed** side effect (`Op::Recall` reproduces
+  it), so `replay == live` holds. New `CcosMemory::set_max_resident` configures the
+  frugal resident-window size.
 - **Non-destructive eviction → a COLD tier (the "swap").** First slice of the
   *unbounded working memory* direction (frugality × available RAM). Evicting a
   node from the resident graph now **demotes** it — with its incident edges — into

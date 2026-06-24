@@ -16,9 +16,12 @@ cognitive MMU, made real: page, don't drop.
   grows into RAM, and `MemoryGraph::page_in` brings anything back. A failure on a
   demoted node resurrects it (a page fault) rather than erroring. Observable via
   `MemoryStats.cold`. Deterministic (sorted demotion, BTreeMap COLD store).
-- **Slice 2 — page-fault from COLD on every read path.** (Partly done: failures
-  resurrect.) Extend to `recall` anchors and the crash-trace pivot, so any
-  referenced cold node is paged back automatically. (M)
+- ✅ **Slice 2 — page-fault from COLD on the read paths.** `page_fault` resurrects
+  cold faulting files (via the cold-aware `signal_failure`); a `recall` *around* a
+  demoted node pages it **and its cold neighbours** (`MemoryGraph::cold_neighbours`)
+  back via `CcosMemory::ensure_resident`, wired into `AgentSession::recall*` and
+  **reproduced on replay** so `replay == live`. `set_max_resident` exposes the
+  frugal-window knob.
 - **Slice 3 — spill COLD to disk, compressed** (reuse the CCR store) → RAM-bounded,
   disk-unbounded: push the ratio further. (M)
 - **Slice 4 — bound + compact COLD** (the final tier): summarise the coldest
