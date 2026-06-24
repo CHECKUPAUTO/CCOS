@@ -110,12 +110,15 @@ honesty code↔docs↔paper, tests/API). **Fixed in this pass:**
 
 **Remaining (decisions / larger work, not bugs):**
 
-### A — Wire in or retire the unwired recent modules
-- `embeddings` (semantic recall) and `eviction_policy` (learned paging) are built and
-  tested but unreachable from the live recall/ingest path. **Decide:** wire in (a
-  `Recall::Semantic`; blend the policy into `enforce_paging`) or remove. (M)
-- `injection_classifier` runs only in `ccos sanitize`. Decide whether to surface an
-  injection score in `IngestReport` or keep it CLI-only. (S)
+### A — Wire in the unwired recent modules — ✅ done
+- ✅ `embeddings` → a `Recall::Semantic` strategy (INT4 TF-IDF cosine entry), exposed
+  via the MCP `recall` tool + `ccos memory`. *(Follow-up: cache the per-call store —
+  see C.)*
+- ✅ `eviction_policy` → blended into `MemoryGraph::enforce_paging` (untrained ⇒
+  identical to the greedy; `train_eviction_policy` fits it offline). *(Follow-up:
+  derive training transitions from the live op-log instead of an external feed.)*
+- ✅ `injection_classifier` → `IngestReport.injection_score` / `injection_flagged`
+  via a shared detector, on the live ingest/MCP path.
 
 ### B — Collapse duplicated abstractions
 - One snapshot type: merge `persist::KernelSnapshot` and `persistence::RuntimeState`

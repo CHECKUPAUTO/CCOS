@@ -8,6 +8,18 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Wired the recent modules onto the live path.** Three capabilities that were
+  in-tree but unreachable from the live recall/ingest core are now connected:
+  (1) **semantic recall** — a new `Recall::Semantic` strategy resolves a
+  free-text task to its entry node by INT4 TF-IDF cosine (`embeddings`), exposed
+  via the MCP `recall` tool and `ccos memory`; (2) **injection signal at ingest**
+  — every `IngestReport` now carries `injection_score` / `injection_flagged` from
+  a shared `InjectionDetector`, so the signal is recorded on the live path, not
+  only in `ccos sanitize`; (3) **learned eviction** — `MemoryGraph::enforce_paging`
+  now consults `EvictionPolicy`, blending its learned keep/evict preference into
+  the eviction order. The policy is **untrained by default**, in which case paging
+  is byte-identical to the deterministic greedy (never worse); `train_eviction_policy`
+  fits it offline. All three preserve determinism/replay; each has a wiring test.
 - **Input hardening — deterministic Unicode de-obfuscation + an injection
   signal** (`sanitizer`, `hashing_tokenizer`, `injection_classifier` modules).
   Hidden-character injection vectors — Trojan-Source bidi overrides

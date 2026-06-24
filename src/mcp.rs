@@ -47,9 +47,9 @@ fn tool_specs() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "strategy": {"type": "string", "enum": ["around", "task", "working_set"]},
+                    "strategy": {"type": "string", "enum": ["around", "task", "semantic", "working_set"]},
                     "anchor": {"type": "string", "description": "node id / file uri for 'around'"},
-                    "text": {"type": "string", "description": "free-text task for 'task'"},
+                    "text": {"type": "string", "description": "free-text task for 'task' / 'semantic'"},
                     "budget": {"type": "integer", "description": "token budget (default 2048)"}
                 }
             }
@@ -163,6 +163,7 @@ fn recall_from_args(args: &Value) -> Recall {
     {
         "around" => Recall::around(str_arg(args, "anchor")),
         "task" => Recall::task(str_arg(args, "text")),
+        "semantic" => Recall::semantic(str_arg(args, "text")),
         _ => Recall::working_set(),
     }
 }

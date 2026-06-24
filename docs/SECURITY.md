@@ -127,7 +127,9 @@ ccos sanitize path/to/file.rs
 ccos sanitize --json path/to/file.rs
 ccos sanitize --strict path/to/file.rs   # pre-commit / CI gate
 
-# Over MCP: the `ingest` tool's response now carries an `anomalies` array.
+# At ingest (and over MCP): every `IngestReport` now carries `anomalies` (the
+# de-obfuscation findings) plus `injection_score` / `injection_flagged` from the
+# classifier — so the signal is recorded on the live path, not only in `sanitize`.
 
 # Retrain / re-evaluate the injection signal (both deterministic):
 cargo run --example train_injection      # fits + locks assets/injection_model.bin

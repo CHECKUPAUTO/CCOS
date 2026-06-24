@@ -61,16 +61,17 @@
 //!   hydrated as context windows, with a dynamic [`context_policy`] admission
 //!   policy and deterministic replay. See [`context_region`], [`region_metrics`].
 //!
-//! ## Not yet on the live path (in-tree, experimental)
+//! ## Wiring of the recent modules
 //!
-//! Built, tested and reachable from the library API and the examples, but **not
-//! yet wired into the live recall/ingest core** — treat as experimental:
-//! [`embeddings`] (semantic TF-IDF recall; the live recall uses lexical/causal
-//! entry, not embeddings), [`eviction_policy`] (a learned eviction policy; live
-//! paging is the deterministic greedy in [`memory`]), and [`injection_classifier`]
-//! (the injection *signal* runs in the `ccos sanitize` CLI, not during ingest).
-//! By contrast [`compressor`] (reversible CCR compression) and [`sanitizer`]
-//! (inline Unicode de-obfuscation at ingest) *are* on the live path.
+//! All of these are now on the **live path**: [`compressor`] (reversible CCR
+//! compression of the recalled window), [`sanitizer`] (inline Unicode
+//! de-obfuscation at ingest), [`injection_classifier`] (an injection-signal score
+//! on every [`external_memory::IngestReport`], via a shared detector), and
+//! [`embeddings`] (semantic recall through [`external_memory::Recall::Semantic`]).
+//! [`eviction_policy`] is wired into [`memory::MemoryGraph::enforce_paging`] but
+//! is **untrained by default** — in which case paging is *exactly* the
+//! deterministic greedy (lowest score first), so it is never worse; train it
+//! offline via [`memory::MemoryGraph::train_eviction_policy`] to give it effect.
 //!
 //! ## Invariants
 //!

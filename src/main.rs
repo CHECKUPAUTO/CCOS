@@ -1790,6 +1790,7 @@ fn run_memory_cmd(args: &[String]) -> i32 {
                 let recall = match req["strategy"].as_str().unwrap_or("working_set") {
                     "around" => Recall::around(s("anchor")),
                     "task" => Recall::task(s("text")),
+                    "semantic" => Recall::semantic(s("text")),
                     _ => Recall::working_set(),
                 };
                 serde_json::to_value(mem.recall(&recall, budget)).unwrap()
