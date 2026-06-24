@@ -51,8 +51,16 @@ cognitive MMU, made real: page, don't drop.
   replay. (M)
 
 ## 🎯 Direction — better retrieval
-- **Slice A — hybrid entry fusion** (lexical ⊕ semantic ⊕ causal, reciprocal-rank)
-  before causal expansion. (M)
+- ✅ **Slice A — hybrid entry fusion.** A new `Recall::Hybrid` resolves a
+  free-text task's entry node by **reciprocal-rank fusion** of three independent
+  rankings — lexical token overlap, semantic INT4-TF-IDF cosine, and the causal
+  **active-failure focus** — before the usual causal-region expansion. RRF needs
+  no cross-signal calibration (it ranks, not scores), so a node strong on any axis
+  surfaces while consensus wins; `K = 60`. The causal vote is **sparse** (only
+  nodes under failure pressure), so it abstains on a quiet graph (no id bias) and
+  speaks for the active problem region once a failure is signalled — the
+  CCOS-native signal. Deterministic; wired through `recall()`, the MCP `recall`
+  tool (`strategy:"hybrid"`), and the runtime CLI. (M)
 - **Slice B — opt-in learned embedder** behind a feature flag; INT4 TF-IDF stays
   the deterministic default (keep the replay invariant). (L)
 - **Slice C — self-improving retrieval from the replayable log**: learn recall

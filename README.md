@@ -74,6 +74,14 @@ measurements behind the numbers above are in
   refreshed window. The propagation reaches the cross-file *cause* (up to ~3 hops), not just
   the symptom the trace names — the post-mortem tools below let you verify which nodes the
   window actually held at each step.
+- **Hybrid entry fusion.** A free-text recall (`Recall::Hybrid`) resolves its entry node by
+  **reciprocal-rank fusion** of three signals — lexical token overlap, semantic INT4-TF-IDF
+  cosine, and the causal **active-failure focus** — before causal expansion. No cross-signal
+  score calibration (RRF ranks, it doesn't add scores): a node strong on any one axis can
+  surface, while consensus across several wins. The causal vote is *sparse* — it speaks only
+  for what's failing — so it abstains on a quiet graph and pulls the active problem region in
+  once you signal a failure. Deterministic; reachable via the MCP `recall` tool
+  (`strategy:"hybrid"`).
 - **Non-destructive eviction (the "swap").** When the resident set exceeds its cap, CCOS
   **demotes** the coldest nodes — with their edges — into a **COLD tier** instead of dropping
   them, so the working memory is *unbounded-backed*: the resident window stays small

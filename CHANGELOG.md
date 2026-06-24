@@ -8,6 +8,18 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Hybrid entry fusion for recall** (slice A of better retrieval). A new
+  `Recall::Hybrid(text)` resolves a free-text task's entry node by
+  **reciprocal-rank fusion** of three independent rankings — lexical token
+  overlap, semantic INT4-TF-IDF cosine, and the causal **active-failure focus** —
+  before the usual causal-region expansion. RRF compares ranks (no cross-signal
+  score calibration), so a node strong on any one axis can still surface while a
+  node decent across several wins; `K = 60`. The causal vote is **sparse** — it
+  ranks only nodes under failure pressure, so it abstains on a quiet graph (no
+  spurious id-ordered bias) and speaks for the active problem region once a
+  failure is signalled (the CCOS-native attention signal). Deterministic; wired
+  through `recall()`, the MCP `recall` tool (`strategy:"hybrid"`), and the runtime
+  recall CLI. `Recall::hybrid(text)` constructs it.
 - **Compact the coldest COLD tail → a frugal backing store** (slice 4 of unbounded
   working memory, the deepest tier). A new, opt-in
   `CcosMemory::set_cold_content_budget(Some(bytes))` keeps total COLD *content*
