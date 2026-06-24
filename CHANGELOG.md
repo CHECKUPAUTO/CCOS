@@ -8,6 +8,24 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Spill COLD content to disk → RAM-bounded content, disk-unbounded** (slice 3
+  of unbounded working memory). A new, opt-in
+  `CcosMemory::attach_cold_spill(dir, inline_budget)` flushes the coldest COLD
+  *content* blobs to a content-addressed on-disk store (SHA-256 keys — the same
+  addressing as the CCR store) once resident COLD content exceeds `inline_budget`
+  bytes, dropping the blob from RAM and leaving a hash **stub**. `page_in` faults
+  it back **hash-verified**: a tampered, truncated, or missing blob is a cold-miss,
+  never a silent empty restore — so disk spill *extends* the integrity story.
+  Identical content is **deduplicated**; the flush is lossless and deterministic
+  (coldest-first by causal score, ties on id). **Off by default** ⇒ no spill,
+  byte-identical serialization, replay/snapshot invariants untouched (the new
+  `spill` stub is `skip_serializing_if = None`; the store handle is `serde(skip)`).
+  `MemoryStats.cold_spilled` / `cold_spilled_bytes` surface it (via `ccos stats` /
+  the MCP `stats` tool). *Honest scope:* only the unbounded **content** moves to
+  disk — per-cold-node metadata still grows in RAM (slice 4); blobs are stored
+  verbatim (dedup, no compression codec yet); a snapshot taken with spill active
+  references blobs by hash and needs the `dir` re-attached to restore (a sidecar,
+  like a swapfile).
 - **Page-fault from the COLD tier on the read paths** (slice 2 of unbounded
   working memory). A `page_fault` now resurrects cold *faulting* files (its
   per-file `signal_failure` is cold-aware), and a `recall` **around** a demoted

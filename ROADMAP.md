@@ -22,10 +22,21 @@ cognitive MMU, made real: page, don't drop.
   back via `CcosMemory::ensure_resident`, wired into `AgentSession::recall*` and
   **reproduced on replay** so `replay == live`. `set_max_resident` exposes the
   frugal-window knob.
-- **Slice 3 — spill COLD to disk, compressed** (reuse the CCR store) → RAM-bounded,
-  disk-unbounded: push the ratio further. (M)
+- ✅ **Slice 3 — spill COLD content to disk → RAM-bounded content, disk-unbounded.**
+  An opt-in `attach_cold_spill(dir, inline_budget)` flushes the coldest COLD
+  *content* blobs to a content-addressed on-disk store (SHA-256 keys, the CCR
+  addressing scheme) once resident COLD content passes a byte budget, leaving a
+  hash **stub** in RAM; `page_in` faults them back, **hash-verified** (a tampered
+  or missing blob is a cold-miss, never a silent empty restore). Identical content
+  is **deduplicated**; spill is lossless and deterministic (coldest-first). Off by
+  default ⇒ byte-identical serialization, so the replay/snapshot invariants are
+  untouched. `MemoryStats.cold_spilled{,_bytes}` surface it. **Honest scope:** only
+  the unbounded *content* moves to disk — per-cold-node *metadata* (small) still
+  grows in RAM (that's slice 4); blobs are stored verbatim (dedup, no codec yet);
+  a snapshot taken with spill on needs its `dir` re-attached to restore (sidecar). (M)
 - **Slice 4 — bound + compact COLD** (the final tier): summarise the coldest
-  entries (CausalSumm) so the backing store itself stays frugal. (M)
+  entries (CausalSumm) and bound the in-RAM metadata so the backing store itself
+  stays frugal. (M)
 
 ## 🎯 Direction — better retrieval
 - **Slice A — hybrid entry fusion** (lexical ⊕ semantic ⊕ causal, reciprocal-rank)
