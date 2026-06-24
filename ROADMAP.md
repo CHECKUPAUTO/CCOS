@@ -85,8 +85,15 @@ cognitive MMU, made real: page, don't drop.
   only under the feature, so the default build is byte-identical. **Honest scope:**
   LSA is a *linear* distillation (not a neural model); it helps most when there are
   enough documents to truncate (`rank < docs`); the Gram-matrix eigensolve adds cost
-  to the per-recall embed build, so it is an opt-in. **The better-retrieval arc is
-  now complete (A·B·C).** (L)
+  to the per-recall embed build, so it is an opt-in. **Measured (see
+  `docs/MEASUREMENT_recall.md`):** on a synthetic recall benchmark LSA does *not*
+  beat — and can hurt — the default TF-IDF in CCOS's entry-selection use (it dropped
+  hybrid's overall hit-rate 58%→38%). It works in the micro-test but its dense-ranking
+  strength doesn't transfer to picking a single entry node; so it **stays opt-in and
+  off**, awaiting a future experiment that wires it into a *ranking* stage. The
+  capability is built and honest; the recommendation is "not yet." **The
+  better-retrieval arc is complete (A·B·C); hybrid (A) is validated by measurement,
+  LSA (B) is not.** (L)
 
 ## ✅ Done — audit pass 4 (hardening the new arcs)
 

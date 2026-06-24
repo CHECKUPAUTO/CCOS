@@ -8,6 +8,15 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Recall-strategy measurement (`examples/recall_eval.rs`) + honest findings**
+  (`docs/MEASUREMENT_recall.md`). An LLM-free benchmark on a synthetic corpus with
+  ground-truth relevant files, comparing working-set / lexical / semantic / hybrid
+  recall at a tight budget across three task types. Result: **hybrid fusion is
+  measurably the best query strategy** (overall hit-rate 58% vs lexical 17% /
+  semantic 21%; it alone recovers the target in the decoy+failure case) —
+  validating slice A in measurement. The **opt-in LSA embedder does *not* help and
+  can hurt** in CCOS's entry-selection use (drops hybrid to 38%), so it correctly
+  stays off by default; the data, not assumption, sets the recommendation.
 - **Opt-in learned semantic embedder (`learned-embed` feature)** — slice B of better
   retrieval, completing the arc. A new `src/lsa.rs` distils the deterministic INT4
   TF-IDF into a learned **latent-semantic (LSA / truncated-SVD) projection**: the top
