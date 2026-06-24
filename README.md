@@ -74,6 +74,14 @@ measurements behind the numbers above are in
   refreshed window. The propagation reaches the cross-file *cause* (up to ~3 hops), not just
   the symptom the trace names — the post-mortem tools below let you verify which nodes the
   window actually held at each step.
+- **Non-destructive eviction (the "swap").** When the resident set exceeds its cap, CCOS
+  **demotes** the coldest nodes — with their edges — into a **COLD tier** instead of dropping
+  them, so the working memory is *unbounded-backed*: the resident window stays small
+  (frugality), the backing store grows into available RAM, and **nothing is lost**. Any node
+  pages back on demand (`page_in`), and a `signal_failure` on a demoted node **resurrects it
+  from COLD** automatically (a page fault). The cognitive-MMU promise made literal — "infinite"
+  working memory as a *direction*, expressed concretely as **frugality × available RAM**
+  (`MemoryStats.cold` surfaces the tier). Deterministic.
 
 ### 2. Transactional, replayable storage
 
