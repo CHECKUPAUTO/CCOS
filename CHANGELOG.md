@@ -8,6 +8,22 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Compact the coldest COLD tail → a frugal backing store** (slice 4 of unbounded
+  working memory, the deepest tier). A new, opt-in
+  `CcosMemory::set_cold_content_budget(Some(bytes))` keeps total COLD *content*
+  (inline + spilled) toward `bytes` by **lossily compacting** the coldest entries —
+  routed by kind, code is skeletonised / prose summarised / JSON crushed
+  (`CausalAst` / `CausalSumm` / `CausalCrusher`, reused as pure functions), and the
+  full original is discarded. Deterministic (coldest-first by causal score), and
+  **observable**: `is_compacted` and `MemoryStats.cold_compacted` report the lossy
+  tier. This is where "infinite working memory as a *direction*" bottoms out — at
+  the floor frugality wins, and CCOS compacts to a summary, **never silently
+  drops**. **Off by default** ⇒ COLD stays lossless and serialization byte-identical
+  (the `ColdNode.compacted` flag is `skip_serializing_if = false`; the budget is
+  `serde(skip)`). *Honest scope:* this bounds the cold **content** footprint, not
+  the entry **count** (the in-RAM stub map is still O(N) — an on-disk index is
+  future work); compaction is lossy and, like spill, an operational mode layered on
+  the deterministic default path, not part of replay.
 - **Spill COLD content to disk → RAM-bounded content, disk-unbounded** (slice 3
   of unbounded working memory). A new, opt-in
   `CcosMemory::attach_cold_spill(dir, inline_budget)` flushes the coldest COLD

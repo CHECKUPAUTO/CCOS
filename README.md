@@ -85,9 +85,13 @@ measurements behind the numbers above are in
   content-addressed on-disk store (SHA-256, **deduplicated**, **hash-verified** on read —
   a tampered blob is a cold-miss, not a silent restore), so the resident *and* cold content
   footprint is **RAM-bounded** while the backing store on disk is **unbounded**; it faults
-  back transparently. The cognitive-MMU promise made literal — "infinite"
-  working memory as a *direction*, expressed concretely as **frugality × available RAM**
-  (`MemoryStats.cold` / `cold_spilled` surface the tier). Deterministic; off by default.
+  back transparently. And at the deepest tier, opt in to `set_cold_content_budget(bytes)`:
+  once the backing store itself must stay frugal, the coldest content is **compacted** —
+  code skeletonised, prose summarised — to a causal summary (lossy, but **observable** via
+  `cold_compacted`, **never silently dropped**). The cognitive-MMU promise made literal —
+  "infinite" working memory as a *direction*, expressed concretely as **frugality × available
+  RAM** (`MemoryStats.cold` / `cold_spilled` / `cold_compacted` surface the tier).
+  Deterministic; lossless and off by default — spill and compaction are opt-in modes.
 
 ### 2. Transactional, replayable storage
 
