@@ -387,6 +387,15 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Compressor CCR reversibility under eviction.** `store` evicted the
+  lowest-hash entry as soon as the store passed `ccr_capacity`, so a single
+  recall window with more compressed items than the capacity could evict refs it
+  had *just handed back* — breaking the "nothing is lost, call `ccos_retrieve`"
+  guarantee (latent: the default capacity is 4096, larger than any real window).
+  Eviction is now deferred to *after* an item/window is produced
+  (`enforce_ccr_capacity`) and never drops a live ref — the cap is a floor
+  against older entries, lifted when the current window exceeds it. Regression
+  test: `compress_window_keeps_every_ref_retrievable_below_capacity`.
 - **Parser:** `strip_comments` now also removes inline `/* … */` block comments
   (string-aware), so symbols hidden in block comments are no longer extracted as
   real nodes. Multi-line block comments remain a known limitation of the

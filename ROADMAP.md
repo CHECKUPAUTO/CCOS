@@ -155,9 +155,11 @@ honesty code↔docs↔paper, tests/API). **Fixed in this pass:**
   every distinct parse pattern — value flags, positionals, two-positionals, and
   the `--workspace` optional-arg branch). The remaining parsers reuse these
   patterns.
-- Still TODO: compressor reversibility-under-eviction, `persist` disk save→load
-  hash-stability, MCP parse-error envelopes, and an equal-score eviction-order
-  tie-break test. (M)
+- ✅ Compressor reversibility-under-eviction — the test found and fixed a real
+  (latent) bug: CCR eviction could drop a ref the current window had just handed
+  back. See the CHANGELOG "Fixed" entry.
+- Still TODO: `persist` disk save→load hash-stability, MCP parse-error envelopes,
+  and an equal-score eviction-order tie-break test. (M)
 
 ### E — Hygiene
 - Extract `main.rs` (2.3 KLoC) into per-domain command modules. (S)
