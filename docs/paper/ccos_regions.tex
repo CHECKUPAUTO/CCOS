@@ -350,7 +350,7 @@ core. The public surface is: \code{ContextRegionEngine} (\code{cluster\_nodes},
 (\code{RegionCreated}, \code{RegionActivated}, \code{RegionMerged},
 \code{RegionEvicted}, \code{ContextWindowGenerated}). A \code{ccos regions} CLI
 exposes clustering, activation and the locality report. The whole crate builds
-warning-clean under \code{clippy -D warnings} and passes 410 tests.
+warning-clean under \code{clippy -D warnings} and passes 413 tests.
 
 \paragraph{The cognitive MMU, made real.} Paging lives in the code, not only the
 prose: eviction is \emph{non-destructive}. When the resident node set exceeds its
@@ -363,12 +363,20 @@ The COLD tier's unbounded \emph{content} optionally spills to a content-addresse
 on-disk store (SHA-256 keys, deduplicated, and \emph{hash-verified} on read---a
 tampered or missing blob is a cold-miss, never a silent empty restore), bounding
 the resident-plus-cold \emph{content} footprint in RAM while the backing store on
-disk is unbounded. This is the sense in which working memory is ``unbounded'': a
-\emph{direction}, frugality~$\times$~available RAM, rather than a literal claim.
-Honestly scoped: only \emph{content} spills---per-cold-node metadata still grows in
-RAM, and the on-disk blobs are stored verbatim (dedup, no compression codec yet);
-the default path keeps spill off and serialization byte-identical, so the
-determinism guarantees of \S\ref{sec:determinism} are untouched.
+disk is unbounded. At the deepest tier, once the backing store \emph{itself} must
+stay frugal, an optional budget \emph{compacts} the coldest content---code
+skeletonised, prose summarised---to a causal summary, discarding the original. This
+is genuine, \emph{auditable forgetting}: it is lossy, but observable
+(\code{cold\_compacted}) and never a silent drop. This is the sense in which working
+memory is ``unbounded'': a \emph{direction}, frugality~$\times$~available RAM, rather
+than a literal claim---and at the floor frugality is the master, exactly as the
+demand-paging analogy demands. Honestly scoped: spill moves only \emph{content} to
+disk (per-cold-node metadata still grows in RAM---an on-disk index is future work),
+blobs are stored verbatim (dedup, no compression codec yet), and compaction bounds
+the cold \emph{content} footprint, not the entry \emph{count}. Both spill and
+compaction are opt-in; the default path keeps them off and serialization
+byte-identical, so the determinism guarantees of \S\ref{sec:determinism} are
+untouched.
 
 \section{Evaluation: what we can measure today}\label{sec:eval}
 

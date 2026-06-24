@@ -1,3 +1,4 @@
+use crate::compressor::{CausalAst, CausalCrusher, CausalSumm, ContentRouter, Route};
 use crate::eviction_policy::{
     bucket_pressure, bucket_recency, bucket_score, bucket_size, EvictionPolicy, PagingState, EVICT,
     KEEP,
@@ -186,6 +187,17 @@ pub struct MemoryGraph {
     /// invariant (replay == live, snapshot hash) is untouched on the default path.
     #[serde(skip)]
     spill: Option<SpillConfig>,
+    /// Optional **compaction budget** for the COLD tier (slice 4). When `Some(b)`,
+    /// total COLD *content* (inline + spilled) is kept toward `b` bytes by
+    /// **lossily compacting** the coldest entries — code is skeletonised, prose
+    /// summarised (CausalSumm/CausalAst), the full original discarded — so the
+    /// *backing store itself* stays frugal. A runtime knob (`#[serde(skip)]`);
+    /// `None` (default) ⇒ no compaction, COLD stays lossless. This is the deepest
+    /// tier: "infinite" working memory is a *direction*, and at the bottom
+    /// frugality wins — CCOS compacts to a summary (observable via
+    /// [`is_compacted`](Self::is_compacted)), never silently drops.
+    #[serde(skip)]
+    cold_content_budget: Option<usize>,
 }
 
 /// A bound spill store plus the resident-content budget that triggers a flush.
@@ -255,6 +267,18 @@ struct ColdNode {
     /// byte-identical to the pre-spill layout whenever nothing is spilled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     spill: Option<SpillRef>,
+    /// When `true`, `node.content` is a **lossy** compaction (a CausalSumm summary
+    /// or CausalAst skeleton) of the original, produced once the COLD compaction
+    /// budget was exceeded; the full original has been discarded. Elided from the
+    /// serialized form when `false` (the default) so the layout is unchanged
+    /// whenever nothing is compacted.
+    #[serde(default, skip_serializing_if = "is_false")]
+    compacted: bool,
+}
+
+/// `skip_serializing_if` predicate: elide a `bool` field when it is `false`.
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// A stub left in RAM after a COLD node's content is flushed to the on-disk spill
@@ -282,6 +306,7 @@ impl MemoryGraph {
             eviction_policy: EvictionPolicy::new(),
             cold: BTreeMap::new(),
             spill: None,
+            cold_content_budget: None,
         }
     }
 
@@ -518,7 +543,9 @@ impl MemoryGraph {
         }
         // Defensive: guarantee no edge survives pointing at an evicted node.
         self.prune_dangling_edges();
-        // Newly-demoted content may push the COLD tier over its RAM budget.
+        // Newly-demoted content may push the COLD tier over its budgets: compact
+        // the coldest tail first (shrink), then spill what remains (move to disk).
+        self.enforce_cold_content_budget();
         self.enforce_cold_budget();
     }
 
@@ -541,6 +568,7 @@ impl MemoryGraph {
                     node,
                     edges: incident,
                     spill: None,
+                    compacted: false,
                 },
             );
         }
@@ -608,7 +636,9 @@ impl MemoryGraph {
             }
         }
         self.prune_dangling_edges();
-        // Swap-demoted victims add inline content to the COLD tier; re-check budget.
+        // Swap-demoted victims add content to the COLD tier; re-check both budgets
+        // (compact the coldest tail, then spill what remains).
+        self.enforce_cold_content_budget();
         self.enforce_cold_budget();
         true
     }
@@ -762,6 +792,104 @@ impl MemoryGraph {
                     resident = resident.saturating_sub(len);
                 }
             }
+        }
+    }
+
+    /// Set the COLD **compaction budget** (slice 4) — the deepest tier. With
+    /// `Some(bytes)`, total COLD *content* (inline + spilled) is driven toward
+    /// `bytes` by **lossily compacting** the coldest entries: code is
+    /// skeletonised, prose summarised, the full original discarded — so the
+    /// backing store itself stays frugal. Applies immediately. `None` (default)
+    /// disables compaction (COLD stays lossless). Compaction is **lossy** and
+    /// observable ([`is_compacted`](Self::is_compacted)); it is *not* part of
+    /// replay, so — like the spill store — it is an operational mode layered on
+    /// the deterministic default path, not a change to it.
+    pub fn set_cold_content_budget(&mut self, budget: Option<usize>) {
+        self.cold_content_budget = budget;
+        self.enforce_cold_content_budget();
+    }
+
+    /// Number of COLD entries whose content has been lossily compacted.
+    pub fn cold_compacted_count(&self) -> usize {
+        self.cold.values().filter(|c| c.compacted).count()
+    }
+
+    /// Whether `id` is a COLD entry whose content is a lossy compaction (a
+    /// summary/skeleton), i.e. its full original has been discarded.
+    pub fn is_compacted(&self, id: &NodeId) -> bool {
+        self.cold.get(id).is_some_and(|c| c.compacted)
+    }
+
+    /// Lossy compaction of one content blob, routed by node kind: code →
+    /// skeleton, JSON → crushed, prose → extractive summary. Pure/deterministic.
+    /// Returns the compact form (callers adopt it only when it is actually
+    /// shorter than the original).
+    fn compact_content(kind: &str, content: &str) -> String {
+        match ContentRouter::classify(kind, content) {
+            Route::Code => CausalAst::skeletonize(content),
+            Route::Json => CausalCrusher::crush(content),
+            Route::Prose => CausalSumm::summarize(content, 0, 0.0),
+        }
+    }
+
+    /// Compact the coldest COLD content until total COLD content (inline +
+    /// spilled) is within [`cold_content_budget`](Self::cold_content_budget).
+    /// Deterministic: coldest-first by causal score, ties on id. A no-op without
+    /// a budget or when already within it. **Lossy**: each compacted entry's full
+    /// original is replaced by its summary/skeleton and discarded (a spilled
+    /// original's on-disk blob is orphaned — reclaimed by a future GC pass). An
+    /// entry that cannot be made smaller is skipped (the summary is the floor),
+    /// so the budget is approached best-effort, never by dropping a node.
+    fn enforce_cold_content_budget(&mut self) {
+        let Some(budget) = self.cold_content_budget else {
+            return;
+        };
+        let mut total = self.cold_inline_bytes() + self.cold_spilled_bytes();
+        if total <= budget {
+            return;
+        }
+        // Coldest-first, not-yet-compacted candidates (scores computed up front).
+        let mut candidates: Vec<(NodeId, f64)> = self
+            .cold
+            .iter()
+            .filter(|(_, c)| !c.compacted)
+            .map(|(id, c)| (id.clone(), self.compute_node_score(&c.node)))
+            .collect();
+        candidates.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        for (id, _) in candidates {
+            if total <= budget {
+                break;
+            }
+            // Materialise the current content (faulting a spilled blob back in).
+            let (content, kind, old_len) = match self.cold.get(&id) {
+                Some(c) if !c.compacted => {
+                    let kind = format!("{:?}", c.node.node_type);
+                    match &c.spill {
+                        Some(s) => match self.spill.as_ref().and_then(|cfg| cfg.store.get(&s.hash))
+                        {
+                            Some(text) => (text, kind, s.len),
+                            None => continue, // store detached / blob gone — leave it
+                        },
+                        None => (c.node.content.clone(), kind, c.node.content.len()),
+                    }
+                }
+                _ => continue,
+            };
+            let compact = Self::compact_content(&kind, &content);
+            if compact.len() >= content.len() {
+                continue; // already minimal — the summary is the floor
+            }
+            let new_len = compact.len();
+            if let Some(entry) = self.cold.get_mut(&id) {
+                entry.node.content = compact;
+                entry.spill = None; // discard the full original (orphans any blob)
+                entry.compacted = true;
+            }
+            total = total.saturating_sub(old_len).saturating_add(new_len);
         }
     }
 
@@ -1832,6 +1960,154 @@ mod tests {
         let other = spilled.iter().find(|id| **id != victim).unwrap().clone();
         assert!(!g.page_in(&other), "a detached store is a cold-miss");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── slice 4: COLD compaction (lossy, observable; the deepest tier) ─────────
+
+    /// A deterministic multi-sentence paragraph so CausalSumm has something to
+    /// extract (≥3 sentences ⇒ the summary is strictly shorter).
+    fn para(tag: &str, sentences: usize) -> String {
+        (0..sentences)
+            .map(|i| format!("{tag} clause {i} has a handful of filler words here. "))
+            .collect()
+    }
+
+    #[test]
+    fn compaction_shrinks_the_coldest_tail_and_spares_warmer_cold() {
+        // Resident cap 1: at equal scores `enforce_paging` demotes the *smallest*
+        // id and keeps the *largest* resident, so after ingesting a,b,c,d the
+        // cold tier is {a,b,c} and d is resident. Compaction is coldest-first by
+        // id, so a,b compact while c (the largest cold id) is spared once the
+        // budget is met.
+        let mut g = MemoryGraph::new(0.2, 1);
+        let a = para("a", 14);
+        let b = para("b", 14);
+        let c = para("c", 10);
+        g.upsert_node("a".into(), "a".into(), a.clone(), NodeType::ContextBlock);
+        g.upsert_node("b".into(), "b".into(), b.clone(), NodeType::ContextBlock);
+        g.upsert_node("c".into(), "c".into(), c.clone(), NodeType::ContextBlock);
+        g.upsert_node("d".into(), "d".into(), para("d", 6), NodeType::ContextBlock);
+        assert_eq!(g.cold_count(), 3);
+        assert!(
+            g.is_cold(&NodeId("c".into())),
+            "c is the warmest (largest-id) cold node"
+        );
+
+        let before = g.cold_inline_bytes() + g.cold_spilled_bytes();
+        g.set_cold_content_budget(Some(1000));
+        let after = g.cold_inline_bytes() + g.cold_spilled_bytes();
+
+        assert!(
+            g.cold_compacted_count() >= 1,
+            "the budget must force compaction"
+        );
+        assert!(after < before, "compaction must shrink total cold content");
+        assert!(after <= 1000, "compaction must reach the budget here");
+        assert!(
+            g.is_compacted(&NodeId("a".into())),
+            "the coldest entry is compacted"
+        );
+        assert!(
+            !g.is_compacted(&NodeId("c".into())),
+            "the warmest cold node is compacted last and spared by the budget"
+        );
+
+        // Lossy contract on compacted entries; lossless on the spared one.
+        let originals = [("a", &a), ("b", &b), ("c", &c)];
+        let cold_ids: Vec<NodeId> = g.cold_ids().cloned().collect();
+        for cid in cold_ids {
+            let orig = originals.iter().find(|(id, _)| *id == cid.0).unwrap().1;
+            let was_compacted = g.is_compacted(&cid);
+            g.page_in(&cid);
+            let content = &g.node(&cid).expect("resident after page_in").content;
+            if was_compacted {
+                assert!(
+                    content.len() < orig.len(),
+                    "compacted content must be shorter (lossy)"
+                );
+                assert_ne!(
+                    content, orig,
+                    "compacted content is a summary, not the original"
+                );
+            } else {
+                assert_eq!(content, orig, "a spared (warm) cold node stays lossless");
+            }
+        }
+    }
+
+    #[test]
+    fn compaction_is_off_by_default_and_lossless() {
+        let mut g = MemoryGraph::new(0.2, 1);
+        let bodies: Vec<(String, String)> = (0..4)
+            .map(|i| (format!("n{i}"), para(&format!("n{i}"), 12)))
+            .collect();
+        for (id, body) in &bodies {
+            g.upsert_node(
+                id.clone().into(),
+                id.clone(),
+                body.clone(),
+                NodeType::ContextBlock,
+            );
+        }
+        assert!(g.cold_count() > 0);
+        assert_eq!(g.cold_compacted_count(), 0, "no budget ⇒ no compaction");
+        // No `compacted` stub on the default path ⇒ serialization unchanged.
+        let json = serde_json::to_string(&g).unwrap();
+        assert!(
+            !json.contains("\"compacted\""),
+            "default path must emit no compacted flag"
+        );
+        // Every cold body is still the verbatim original.
+        for (id, body) in &bodies {
+            let nid = NodeId(id.clone());
+            if g.is_cold(&nid) {
+                g.page_in(&nid);
+                assert_eq!(
+                    &g.node(&nid).unwrap().content,
+                    body,
+                    "lossless without a budget"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compaction_decisions_are_deterministic() {
+        fn compacted_set() -> Vec<NodeId> {
+            let mut g = MemoryGraph::new(0.2, 1);
+            g.upsert_node(
+                "z_warm".into(),
+                "z_warm".into(),
+                para("zwarm", 10),
+                NodeType::ContextBlock,
+            );
+            for id in ["a", "b", "c"] {
+                g.upsert_node(
+                    id.into(),
+                    id.to_string(),
+                    para(id, 14),
+                    NodeType::ContextBlock,
+                );
+            }
+            g.set_cold_content_budget(Some(900));
+            let mut out: Vec<NodeId> = g
+                .cold_ids()
+                .filter(|id| g.is_compacted(id))
+                .cloned()
+                .collect();
+            out.sort();
+            out
+        }
+        let a = compacted_set();
+        let b = compacted_set();
+        assert_eq!(
+            a, b,
+            "identical histories must compact the identical node set"
+        );
+        assert!(
+            !a.is_empty(),
+            "the budget should have forced some compaction"
+        );
     }
 
     #[test]

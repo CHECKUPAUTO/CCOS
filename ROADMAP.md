@@ -32,11 +32,23 @@ cognitive MMU, made real: page, don't drop.
   default ⇒ byte-identical serialization, so the replay/snapshot invariants are
   untouched. `MemoryStats.cold_spilled{,_bytes}` surface it. **Honest scope:** only
   the unbounded *content* moves to disk — per-cold-node *metadata* (small) still
-  grows in RAM (that's slice 4); blobs are stored verbatim (dedup, no codec yet);
-  a snapshot taken with spill on needs its `dir` re-attached to restore (sidecar). (M)
-- **Slice 4 — bound + compact COLD** (the final tier): summarise the coldest
-  entries (CausalSumm) and bound the in-RAM metadata so the backing store itself
-  stays frugal. (M)
+  grows in RAM (a true O(1) on-disk index is future work); blobs are stored verbatim
+  (dedup, no codec yet); a snapshot taken with spill on needs its `dir` re-attached
+  to restore (sidecar). (M)
+- ✅ **Slice 4 — compact the coldest tail → a frugal backing store.** The deepest
+  tier. An opt-in `set_cold_content_budget(Some(bytes))` keeps total COLD *content*
+  (inline + spilled) toward `bytes` by **lossily compacting** the coldest entries:
+  routed by kind, code is skeletonised / prose summarised / JSON crushed
+  (`CausalAst` / `CausalSumm` / `CausalCrusher`), and the full original is
+  discarded. Deterministic (coldest-first), **observable** (`is_compacted`,
+  `MemoryStats.cold_compacted`), and explicitly the place where "infinite working
+  memory as a *direction*" bottoms out: at the floor frugality wins, and CCOS
+  compacts to a summary — **never silently drops**. Off by default ⇒ COLD stays
+  lossless, serialization byte-identical. **Honest scope:** this bounds the cold
+  *content* footprint, **not** the entry *count* (the `BTreeMap` still holds an
+  O(N) stub per node — an on-disk index is future work); compaction is lossy and,
+  like spill, an operational mode layered on the deterministic default, not part of
+  replay. (M)
 
 ## 🎯 Direction — better retrieval
 - **Slice A — hybrid entry fusion** (lexical ⊕ semantic ⊕ causal, reciprocal-rank)

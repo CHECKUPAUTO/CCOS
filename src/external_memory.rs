@@ -241,6 +241,10 @@ pub struct MemoryStats {
     /// Bytes of COLD content currently spilled to disk (sum of original lengths;
     /// the store deduplicates identical blobs, so actual disk use is ≤ this).
     pub cold_spilled_bytes: usize,
+    /// Of `cold`, how many have had their content **lossily compacted** to a
+    /// summary/skeleton (the deepest tier; the full original was discarded). `0`
+    /// unless a COLD compaction budget is set.
+    pub cold_compacted: usize,
     /// Events appended to the primary log.
     pub events: usize,
     /// Files whose source is retained.
@@ -576,6 +580,18 @@ impl CcosMemory {
         inline_budget: usize,
     ) -> std::io::Result<()> {
         self.graph.attach_cold_spill(dir, inline_budget)
+    }
+
+    /// Set the COLD **compaction budget** (the deepest tier): with `Some(bytes)`,
+    /// total COLD content (inline + spilled) is kept toward `bytes` by **lossily
+    /// compacting** the coldest entries — code skeletonised, prose summarised, the
+    /// full original discarded — so the backing store itself stays frugal. This is
+    /// where "infinite working memory as a *direction*" bottoms out: at the floor,
+    /// frugality wins and CCOS compacts to a summary (observable via stats'
+    /// `cold_compacted`), never silently drops. **Lossy** and opt-in; `None`
+    /// (default) keeps COLD lossless.
+    pub fn set_cold_content_budget(&mut self, budget: Option<usize>) {
+        self.graph.set_cold_content_budget(budget);
     }
 
     /// The node currently under the most failure pressure — the workspace's active
@@ -1033,6 +1049,7 @@ impl ExternalMemory for CcosMemory {
             cold: self.graph.cold_count(),
             cold_spilled: self.graph.cold_spilled_count(),
             cold_spilled_bytes: self.graph.cold_spilled_bytes(),
+            cold_compacted: self.graph.cold_compacted_count(),
             events: self.event_log.event_count(),
             files: self.sources.len(),
             clock: self.graph.clock,
