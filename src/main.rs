@@ -2235,6 +2235,89 @@ mod tests {
     use ccos::external_memory::RecallItem;
     use ccos::trace::TraceHit;
 
+    /// Build an owned `Vec<String>` arg list from string literals.
+    fn argv(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn analyze_opts_parse_defaults_flags_and_positional() {
+        let d = AnalyzeOpts::parse(&[]);
+        assert_eq!(d.path, ".");
+        assert!(!d.json && !d.cycles);
+        assert_eq!(d.max_nodes, 5000);
+        assert_eq!(d.budget, 2048);
+        assert!(d.out.is_none() && d.dot.is_none());
+
+        let o = AnalyzeOpts::parse(&argv(&[
+            "src",
+            "--json",
+            "--cycles",
+            "--out",
+            "r.json",
+            "--max-nodes",
+            "10",
+            "--budget",
+            "512",
+        ]));
+        assert_eq!(o.path, "src");
+        assert!(o.json && o.cycles);
+        assert_eq!(o.out.as_deref(), Some("r.json"));
+        assert_eq!(o.max_nodes, 10);
+        assert_eq!(o.budget, 512);
+        // A non-numeric value leaves the default rather than panicking.
+        assert_eq!(AnalyzeOpts::parse(&argv(&["--budget", "abc"])).budget, 2048);
+    }
+
+    #[test]
+    fn top_opts_parse() {
+        let o = TopOpts::parse(&argv(&["src", "--limit", "7", "--json"]));
+        assert_eq!(o.path, "src");
+        assert_eq!(o.limit, 7);
+        assert!(o.json);
+        assert_eq!(TopOpts::parse(&[]).limit, 20);
+    }
+
+    #[test]
+    fn chaos_opts_parse() {
+        assert_eq!(ChaosOpts::parse(&[]).iters, 1000);
+        assert_eq!(ChaosOpts::parse(&argv(&["--iters", "42"])).iters, 42);
+    }
+
+    #[test]
+    fn blame_opts_two_positionals_then_flag() {
+        let o = BlameOpts::parse(&argv(&["snap.json", "file:src/a.rs", "--depth", "5"]));
+        assert_eq!(o.snapshot.as_deref(), Some("snap.json"));
+        assert_eq!(o.node.as_deref(), Some("file:src/a.rs"));
+        assert_eq!(o.depth, 5);
+        // Missing positionals → None (run_blame then prints usage and exits 2).
+        let d = BlameOpts::parse(&[]);
+        assert!(d.snapshot.is_none() && d.node.is_none());
+        assert_eq!(d.depth, 3);
+    }
+
+    #[test]
+    fn focus_opts_workspace_optional_arg() {
+        // --workspace with an explicit path.
+        let a = FocusOpts::parse(&argv(&["src", "--workspace", "ws.ccos", "--budget", "999"]));
+        assert_eq!(a.path, "src");
+        assert_eq!(a.workspace.as_deref(), Some("ws.ccos"));
+        assert_eq!(a.budget, 999);
+        // --workspace with the next token a flag → defaults to workspace.ccos.
+        let b = FocusOpts::parse(&argv(&["--workspace", "--json"]));
+        assert_eq!(b.workspace.as_deref(), Some("workspace.ccos"));
+        assert!(b.json);
+        // --workspace as the final token → default.
+        assert_eq!(
+            FocusOpts::parse(&argv(&["--workspace"]))
+                .workspace
+                .as_deref(),
+            Some("workspace.ccos")
+        );
+        // Default path is `src` when no positional is given.
+        assert_eq!(FocusOpts::parse(&[]).path, "src");
+    }
+
     #[test]
     fn truncate_cuts_on_char_boundaries_without_panicking() {
         assert_eq!(truncate("hello", 10), "hello"); // under the cap: unchanged

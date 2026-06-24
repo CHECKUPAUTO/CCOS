@@ -143,9 +143,16 @@ honesty code↔docs↔paper, tests/API). **Fixed in this pass:**
   call. (M)
 
 ### D — Test coverage
-- The CLI binary + the 9 `Opts::parse` have zero coverage; add compressor
-  reversibility-under-eviction, `persist` disk save→load hash-stability, MCP
-  parse-error envelopes, and an equal-score eviction-order tie-break test. (M)
+- ✅ The CLI now has coverage: a black-box `tests/cli.rs` (version/help, unknown
+  command → exit 2, `analyze → verify → replay` round-trip, `sanitize --strict`
+  on a Trojan-Source bidi override) driven via `CARGO_BIN_EXE_ccos`, plus unit
+  tests for the option parsers (`analyze`/`top`/`chaos`/`blame`/`focus`, covering
+  every distinct parse pattern — value flags, positionals, two-positionals, and
+  the `--workspace` optional-arg branch). The remaining parsers reuse these
+  patterns.
+- Still TODO: compressor reversibility-under-eviction, `persist` disk save→load
+  hash-stability, MCP parse-error envelopes, and an equal-score eviction-order
+  tie-break test. (M)
 
 ### E — Hygiene
 - Extract `main.rs` (2.3 KLoC) into per-domain command modules. (S)
