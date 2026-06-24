@@ -115,6 +115,16 @@ measurements behind the numbers above are in
   restored: replay and time-travel span restarts (up to the compaction floor), even
   after the daemon was killed. A stale log that no longer reproduces the snapshot
   self-heals to the snapshot — the memory is never corrupted.
+- **Self-improving retrieval (trains on the log).** The replayable log isn't just for
+  debugging — it's *training data*. A retrieval **reward** is read straight off it: for
+  each recorded recall, was the node the agent engaged *next* (a failure / page-fault)
+  in the window that recall would have produced? `tune_recall_weights` then learns the
+  scoring weights that maximise that hit rate by **deterministic coordinate ascent,
+  evaluated by replay** (same log ⇒ same weights), and adopting them records an
+  `Op::Retune` so the learned policy is **auditable and reproduced on replay** —
+  `replay == live` holds. Better retrieval that *reinforces* the moat: nobody else has a
+  deterministic, replayable causal log to train on. (The reward is an honest proxy and
+  the optimiser is greedy — it's an offline tune, not a hot path.)
 
 ### 3. Standard MCP transport
 

@@ -8,6 +8,20 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Self-improving retrieval from the replayable log** (slice C of better retrieval —
+  the CCOS-native gem). A retrieval **reward** is read straight off the hash-chained
+  timeline: for each recorded recall, was the node the agent engaged *next* (a
+  failure signal / page-fault) present — at file granularity — in the window that
+  recall would have produced? `AgentSession::retrieval_hit_rate` reports it;
+  `tune_recall_weights` learns the `ScoringWeights` that maximise it by
+  **deterministic coordinate ascent, evaluated by replay** (same log ⇒ same
+  weights); `adopt_tuned_recall_weights` applies them **and records an `Op::Retune`**,
+  so the learned policy is auditable and **reproduced on replay** — `replay == live`
+  still holds. This is retrieval that trains on CCOS's own moat: the deterministic,
+  replayable causal history. *Honest scope:* the reward is a proxy (the next failing
+  node = the context recall should have surfaced); the optimiser is greedy (a local
+  optimum) over the four scoring weights; evaluation is one replay per candidate, so
+  it is an offline/maintenance call, not a hot path.
 - **Hybrid entry fusion for recall** (slice A of better retrieval). A new
   `Recall::Hybrid(text)` resolves a free-text task's entry node by
   **reciprocal-rank fusion** of three independent rankings — lexical token
