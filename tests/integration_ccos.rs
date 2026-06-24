@@ -162,13 +162,13 @@ fn phase4_failure_propagation() {
     graph.propagate_failure(&"src/sorter.rs".into(), 0, 3);
 
     // Assertions
-    let sorter = graph.nodes.get(&"src/sorter.rs".into()).unwrap();
+    let sorter = graph.node(&"src/sorter.rs".into()).unwrap();
     assert!(
         sorter.failure_relevance > 0.0,
         "sorter must have failure relevance"
     );
 
-    let logger = graph.nodes.get(&"src/logger.rs".into()).unwrap();
+    let logger = graph.node(&"src/logger.rs".into()).unwrap();
     assert!(
         logger.failure_relevance > 0.0,
         "logger must be impacted by propagation"
@@ -377,7 +377,7 @@ fn phase9_memory_paging() {
             NodeType::Unknown,
         );
         // Give low scores to force eviction
-        if let Some(node) = graph.nodes.get_mut(&NodeId(format!("node_{}", i))) {
+        if let Some(node) = graph.node_mut(&NodeId(format!("node_{}", i))) {
             node.base_importance = 0.01;
             node.recency = 0.01;
         }
@@ -397,7 +397,7 @@ fn phase9_memory_paging() {
             "vital".into(),
             NodeType::ContextBlock,
         );
-        if let Some(node) = graph.nodes.get_mut(&NodeId(format!("important_{}", i))) {
+        if let Some(node) = graph.node_mut(&NodeId(format!("important_{}", i))) {
             node.base_importance = 0.95;
             node.failure_relevance = 0.8;
             node.recency = 1.0;
@@ -407,8 +407,7 @@ fn phase9_memory_paging() {
     graph.enforce_paging();
     // Important nodes should survive
     let important_count = graph
-        .nodes
-        .keys()
+        .node_ids()
         .filter(|id| id.0.starts_with("important_"))
         .count();
     assert!(important_count > 0, "high-score nodes must survive paging");
@@ -524,10 +523,10 @@ fn phase12_graph_connectivity() {
     graph.set_failure_relevance(&"a".into(), 1.0);
     graph.propagate_failure(&"a".into(), 0, 5);
 
-    let a = graph.nodes.get(&"a".into()).unwrap();
-    let b = graph.nodes.get(&"b".into()).unwrap();
-    let c = graph.nodes.get(&"c".into()).unwrap();
-    let d = graph.nodes.get(&"d".into()).unwrap();
+    let a = graph.node(&"a".into()).unwrap();
+    let b = graph.node(&"b".into()).unwrap();
+    let c = graph.node(&"c".into()).unwrap();
+    let d = graph.node(&"d".into()).unwrap();
 
     assert!(a.failure_relevance > b.failure_relevance);
     assert!(b.failure_relevance >= c.failure_relevance);
@@ -586,7 +585,7 @@ fn phase14_context_window_selection() {
             "data".into(),
             NodeType::ContextBlock,
         );
-        if let Some(node) = graph.nodes.get_mut(&id) {
+        if let Some(node) = graph.node_mut(&id) {
             node.base_importance = (i as f64) / 60.0;
             node.recency = if i < 10 { 1.0 } else { 0.1 };
             node.failure_relevance = if i < 5 { 0.9 } else { 0.0 };

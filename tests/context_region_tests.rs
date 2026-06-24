@@ -124,7 +124,10 @@ fn failure_propagates_a_regional_activation() {
     g.set_failure_relevance(&NodeId("sym:a.rs:x".into()), 0.95);
     g.propagate_failure(&NodeId("sym:a.rs:x".into()), 0, 3);
     assert!(
-        g.nodes[&NodeId("sym:b.rs:z".into())].failure_relevance > 0.0,
+        g.node(&NodeId("sym:b.rs:z".into()))
+            .unwrap()
+            .failure_relevance
+            > 0.0,
         "failure must reach b.rs::z"
     );
 

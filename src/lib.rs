@@ -77,9 +77,13 @@
 //!
 //! The memory graph maintains `edges ⊆ nodes × nodes` at all times (see
 //! [`memory::MemoryGraph::add_edge`] and
-//! [`memory::MemoryGraph::prune_dangling_edges`]), and eviction order is
-//! deterministic so replays and snapshot hashes are reproducible regardless of
-//! `HashMap` iteration order.
+//! [`memory::MemoryGraph::prune_dangling_edges`]). The `nodes`/`edges` stores are
+//! `pub(crate)`, reachable from outside only through read accessors
+//! ([`memory::MemoryGraph::node`], [`node_mut`](memory::MemoryGraph::node_mut),
+//! [`edges`](memory::MemoryGraph::edges), …) and the structural mutators above —
+//! so an external caller cannot push a dangling edge or orphan a node and break
+//! the invariant. Eviction order is deterministic, so replays and snapshot hashes
+//! are reproducible regardless of `HashMap` iteration order.
 
 pub mod adversarial;
 pub mod agent_session;

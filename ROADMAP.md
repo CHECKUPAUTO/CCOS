@@ -130,9 +130,11 @@ honesty code↔docs↔paper, tests/API). **Fixed in this pass:**
 - One snapshot-error type (unify on `MemoryError`). (S)
 
 ### C — Encapsulation & API
-- Make `MemoryGraph.{nodes,edges}` (and `EventLog.events`, `LinearModel` fields)
-  `pub(crate)` + accessors — the only thing letting a caller break the
-  `edges ⊆ nodes²` invariant. (M)
+- ✅ `MemoryGraph.{nodes,edges}` are now `pub(crate)` + read accessors (`node`,
+  `node_mut`, `node_ids`, `node_entries`, `node_values`, `contains_node`, `edges`)
+  — external callers can no longer push a dangling edge or orphan a node and break
+  the `edges ⊆ nodes²` invariant. *(Still `pub` and could get the same treatment:
+  `EventLog.events`, the `DistributedEventLog` fields, the `LinearModel` fields.)*
 - `lib.rs` re-exports / prelude for the core types; `#[non_exhaustive]` on the error +
   event enums and `Recall`, pre-1.0. (S)
 - Cache the recall-time region clustering instead of rebuilding it per `around`/`task`

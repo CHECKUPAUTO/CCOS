@@ -507,8 +507,8 @@ fn run_diff(a: Option<&str>, b: Option<&str>) -> i32 {
 
     // Causal-score drift among nodes present in both snapshots.
     let mut movers: Vec<(String, f64)> = Vec::new();
-    for (id, node_b) in &snap_b.graph.nodes {
-        if let Some(node_a) = snap_a.graph.nodes.get(id) {
+    for (id, node_b) in snap_b.graph.node_entries() {
+        if let Some(node_a) = snap_a.graph.node(id) {
             let drift =
                 snap_b.graph.compute_node_score(node_b) - snap_a.graph.compute_node_score(node_a);
             if drift.abs() > 1e-9 {
@@ -620,7 +620,7 @@ fn run_failure(opts: &FailureOpts) -> i32 {
     // Re-score under any trial weights before injection/eviction.
     graph.set_scoring_weights(ScoringWeights::from_env());
     let origin = NodeId(node_id.to_string());
-    if !graph.nodes.contains_key(&origin) {
+    if !graph.contains_node(&origin) {
         eprintln!(
             "ccos: node '{node_id}' not found ({} nodes). List ids with `ccos analyze <path> --json`.",
             graph.node_count()
@@ -645,8 +645,7 @@ fn run_failure(opts: &FailureOpts) -> i32 {
     }
 
     let mut affected: Vec<(String, f64)> = graph
-        .nodes
-        .iter()
+        .node_entries()
         .filter(|(id, n)| **id != origin && n.failure_relevance > 0.0)
         .map(|(id, n)| (id.0.clone(), n.failure_relevance))
         .collect();
@@ -657,7 +656,7 @@ fn run_failure(opts: &FailureOpts) -> i32 {
     });
 
     if opts.json {
-        let mut working_set: Vec<&NodeId> = graph.nodes.keys().collect();
+        let mut working_set: Vec<&NodeId> = graph.node_ids().collect();
         working_set.sort();
         let w = graph.scoring_weights;
         let report = serde_json::json!({
@@ -886,8 +885,7 @@ fn run_top(opts: &TopOpts) -> i32 {
     println!("    {:>7}  {:<8}  NODE", "SCORE", "TYPE");
     for (id, score) in &hot {
         let ty = graph
-            .nodes
-            .get(id)
+            .node(id)
             .map(|n| format!("{:?}", n.node_type))
             .unwrap_or_else(|| "?".into());
         println!(
@@ -959,7 +957,7 @@ fn run_blame(opts: &BlameOpts) -> i32 {
     };
     let graph = snapshot.graph;
     let origin = NodeId(node_id.to_string());
-    if !graph.nodes.contains_key(&origin) {
+    if !graph.contains_node(&origin) {
         eprintln!(
             "ccos: node '{node_id}' not found ({} nodes). List ids with `ccos analyze <path> --json`.",
             graph.node_count()

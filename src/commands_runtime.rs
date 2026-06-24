@@ -210,7 +210,7 @@ pub(crate) async fn run_runtime(args: &[String]) -> i32 {
     // 3. Run the agents over the HOT context.
     let context: String = hot
         .iter()
-        .filter_map(|id| graph.nodes.get(id))
+        .filter_map(|id| graph.node(id))
         .map(|n| format!("{} {}", n.label, n.content))
         .collect::<Vec<_>>()
         .join("\n");

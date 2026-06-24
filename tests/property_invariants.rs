@@ -33,9 +33,9 @@ proptest! {
         }
 
         // Invariant 1 — no dangling edges.
-        let ids: HashSet<_> = graph.nodes.keys().cloned().collect();
+        let ids: HashSet<_> = graph.node_ids().cloned().collect();
         let dangling = graph
-            .edges
+            .edges()
             .iter()
             .filter(|e| !ids.contains(&e.source) || !ids.contains(&e.target))
             .count();
@@ -66,7 +66,7 @@ proptest! {
                 let source = format!("mod m{s};\npub fn func_{s}() {{}}\nstruct S{s};\n", s = sym);
                 engine.process_delta(&path, None, &source, &mut graph);
             }
-            let mut ids: Vec<String> = graph.nodes.keys().map(|k| k.0.clone()).collect();
+            let mut ids: Vec<String> = graph.node_ids().map(|k| k.0.clone()).collect();
             ids.sort();
             ids
         };

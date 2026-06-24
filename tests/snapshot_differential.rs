@@ -12,11 +12,11 @@ fn graph_hash(graph: &MemoryGraph) -> String {
     hasher.update(graph.edge_count().to_le_bytes());
 
     // Collect and sort node IDs for deterministic hashing
-    let mut node_ids: Vec<&NodeId> = graph.nodes.keys().collect();
+    let mut node_ids: Vec<&NodeId> = graph.node_ids().collect();
     node_ids.sort_by(|a, b| a.0.cmp(&b.0));
 
     for id in node_ids {
-        if let Some(node) = graph.nodes.get(id) {
+        if let Some(node) = graph.node(id) {
             hasher.update(id.0.as_bytes());
             hasher.update(node.label.as_bytes());
             hasher.update(node.content.as_bytes());
@@ -27,7 +27,7 @@ fn graph_hash(graph: &MemoryGraph) -> String {
     }
 
     // Hash edges deterministically
-    let mut edges_sorted: Vec<&ccos::memory::GraphEdge> = graph.edges.iter().collect();
+    let mut edges_sorted: Vec<&ccos::memory::GraphEdge> = graph.edges().iter().collect();
     edges_sorted.sort_by(|a, b| {
         a.source
             .0
