@@ -80,10 +80,14 @@ measurements behind the numbers above are in
   (frugality), the backing store grows into available RAM, and **nothing is lost**. Any node
   pages back on demand (`page_in`); on the read paths the tier is **transparent** — a
   `signal_failure` or a `page_fault` resurrects a demoted faulting file, and a **recall around**
-  a demoted node pages it (and its cold neighbours) back automatically. The cognitive-MMU
-  promise made literal — "infinite"
+  a demoted node pages it (and its cold neighbours) back automatically. Opt in to
+  `attach_cold_spill(dir, budget)` and the coldest COLD **content** spills to a
+  content-addressed on-disk store (SHA-256, **deduplicated**, **hash-verified** on read —
+  a tampered blob is a cold-miss, not a silent restore), so the resident *and* cold content
+  footprint is **RAM-bounded** while the backing store on disk is **unbounded**; it faults
+  back transparently. The cognitive-MMU promise made literal — "infinite"
   working memory as a *direction*, expressed concretely as **frugality × available RAM**
-  (`MemoryStats.cold` surfaces the tier). Deterministic.
+  (`MemoryStats.cold` / `cold_spilled` surface the tier). Deterministic; off by default.
 
 ### 2. Transactional, replayable storage
 

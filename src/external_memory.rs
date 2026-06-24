@@ -234,6 +234,13 @@ pub struct MemoryStats {
     /// retrievable via a page-in. The resident `nodes` count stays bounded; this
     /// is the unbounded backing store behind it.
     pub cold: usize,
+    /// Of `cold`, how many have had their content **spilled to disk** (the
+    /// on-disk swap store). `0` unless a spill store is attached; the resident
+    /// RAM footprint of a spilled entry is just a hash stub.
+    pub cold_spilled: usize,
+    /// Bytes of COLD content currently spilled to disk (sum of original lengths;
+    /// the store deduplicates identical blobs, so actual disk use is ≤ this).
+    pub cold_spilled_bytes: usize,
     /// Events appended to the primary log.
     pub events: usize,
     /// Files whose source is retained.
@@ -548,6 +555,27 @@ impl CcosMemory {
     pub fn set_max_resident(&mut self, max: usize) {
         self.graph.max_in_memory_nodes = max.max(1);
         self.graph.enforce_paging();
+    }
+
+    /// Attach an on-disk **spill store** (the "swap file") for the COLD tier: once
+    /// resident COLD *content* exceeds `inline_budget` bytes, the coldest blobs
+    /// are written to `dir` (content-addressed by SHA-256, deduplicated, and
+    /// hash-verified on read) and dropped from RAM, leaving only a stub. They
+    /// fault back in transparently on the next recall/page-in. This makes the
+    /// resident *and* cold **content** footprint RAM-bounded while the backing
+    /// store on disk is unbounded — the concrete shape of "frugality × RAM".
+    ///
+    /// Opt-in: with no store attached (the default) the COLD tier stays fully in
+    /// memory, byte-identical to before, so the replay/snapshot invariants are
+    /// untouched. A snapshot taken while a store is attached references spilled
+    /// blobs by hash; restore needs the same `dir` re-attached (a sidecar, like a
+    /// swapfile). Errors only if `dir` cannot be created.
+    pub fn attach_cold_spill(
+        &mut self,
+        dir: impl Into<std::path::PathBuf>,
+        inline_budget: usize,
+    ) -> std::io::Result<()> {
+        self.graph.attach_cold_spill(dir, inline_budget)
     }
 
     /// The node currently under the most failure pressure — the workspace's active
@@ -1003,6 +1031,8 @@ impl ExternalMemory for CcosMemory {
             nodes: self.graph.nodes.len(),
             edges: self.graph.edges.len(),
             cold: self.graph.cold_count(),
+            cold_spilled: self.graph.cold_spilled_count(),
+            cold_spilled_bytes: self.graph.cold_spilled_bytes(),
             events: self.event_log.event_count(),
             files: self.sources.len(),
             clock: self.graph.clock,

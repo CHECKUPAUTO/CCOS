@@ -2,9 +2,11 @@ use crate::eviction_policy::{
     bucket_pressure, bucket_recency, bucket_score, bucket_size, EvictionPolicy, PagingState, EVICT,
     KEEP,
 };
+use crate::util::sha256_hex;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeId(pub String);
@@ -175,6 +177,67 @@ pub struct MemoryGraph {
     /// pre-existing snapshots loadable.
     #[serde(default)]
     cold: BTreeMap<NodeId, ColdNode>,
+    /// Optional on-disk **spill store** for COLD content — the "swap file". A
+    /// runtime handle only (`#[serde(skip)]`): a snapshot records the spilled
+    /// *stubs* (see [`ColdNode::spill`]), and the directory travels alongside,
+    /// re-attached on restore via [`attach_cold_spill`](Self::attach_cold_spill).
+    /// `None` (the default) ⇒ COLD content stays fully resident in RAM,
+    /// byte-identical to a graph that never knew about spill, so every existing
+    /// invariant (replay == live, snapshot hash) is untouched on the default path.
+    #[serde(skip)]
+    spill: Option<SpillConfig>,
+}
+
+/// A bound spill store plus the resident-content budget that triggers a flush.
+/// Not serialised — held only while a [`MemoryGraph`] is live.
+#[derive(Debug, Clone)]
+struct SpillConfig {
+    store: ColdSpill,
+    /// Max bytes of COLD *content* kept inline (resident) before the coldest is
+    /// flushed to disk. `usize::MAX` ⇒ never flush.
+    inline_budget: usize,
+}
+
+/// An on-disk, content-addressed store for vacated COLD content — the unbounded
+/// "swap" backing the bounded resident window. A blob is keyed by the **SHA-256**
+/// of its content (the same addressing scheme as the CCR store,
+/// [`crate::compressor::CcrRef`]), so identical content is **deduplicated** to a
+/// single file, and a read **re-verifies** the hash: a truncated or tampered
+/// blob is a detectable miss, never a silent empty restore. Spill thus *extends*
+/// the integrity story rather than weakening it. Lossless and verbatim (no codec
+/// yet — content-dedup is the only space win at this layer).
+#[derive(Debug, Clone)]
+pub struct ColdSpill {
+    dir: PathBuf,
+}
+
+impl ColdSpill {
+    /// Open (creating if needed) a spill directory.
+    pub fn new(dir: impl Into<PathBuf>) -> std::io::Result<Self> {
+        let dir = dir.into();
+        std::fs::create_dir_all(&dir)?;
+        Ok(Self { dir })
+    }
+
+    /// Write `content` addressed by its SHA-256, returning the hex key. Idempotent
+    /// — content-addressed, so re-spilling the same blob is a no-op write.
+    fn put(&self, content: &str) -> std::io::Result<String> {
+        let hash = sha256_hex(content);
+        let path = self.dir.join(&hash);
+        if !path.exists() {
+            std::fs::write(&path, content.as_bytes())?;
+        }
+        Ok(hash)
+    }
+
+    /// Read a blob by hash, **verifying** integrity. `None` if the file is
+    /// missing, not valid UTF-8, or its content no longer hashes to `hash`
+    /// (tampered/corrupt) — all surfaced as a cold-miss by the caller.
+    fn get(&self, hash: &str) -> Option<String> {
+        let bytes = std::fs::read(self.dir.join(hash)).ok()?;
+        let text = String::from_utf8(bytes).ok()?;
+        (sha256_hex(&text) == hash).then_some(text)
+    }
 }
 
 /// A node demoted out of the resident graph into the [`MemoryGraph`] COLD tier,
@@ -184,6 +247,27 @@ pub struct MemoryGraph {
 struct ColdNode {
     node: GraphNode,
     edges: Vec<GraphEdge>,
+    /// When `Some`, this node's `content` blob has been vacated to the on-disk
+    /// spill store and `node.content` is empty; it must be faulted back in
+    /// (verified by hash) before the node can be paged resident. `None` ⇒
+    /// content is inline (resident), the default and the only state when no
+    /// spill store is attached. `skip_serializing_if` keeps the serialized form
+    /// byte-identical to the pre-spill layout whenever nothing is spilled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    spill: Option<SpillRef>,
+}
+
+/// A stub left in RAM after a COLD node's content is flushed to the on-disk spill
+/// store: enough to fault it back (the hash key + integrity check) and to account
+/// for its disk footprint (the original length) without touching the disk.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SpillRef {
+    /// SHA-256 hex of the vacated content — the on-disk key *and* the read-time
+    /// integrity check.
+    hash: String,
+    /// Byte length of the original content (so budget/stat math need not fault
+    /// the blob back in).
+    len: usize,
 }
 
 impl MemoryGraph {
@@ -197,6 +281,7 @@ impl MemoryGraph {
             scoring_weights: ScoringWeights::default(),
             eviction_policy: EvictionPolicy::new(),
             cold: BTreeMap::new(),
+            spill: None,
         }
     }
 
@@ -433,6 +518,8 @@ impl MemoryGraph {
         }
         // Defensive: guarantee no edge survives pointing at an evicted node.
         self.prune_dangling_edges();
+        // Newly-demoted content may push the COLD tier over its RAM budget.
+        self.enforce_cold_budget();
     }
 
     /// Demote a node out of the resident graph into the COLD tier, archiving the
@@ -453,6 +540,7 @@ impl MemoryGraph {
                 ColdNode {
                     node,
                     edges: incident,
+                    spill: None,
                 },
             );
         }
@@ -465,6 +553,24 @@ impl MemoryGraph {
     /// whose other endpoint is resident is re-linked. Returns `true` if the node
     /// was cold and is now resident. Deterministic (tie-break on id).
     pub fn page_in(&mut self, id: &NodeId) -> bool {
+        // Fault spilled content back from disk first (verified by hash). A
+        // spilled entry whose blob is missing/tampered, or whose store has been
+        // detached, is a cold-miss — never a silent empty restore.
+        let spilled_hash = self
+            .cold
+            .get(id)
+            .and_then(|c| c.spill.as_ref().map(|s| s.hash.clone()));
+        if let Some(hash) = spilled_hash {
+            match self.spill.as_ref().and_then(|cfg| cfg.store.get(&hash)) {
+                Some(text) => {
+                    if let Some(entry) = self.cold.get_mut(id) {
+                        entry.node.content = text;
+                        entry.spill = None;
+                    }
+                }
+                None => return false,
+            }
+        }
         let Some(mut cold) = self.cold.remove(id) else {
             return false;
         };
@@ -502,6 +608,8 @@ impl MemoryGraph {
             }
         }
         self.prune_dangling_edges();
+        // Swap-demoted victims add inline content to the COLD tier; re-check budget.
+        self.enforce_cold_budget();
         true
     }
 
@@ -542,6 +650,119 @@ impl MemoryGraph {
             }
         }
         out.into_iter().collect()
+    }
+
+    /// Attach an on-disk **spill store** (the "swap file") for COLD content,
+    /// flushing the coldest content to `dir` whenever resident COLD content
+    /// exceeds `inline_budget` bytes. Content is addressed by SHA-256 (so a
+    /// blob is deduplicated and integrity-checked on read) and faulted back by
+    /// [`page_in`](Self::page_in) on demand. Re-attaching the *same* directory
+    /// after a snapshot restore lets previously-spilled stubs fault back in.
+    /// Applies the budget immediately. Errors only if `dir` can't be created.
+    pub fn attach_cold_spill(
+        &mut self,
+        dir: impl Into<PathBuf>,
+        inline_budget: usize,
+    ) -> std::io::Result<()> {
+        let store = ColdSpill::new(dir)?;
+        self.spill = Some(SpillConfig {
+            store,
+            inline_budget,
+        });
+        self.enforce_cold_budget();
+        Ok(())
+    }
+
+    /// Detach the spill store. Already-spilled entries stay stubbed and become
+    /// unreachable (a cold-miss on [`page_in`](Self::page_in)) until the same
+    /// directory is re-attached. Mainly for tests and controlled teardown.
+    pub fn detach_cold_spill(&mut self) {
+        self.spill = None;
+    }
+
+    /// Whether an on-disk COLD spill store is currently attached.
+    pub fn has_cold_spill(&self) -> bool {
+        self.spill.is_some()
+    }
+
+    /// Bytes of COLD content currently held **inline** (resident in RAM, not yet
+    /// spilled). This is the quantity the spill budget bounds.
+    pub fn cold_inline_bytes(&self) -> usize {
+        self.cold
+            .values()
+            .filter(|c| c.spill.is_none())
+            .map(|c| c.node.content.len())
+            .sum()
+    }
+
+    /// Number of COLD entries whose content has been spilled to disk.
+    pub fn cold_spilled_count(&self) -> usize {
+        self.cold.values().filter(|c| c.spill.is_some()).count()
+    }
+
+    /// Whether `id` is a COLD entry whose content currently lives on disk (spilled).
+    pub fn is_spilled(&self, id: &NodeId) -> bool {
+        self.cold.get(id).is_some_and(|c| c.spill.is_some())
+    }
+
+    /// Bytes of COLD content spilled to disk (sum of original content lengths;
+    /// the on-disk store deduplicates identical blobs, so the actual disk
+    /// footprint is ≤ this).
+    pub fn cold_spilled_bytes(&self) -> usize {
+        self.cold
+            .values()
+            .filter_map(|c| c.spill.as_ref().map(|s| s.len))
+            .sum()
+    }
+
+    /// Flush the coldest resident COLD content to the spill store until resident
+    /// COLD content is within `inline_budget`. Deterministic: candidates are
+    /// ordered coldest-first by causal score, ties broken on node id. A no-op
+    /// without an attached store, or when already within budget. A blob that
+    /// fails to write is left **inline** (kept in RAM) — spill never drops data.
+    fn enforce_cold_budget(&mut self) {
+        let budget = match self.spill.as_ref() {
+            Some(cfg) => cfg.inline_budget,
+            None => return,
+        };
+        let mut resident = self.cold_inline_bytes();
+        if resident <= budget {
+            return;
+        }
+        // Coldest-first candidate order (deterministic); scores computed up front
+        // so the mutation loop borrows neither `self.scoring_weights` nor the map.
+        let mut candidates: Vec<(NodeId, f64)> = self
+            .cold
+            .iter()
+            .filter(|(_, c)| c.spill.is_none() && !c.node.content.is_empty())
+            .map(|(id, c)| (id.clone(), self.compute_node_score(&c.node)))
+            .collect();
+        candidates.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        for (id, _) in candidates {
+            if resident <= budget {
+                break;
+            }
+            let content = match self.cold.get(&id) {
+                Some(c) if c.spill.is_none() => c.node.content.clone(),
+                _ => continue,
+            };
+            let written = self
+                .spill
+                .as_ref()
+                .and_then(|cfg| cfg.store.put(&content).ok());
+            if let Some(hash) = written {
+                if let Some(entry) = self.cold.get_mut(&id) {
+                    let len = entry.node.content.len();
+                    entry.node.content = String::new();
+                    entry.spill = Some(SpillRef { hash, len });
+                    resident = resident.saturating_sub(len);
+                }
+            }
+        }
     }
 
     /// Remove any edge whose endpoints are no longer present in the graph and
@@ -1433,6 +1654,184 @@ mod tests {
             vec![NodeId("a".into())]
         );
         assert!(g.cold_neighbours(&NodeId("c".into())).is_empty());
+    }
+
+    // ── slice 3: COLD spill to disk (RAM-bounded content, disk-unbounded) ──────
+
+    fn spill_temp_dir(tag: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "ccos_spill_{}_{}_{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        p
+    }
+
+    #[test]
+    fn spill_round_trips_cold_content_losslessly() {
+        // Resident cap 1 ⇒ all but one node is demoted to the COLD tier.
+        let mut g = MemoryGraph::new(0.2, 1);
+        let bodies: Vec<(String, String)> = (0..6)
+            .map(|i| {
+                (
+                    format!("n{i}"),
+                    format!("// node {i}\n{}\n", "payload ".repeat(50 + i)),
+                )
+            })
+            .collect();
+        for (id, body) in &bodies {
+            g.upsert_node(
+                id.clone().into(),
+                id.clone(),
+                body.clone(),
+                NodeType::Symbol,
+            );
+        }
+        assert!(
+            g.cold_count() >= 4,
+            "expected a populated COLD tier, got {}",
+            g.cold_count()
+        );
+        assert!(g.cold_inline_bytes() > 0);
+
+        // Attach a spill store with a tiny budget → coldest content flushes to disk.
+        let dir = spill_temp_dir("roundtrip");
+        g.attach_cold_spill(&dir, 64).unwrap();
+        assert!(
+            g.cold_spilled_count() > 0,
+            "a 64-byte budget must force at least one spill"
+        );
+        assert!(
+            g.cold_inline_bytes() <= 64,
+            "resident COLD content must be within budget, got {}",
+            g.cold_inline_bytes()
+        );
+
+        // Every body must reconstruct exactly when its node is made resident.
+        for (id, body) in &bodies {
+            let nid = NodeId(id.clone());
+            g.page_in(&nid); // faults the blob back (hash-verified); no-op if resident
+            let n = g.node(&nid).expect("node must be resident after page_in");
+            assert_eq!(
+                &n.content, body,
+                "content for {id} must round-trip losslessly"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn spill_decisions_are_deterministic() {
+        fn spilled_set(dir: &std::path::Path) -> Vec<NodeId> {
+            let mut g = MemoryGraph::new(0.2, 1);
+            for i in 0..6 {
+                let id = format!("n{i}");
+                g.upsert_node(
+                    id.clone().into(),
+                    id,
+                    format!("body {}", "z".repeat(40 + i)),
+                    NodeType::Symbol,
+                );
+            }
+            g.attach_cold_spill(dir, 50).unwrap();
+            let mut out: Vec<NodeId> = g
+                .cold_ids()
+                .filter(|id| g.is_spilled(id))
+                .cloned()
+                .collect();
+            out.sort();
+            out
+        }
+        let d1 = spill_temp_dir("det1");
+        let d2 = spill_temp_dir("det2");
+        let a = spilled_set(&d1);
+        let b = spilled_set(&d2);
+        assert_eq!(
+            a, b,
+            "identical histories must spill the identical node set"
+        );
+        assert!(!a.is_empty(), "the budget should have forced some spills");
+        std::fs::remove_dir_all(&d1).ok();
+        std::fs::remove_dir_all(&d2).ok();
+    }
+
+    #[test]
+    fn spill_off_by_default_leaves_serialization_unchanged() {
+        let mut g = MemoryGraph::new(0.2, 1);
+        for i in 0..5 {
+            let id = format!("n{i}");
+            g.upsert_node(
+                id.clone().into(),
+                id,
+                format!("content {}", "q".repeat(30)),
+                NodeType::Symbol,
+            );
+        }
+        assert!(g.cold_count() > 0);
+        assert_eq!(
+            g.cold_spilled_count(),
+            0,
+            "nothing spills without an attached store"
+        );
+        // With no store attached, every `spill` stub is `None` and elided, so the
+        // JSON carries no new field — byte-identical to the pre-spill layout.
+        let json = serde_json::to_string(&g).unwrap();
+        assert!(
+            !json.contains("\"spill\""),
+            "the default path must not emit any spill stub"
+        );
+    }
+
+    #[test]
+    fn a_tampered_or_detached_spill_blob_is_a_cold_miss() {
+        let mut g = MemoryGraph::new(0.2, 1);
+        for i in 0..4 {
+            let id = format!("n{i}");
+            g.upsert_node(
+                id.clone().into(),
+                id,
+                format!("secret-{i} {}", "p".repeat(60)),
+                NodeType::Symbol,
+            );
+        }
+        let dir = spill_temp_dir("tamper");
+        g.attach_cold_spill(&dir, 0).unwrap(); // budget 0 ⇒ spill all cold content
+        let spilled: Vec<NodeId> = g
+            .cold_ids()
+            .filter(|id| g.is_spilled(id))
+            .cloned()
+            .collect();
+        assert!(spilled.len() >= 2, "expected several spilled nodes");
+
+        // Tamper: rewrite every blob so its bytes no longer hash to its name.
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            std::fs::write(entry.unwrap().path(), b"tampered").unwrap();
+        }
+        let victim = spilled[0].clone();
+        assert!(
+            !g.page_in(&victim),
+            "a tampered blob must fail the hash check → cold-miss"
+        );
+        assert!(
+            g.is_cold(&victim),
+            "the victim stays cold, not silently restored"
+        );
+        assert!(
+            g.node(&victim).is_none(),
+            "no empty or partial node may become resident on a failed fault"
+        );
+
+        // Detaching the store makes the remaining spilled nodes unreachable until
+        // the same directory is re-attached.
+        g.detach_cold_spill();
+        let other = spilled.iter().find(|id| **id != victim).unwrap().clone();
+        assert!(!g.page_in(&other), "a detached store is a cold-miss");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

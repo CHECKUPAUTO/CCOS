@@ -350,7 +350,25 @@ core. The public surface is: \code{ContextRegionEngine} (\code{cluster\_nodes},
 (\code{RegionCreated}, \code{RegionActivated}, \code{RegionMerged},
 \code{RegionEvicted}, \code{ContextWindowGenerated}). A \code{ccos regions} CLI
 exposes clustering, activation and the locality report. The whole crate builds
-warning-clean under \code{clippy -D warnings} and passes 364 tests.
+warning-clean under \code{clippy -D warnings} and passes 410 tests.
+
+\paragraph{The cognitive MMU, made real.} Paging lives in the code, not only the
+prose: eviction is \emph{non-destructive}. When the resident node set exceeds its
+cap, the lowest-scored nodes are \emph{demoted}---with their incident edges---into
+a COLD tier rather than dropped, and any node faults back on demand
+(\code{page\_in}). A failure signal, or a recall \emph{around} a demoted node,
+resurrects it and its cold neighbours transparently; the page-in is a
+\emph{replayed} side effect, so \mbox{\code{replay}\,$=$\,\code{live}} still holds.
+The COLD tier's unbounded \emph{content} optionally spills to a content-addressed
+on-disk store (SHA-256 keys, deduplicated, and \emph{hash-verified} on read---a
+tampered or missing blob is a cold-miss, never a silent empty restore), bounding
+the resident-plus-cold \emph{content} footprint in RAM while the backing store on
+disk is unbounded. This is the sense in which working memory is ``unbounded'': a
+\emph{direction}, frugality~$\times$~available RAM, rather than a literal claim.
+Honestly scoped: only \emph{content} spills---per-cold-node metadata still grows in
+RAM, and the on-disk blobs are stored verbatim (dedup, no compression codec yet);
+the default path keeps spill off and serialization byte-identical, so the
+determinism guarantees of \S\ref{sec:determinism} are untouched.
 
 \section{Evaluation: what we can measure today}\label{sec:eval}
 
