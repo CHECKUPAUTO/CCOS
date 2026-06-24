@@ -613,6 +613,18 @@ impl CcosMemory {
         self.graph.set_cold_content_budget(budget);
     }
 
+    /// Replace the causal scoring/decay weights ([`crate::memory::ScoringWeights`])
+    /// that drive node scoring, selection, and eviction. Used by the session's
+    /// log-tuned retrieval (slice C) to adopt learned weights.
+    pub fn set_scoring_weights(&mut self, weights: crate::memory::ScoringWeights) {
+        self.graph.set_scoring_weights(weights);
+    }
+
+    /// The current causal scoring weights.
+    pub fn scoring_weights(&self) -> crate::memory::ScoringWeights {
+        self.graph.scoring_weights
+    }
+
     /// The node currently under the most failure pressure — the workspace's active
     /// problem focus, and the natural anchor for "what should I be looking at".
     /// `None` when nothing is failing. Deterministic (ties break on the node id).

@@ -339,6 +339,21 @@ not claim this improves task success; we claim it is a property the alternatives
 not have, and that it is the honest locus of CCOS's contribution
 (\S\ref{sec:protocol}).
 
+\paragraph{The log as training data.} Because the timeline is deterministic and
+replayable, it is also a \emph{counterfactual evaluation set} for retrieval
+itself. We read a reward straight off it: for each recorded recall, was the node
+the agent engaged \emph{next} --- a failure signal or page-fault, taken as a
+post-hoc relevance signal --- present in the window that recall \emph{would} have
+produced under candidate scoring weights? Maximising this hit rate by deterministic
+coordinate ascent (each candidate scored by a full replay) yields scoring weights
+tuned to the session's own history; adopting them is recorded as an operation, so
+the learned policy is itself auditable and reproduced on replay. The reward is an
+honest proxy and the optimiser is greedy, so we claim only that this is retrieval
+that \emph{trains on a substrate the alternatives lack}: a probabilistic RAG store
+keeps no canonical, replayable log to learn from. This closes the loop the title
+implies --- the working memory is not only inspectable but \emph{self-improving}
+from its own auditable record.
+
 \section{Implementation}\label{sec:impl}
 
 The engine is $\approx\!600$ lines of dependency-light Rust layered above the
@@ -350,7 +365,7 @@ core. The public surface is: \code{ContextRegionEngine} (\code{cluster\_nodes},
 (\code{RegionCreated}, \code{RegionActivated}, \code{RegionMerged},
 \code{RegionEvicted}, \code{ContextWindowGenerated}). A \code{ccos regions} CLI
 exposes clustering, activation and the locality report. The whole crate builds
-warning-clean under \code{clippy -D warnings} and passes 416 tests.
+warning-clean under \code{clippy -D warnings} and passes 420 tests.
 
 \paragraph{The cognitive MMU, made real.} Paging lives in the code, not only the
 prose: eviction is \emph{non-destructive}. When the resident node set exceeds its

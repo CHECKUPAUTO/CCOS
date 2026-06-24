@@ -39,6 +39,7 @@ use crate::compressor::{CausalCompressor, CcrRef};
 use crate::external_memory::{
     CcosMemory, ExternalMemory, IngestReport, MemoryError, Recall, RecallWindow,
 };
+use crate::memory::ScoringWeights;
 use crate::trace::parse_cargo_test_output;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -67,6 +68,13 @@ enum Op {
         #[serde(default = "legacy_page_fault_depth")]
         depth: u32,
     },
+    /// The causal scoring weights were **retuned** from the replayable log (slice
+    /// C). Logged so the change is auditable *and* reproduced on replay — the
+    /// learned policy is part of the timeline, not a side channel, so
+    /// `replay == live` still holds.
+    Retune {
+        weights: ScoringWeights,
+    },
 }
 
 /// Failure-propagation depth a `page_fault` injects. Configurable via
@@ -83,6 +91,26 @@ fn page_fault_depth() -> u32 {
 /// The depth `PageFault` ops used before it was recorded — for replaying old logs.
 fn legacy_page_fault_depth() -> u32 {
     2
+}
+
+/// Whether a recall window holds the engaged node `uri` at **file granularity**:
+/// a window item for the same source file — its file node *or* any of its symbol
+/// nodes — counts as the relevant context having been surfaced. Used by the
+/// log-tuned retrieval reward (slice C).
+fn window_holds(win: &RecallWindow, uri: &str) -> bool {
+    let want = engaged_path(uri);
+    win.items.iter().any(|it| engaged_path(&it.uri) == want)
+}
+
+/// The source path a node uri refers to, stripped of any `kind:` prefix and
+/// `:symbol` suffix — so `sym:src/x.rs:foo`, `file:src/x.rs`, and a bare
+/// `src/x.rs` all reduce to `src/x.rs`.
+fn engaged_path(uri: &str) -> &str {
+    let rest = ["file:", "sym:", "mod:", "use:", "dep:"]
+        .iter()
+        .find_map(|p| uri.strip_prefix(p))
+        .unwrap_or(uri);
+    rest.split(':').next().unwrap_or(rest)
 }
 
 /// The on-disk timeline sidecar (`<workspace>.oplog`): the replay **baseline**
@@ -449,6 +477,10 @@ impl AgentSession {
                         m.ensure_resident(uri);
                     }
                 }
+                Op::Retune { weights } => {
+                    // Reproduce the learned-weights change so replay == live.
+                    m.set_scoring_weights(*weights);
+                }
             }
         }
         m
@@ -459,6 +491,127 @@ impl AgentSession {
     /// a better window? `step` is clamped to the timeline length.
     pub fn recall_what_if(&self, step: usize, recall: &Recall, budget: usize) -> RecallWindow {
         self.replay_to(step).recall(recall, budget)
+    }
+
+    // ── slice C: self-improving retrieval from the replayable log ─────────────
+
+    /// Replay the timeline under candidate scoring `weights` and score how often
+    /// recall **helped**: for each recorded recall, was the node the agent engaged
+    /// *next* (a failure signal or page-fault) present — at file granularity — in
+    /// the window that recall would have produced under `weights`? Returns the hit
+    /// rate over all such recall→engagement pairs, or `None` when the log has no
+    /// judged pair (nothing to learn from yet).
+    ///
+    /// This is **counterfactual** evaluation on the hash-chained log: the same log
+    /// yields the same number, deterministically. The reward is an honest *proxy* —
+    /// it assumes the agent's next failing/faulting node is the context recall
+    /// should have surfaced. Cost is one full replay per call (each recall op is
+    /// re-run), so it is an offline/maintenance operation, not a hot path.
+    pub fn retrieval_reward(&self, weights: &ScoringWeights) -> Option<f64> {
+        let mut m = match &self.baseline {
+            Some(snapshot) => CcosMemory::from_json(snapshot).unwrap_or_default(),
+            None => CcosMemory::new(),
+        };
+        m.set_scoring_weights(*weights);
+        let mut pending: Option<RecallWindow> = None;
+        let (mut hits, mut total) = (0usize, 0usize);
+        for op in &self.ops {
+            match op {
+                Op::Ingest { uri, source } => {
+                    m.ingest_source(uri, source);
+                }
+                Op::Recall { recall, budget } => {
+                    if let Recall::Around(uri) = recall {
+                        m.ensure_resident(uri);
+                    }
+                    pending = Some(m.recall(recall, *budget));
+                }
+                Op::Failure { node, depth } => {
+                    if let Some(win) = pending.take() {
+                        total += 1;
+                        if window_holds(&win, node) {
+                            hits += 1;
+                        }
+                    }
+                    let _ = m.signal_failure(node, *depth);
+                }
+                Op::PageFault { files, depth } => {
+                    if let Some(win) = pending.take() {
+                        total += 1;
+                        if files.iter().any(|f| window_holds(&win, f)) {
+                            hits += 1;
+                        }
+                    }
+                    for f in files {
+                        let _ = m.signal_failure(&format!("file:{f}"), *depth);
+                    }
+                }
+                Op::Retune { .. } => {
+                    // Hold `weights` fixed across the whole evaluation; a recorded
+                    // retune is what we are *measuring against*, not applying here.
+                }
+            }
+        }
+        (total > 0).then_some(hits as f64 / total as f64)
+    }
+
+    /// The retrieval hit rate under the **current** scoring weights — the baseline
+    /// the tuner improves on. `None` when the log has no judged recall yet.
+    pub fn retrieval_hit_rate(&self) -> Option<f64> {
+        self.retrieval_reward(&self.live.scoring_weights())
+    }
+
+    /// Learn scoring weights that maximise the retrieval reward over the
+    /// replayable log, by **deterministic coordinate ascent** from the current
+    /// weights (a fixed multiplicative grid, fixed dimension order, strict
+    /// improvement only — so the same log always yields the same weights). Pure: it
+    /// does not mutate the session. Returns the current weights unchanged when
+    /// there is nothing to learn from.
+    pub fn tune_recall_weights(&self) -> ScoringWeights {
+        let mut best = self.live.scoring_weights();
+        let Some(mut best_reward) = self.retrieval_reward(&best) else {
+            return best;
+        };
+        const FACTORS: [f64; 6] = [0.25, 0.5, 0.75, 1.5, 2.0, 4.0];
+        for _pass in 0..2 {
+            for dim in 0..4 {
+                for &f in &FACTORS {
+                    let mut cand = best;
+                    match dim {
+                        0 => cand.w_base *= f,
+                        1 => cand.w_failure *= f,
+                        2 => cand.w_recency *= f,
+                        _ => cand.w_access *= f,
+                    }
+                    if let Some(r) = self.retrieval_reward(&cand) {
+                        if r > best_reward {
+                            best = cand;
+                            best_reward = r;
+                        }
+                    }
+                }
+            }
+        }
+        best
+    }
+
+    /// Learn weights from the log ([`tune_recall_weights`](Self::tune_recall_weights))
+    /// and **adopt** them when they strictly improve the measured hit rate: apply
+    /// them to the live memory *and* record a retune op so the change is
+    /// auditable and reproduced on replay (`replay == live` holds). Returns `true`
+    /// when weights were adopted. The CCOS-native loop — the replayable history is
+    /// the training data.
+    pub fn adopt_tuned_recall_weights(&mut self) -> bool {
+        let before = self.retrieval_hit_rate();
+        let tuned = self.tune_recall_weights();
+        let after = self.retrieval_reward(&tuned);
+        if after > before {
+            self.live.set_scoring_weights(tuned);
+            self.ops.push(Op::Retune { weights: tuned });
+            true
+        } else {
+            false
+        }
     }
 
     /// A human-readable journal of the cognitive timeline. If compaction has folded
@@ -485,6 +638,7 @@ impl AgentSession {
                 Op::PageFault { files, depth } => {
                     format!("t={t}  PageFault(files={files:?}, depth={depth})")
                 }
+                Op::Retune { .. } => format!("t={t}  Retune(scoring weights from log)"),
             }
         }));
         out
@@ -515,6 +669,97 @@ mod tests {
         );
         s.signal_failure("file:src/api.rs", 3).unwrap();
         s
+    }
+
+    // ── slice C: self-improving retrieval from the replayable log ─────────────
+
+    /// A session whose log has a recall that *misses* the node engaged next under
+    /// the default weights, but is fixable by re-weighting: the engaged file `d`
+    /// has a high access count (re-ingested), while a failing competitor `f` wins
+    /// the tight default window.
+    fn learnable_session() -> AgentSession {
+        let mut s = AgentSession::new();
+        for _ in 0..40 {
+            s.ingest("src/d.rs", "pub fn delta() -> u32 { 0 }\n"); // raise d's access
+        }
+        s.ingest("src/f.rs", "pub fn frank() -> u32 { 1 }\n");
+        s.signal_failure("file:src/f.rs", 0).unwrap(); // f is the hot default-window winner
+        s.recall(Recall::working_set(), 8); // tight budget → ~1 node
+        s.signal_failure("file:src/d.rs", 0).unwrap(); // the agent actually engages d
+        s
+    }
+
+    #[test]
+    fn retrieval_reward_scores_recall_hits_and_misses() {
+        // HIT: recall around A, then fail on A → A is in its own region window.
+        let mut s = AgentSession::new();
+        s.ingest("src/a.rs", "pub fn alpha() -> u32 { 1 }\n");
+        s.ingest("src/z.rs", "pub fn zeta() -> u32 { 2 }\n");
+        s.recall(Recall::around("file:src/a.rs"), 4096);
+        s.signal_failure("file:src/a.rs", 1).unwrap();
+        assert_eq!(
+            s.retrieval_hit_rate(),
+            Some(1.0),
+            "recall around A then fail on A is a hit"
+        );
+
+        // MISS: recall around A, then fail on the disconnected Z.
+        let mut s = AgentSession::new();
+        s.ingest("src/a.rs", "pub fn alpha() -> u32 { 1 }\n");
+        s.ingest("src/z.rs", "pub fn zeta() -> u32 { 2 }\n");
+        s.recall(Recall::around("file:src/a.rs"), 4096);
+        s.signal_failure("file:src/z.rs", 1).unwrap();
+        assert_eq!(
+            s.retrieval_hit_rate(),
+            Some(0.0),
+            "recall around A then fail on disconnected Z is a miss"
+        );
+
+        // No judged pair yet → nothing to learn from.
+        let mut s = AgentSession::new();
+        s.ingest("src/a.rs", "pub fn alpha() -> u32 { 1 }\n");
+        assert_eq!(s.retrieval_hit_rate(), None);
+    }
+
+    #[test]
+    fn tune_recall_weights_is_deterministic() {
+        let a = learnable_session().tune_recall_weights();
+        let b = learnable_session().tune_recall_weights();
+        assert_eq!(a.w_base, b.w_base);
+        assert_eq!(a.w_failure, b.w_failure);
+        assert_eq!(a.w_recency, b.w_recency);
+        assert_eq!(a.w_access, b.w_access);
+    }
+
+    #[test]
+    fn tuning_improves_retrieval_on_a_learnable_log() {
+        let s = learnable_session();
+        let before = s.retrieval_hit_rate();
+        let tuned = s.tune_recall_weights();
+        let after = s.retrieval_reward(&tuned);
+        assert!(
+            after > before,
+            "log-tuned weights improve the measured hit rate: {before:?} -> {after:?}"
+        );
+    }
+
+    #[test]
+    fn adopting_tuned_weights_is_logged_and_replay_matches_live() {
+        let mut s = learnable_session();
+        let adopted = s.adopt_tuned_recall_weights();
+        assert!(
+            adopted,
+            "the learnable log should yield an improving retune"
+        );
+        // The retune was recorded as an op, so replaying the whole timeline
+        // reproduces the live scoring weights — replay == live still holds.
+        let replayed = s.replay_to(s.len());
+        let live = s.live.scoring_weights();
+        let rep = replayed.scoring_weights();
+        assert_eq!(live.w_base, rep.w_base);
+        assert_eq!(live.w_failure, rep.w_failure);
+        assert_eq!(live.w_recency, rep.w_recency);
+        assert_eq!(live.w_access, rep.w_access);
     }
 
     #[test]

@@ -61,11 +61,21 @@ cognitive MMU, made real: page, don't drop.
   speaks for the active problem region once a failure is signalled — the
   CCOS-native signal. Deterministic; wired through `recall()`, the MCP `recall`
   tool (`strategy:"hybrid"`), and the runtime CLI. (M)
+- ✅ **Slice C — self-improving retrieval from the replayable log.** The CCOS-native
+  gem. A retrieval **reward** is read straight off the hash-chained timeline: for
+  each recorded recall, was the node the agent engaged *next* (a failure / page-fault)
+  in the window that recall would have produced? `AgentSession::tune_recall_weights`
+  then learns the `ScoringWeights` that maximise that hit rate by **deterministic
+  coordinate ascent, evaluated by replay** (same log ⇒ same weights).
+  `adopt_tuned_recall_weights` applies them *and records an `Op::Retune`* so the
+  learned policy is **auditable and reproduced on replay** — `replay == live` still
+  holds. Better retrieval that also reinforces the moat: nobody else has a
+  deterministic, replayable causal log to train on. **Honest scope:** the reward is
+  a proxy (the next failing node = the context recall should have surfaced); the
+  optimiser is greedy (a local optimum) over the four scoring weights; evaluation is
+  one replay per candidate, so it is an offline/maintenance call. (L)
 - **Slice B — opt-in learned embedder** behind a feature flag; INT4 TF-IDF stays
-  the deterministic default (keep the replay invariant). (L)
-- **Slice C — self-improving retrieval from the replayable log**: learn recall
-  weights from which recalls actually *helped* — the auditable history as training
-  data. The CCOS-native gem (better retrieval *and* reinforces the moat). (L)
+  the deterministic default (keep the replay invariant). (L) — *the remaining slice.*
 
 ## ✅ Done — audit pass 1 (correctness)
 
