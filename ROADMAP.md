@@ -340,11 +340,14 @@ honesty code↔docs↔paper, tests/API). **Fixed in this pass:**
 
 ### P0 — Correctness
 
-- ✅ **`syn`-based AST parser** — *done.* Behind the `syn-parser` feature, the
-  parser builds a real Rust AST (nested-module bodies, multi-line signatures,
-  grouped `use`, impl methods), with the zero-dependency line-based heuristic as
-  the fallback (used when the feature is off or a file does not parse as valid
-  Rust). CI lints and tests both paths. See `src/parser.rs::syn_ast`.
+- ✅ **`syn`-based AST parser — now the *default*.** The parser builds a real Rust
+  AST (nested-module bodies, multi-line signatures, grouped `use`, impl methods) by
+  default, with the zero-extra-dependency line heuristic as the fallback (selected by
+  `--no-default-features`, or used automatically when a file does not parse as valid
+  Rust). Measured 36.5% more faithful than the heuristic on real code (import recall
+  66.9% → 100%; see `docs/MEASUREMENT_ast.md`), and `syn`/`proc-macro2` are already in
+  the tree via serde, so it is free. CI lints and tests both paths. See
+  `src/parser.rs::syn_ast`.
 
 ### P1 — Depth
 

@@ -62,7 +62,7 @@ third-party action can be blocked by org policy. Steps run cheapest-first
 | --- | ------- | -------- |
 | **Format** | `cargo fmt --all --check` | yes |
 | **Clippy** | `cargo clippy --all-targets --all-features --locked -- -D warnings` | yes |
-| **Test** | `cargo test` **and** `cargo test --features syn-parser` | yes |
+| **Test** | `cargo test` (default = real AST) **and** `cargo test --no-default-features` (heuristic fallback) | yes |
 | **Docs** | `cargo doc --no-deps` with `RUSTDOCFLAGS=-D warnings` | yes |
 | **CLI smoke** | `analyze → verify → replay → top → blame → export → chaos` | yes |
 

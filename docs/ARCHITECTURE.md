@@ -7,7 +7,7 @@ A practical map of the codebase for contributors. For the conceptual write-up se
 
 | Module                      | Responsibility | Key types |
 | --------------------------- | -------------- | --------- |
-| `parser`                    | Modules / `use` / symbols from Rust source — line-based heuristic, or a real `syn` AST behind the `syn-parser` feature | `ASTParser`, `ParseResult`, `Symbol`, `SymbolKind` |
+| `parser`                    | Modules / `use` / symbols from Rust source — real `syn` AST by default (line-heuristic fallback via `--no-default-features`) | `ASTParser`, `ParseResult`, `Symbol`, `SymbolKind` |
 | `memory`                    | The causal graph: scoring, paging, failure propagation, analytics | `MemoryGraph`, `GraphNode`, `GraphEdge`, `NodeId`, `NodeType`, `EdgeType` |
 | `incremental`               | `O(Δ)` graph maintenance on file edits | `IncrementalGraphEngine`, `DeltaMutation`, `MutationOp`, `FileState` |
 | `event_log`                 | Append-only event log with a canonical tamper-evident hash chain, deterministic replay & graph reconstruction | `EventLog`, `TraceEvent`, `EventType`, `EventPayload`, `LogIntegrity`, `EventReplayer`, `GraphReconstructor` |
@@ -115,7 +115,7 @@ or loaded from a snapshot (`blame`, `export`):
 
 ```bash
 cargo build --all-targets
-cargo test                    # 364 tests (default features; a few more with --features syn-parser/llm)
+cargo test                    # full suite — default build = real `syn` AST; add --no-default-features (heuristic) / --features llm (async)
 cargo clippy --all-targets    # warning-clean (CI denies warnings)
 cargo doc --open              # rendered module docs
 ```

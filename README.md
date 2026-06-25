@@ -385,9 +385,13 @@ hash-chained logs detect any mutation, reorder, insertion or deletion).
 A research prototype, not a production system. Known gaps (tracked in
 [`ROADMAP.md`](ROADMAP.md)):
 
-- The parser defaults to a **line-based heuristic** (zero dependencies); build with
-  `--features syn-parser` for a real `syn` AST. Edges capture containment/dependency,
-  **not** call graphs or data flow — so the causal graph is structural, not semantic.
+- The parser uses a real `syn` **AST** by default (accurate nested modules, grouped
+  `use`, impl methods — 36.5% more faithful than the old line heuristic on real code,
+  see [`docs/MEASUREMENT_ast.md`](docs/MEASUREMENT_ast.md)); `--no-default-features`
+  selects the zero-extra-dependency line heuristic, kept as the fallback for non-Rust /
+  unparseable input. Edges still capture containment/dependency, **not** call graphs or
+  data flow — so the causal graph is structural, not yet semantic (the next lever — see
+  ROADMAP P1.3 "semantic edges").
 - CCOS's broad, proven wins are **coverage** (the right context, frugally) and
   **auditability**. On the *narrow* slice of multi-file bugs it also improves
   **resolution** (a capable local model fixes the root cause where an equal-budget dump
