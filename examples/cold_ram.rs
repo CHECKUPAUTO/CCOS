@@ -120,18 +120,18 @@ fn main() {
     drop(g);
     std::fs::remove_dir_all(&dir).ok();
 
-    // ── slice 5 payoff: deep-spill bounds that resident metadata ──────────────
-    // Archive each cold entry's label + full edges to the same on-disk store,
-    // keeping only the neighbour ids resident (lossless — it all faults back on
-    // page-in). The measured-dominant edge cost shrinks to ids, not dropped.
+    // ── slice 5b payoff: deep-spill to a compact husk bounds the resident floor ──
+    // Each cold entry is archived *whole* to the on-disk store and replaced in RAM by
+    // a compact husk (body-blob stub + neighbour ids), shedding the full ColdNode
+    // struct — the per-entry floor. Lossless: the node faults back on page-in.
     let dir = std::env::temp_dir().join(format!("ccos_coldram_deep_{}", std::process::id()));
     let mut g = build_cold(30000, &dir);
     let before = g.cold_resident_bytes();
     g.set_cold_resident_budget(Some(before / 2)); // ask to halve the resident metadata
     let after = g.cold_resident_bytes();
     println!(
-        "\nslice 5 — deep-spill: resident metadata {} B → {} B (−{}%), {} of {} entries archived \
-         (label+edges → disk, neighbour ids kept, lossless).",
+        "\nslice 5b — deep-spill to a compact husk: resident metadata {} B → {} B (−{}%), \
+         {} of {} entries archived (whole node → disk, husk = body-stub + ids, lossless).",
         before,
         after,
         (before - after) * 100 / before.max(1),
@@ -139,9 +139,9 @@ fn main() {
         g.cold_count(),
     );
     println!(
-        "Honest: the guard skips entries it can't shrink (here the symbols, whose one edge is \
-         archived under their file), and the remainder is the irreducible per-entry floor — \
-         struct + id + content-hash — that deep-spill leaves resident by design."
+        "The compact husk beats a full ColdNode for *every* entry, so the budget is actually \
+         reached — no per-entry struct floor capping it as in slice 5; the rest stay full only \
+         because the budget didn't require spilling them."
     );
     drop(g);
     std::fs::remove_dir_all(&dir).ok();

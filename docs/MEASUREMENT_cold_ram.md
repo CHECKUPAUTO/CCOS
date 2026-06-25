@@ -52,20 +52,21 @@ full-entry spill**, not lossy contraction.
 
 ## Slice 5 result — deep-spill (built; lossless, off by default)
 
-`set_cold_resident_budget(Some(b))` deep-spills the coldest entries: each one's
-`label` + full `edges` move to the same content-addressed store as one blob, and only
-the neighbour **ids** (`ColdNode::adj`) stay resident — enough for `cold_neighbours`
-and region paging to keep working without touching disk. Everything faults back,
-hash-verified, on `page_in`. A guard skips any entry that wouldn't shrink (two 64-byte
-hash stubs costing more than the bytes they replace), so the budget is approached
-best-effort, never by dropping a node.
+`set_cold_resident_budget(Some(b))` deep-spills the coldest entries until resident COLD
+metadata is within `b`. The first cut (slice 5) moved each entry's `label` + edges to
+the store but kept a full `ColdNode` husk — and stalled at **~11 %** on the 120 K-node
+fixture: only the 30 K edge-bearing file nodes had enough to shed, and the remainder was
+the **per-entry `ColdNode` struct floor** (~`size_of::<ColdNode>()` + id + hash stub),
+which a same-shape husk can't touch.
 
-On the 120 K-node fixture above (content already spilled by slice 3), deep-spill cuts
-resident metadata **~11 %**, archiving the 30 K edge-bearing file nodes. The honest
-ceiling: the 90 K symbols have their one edge archived under their file (nothing to
-shrink), and the remainder is the **irreducible per-entry floor** — the `ColdNode`
-struct + id + content-hash stub — which deep-spill leaves resident by design. Cutting
-*that* floor (a compact husk replacing the full struct) is the next lever, beyond this
-slice. The win scales with edge density: hub- and edge-rich tiers shed far more, still
-losslessly, and crucially **without** the bridge-edge blow-up that lossy contraction
-would inflict on those same hubs.
+**Slice 5b — compact husk.** A deep-spilled entry is now archived *whole* (node, content
+folded inline, edges) to one content-addressed blob and represented in RAM by a compact
+husk — body-blob stub + the neighbour **ids** (`adj`, all `cold_neighbours`/region paging
+need) — held in its own `cold_deep` map. Because that husk is far smaller than a full
+`ColdNode`, *every* entry shrinks when spilled, so the budget is actually **reached**:
+on the same fixture, resident metadata halves (**−50 %**, 60 MB → 30 MB at the `b = half`
+budget, ~108 K of 120 K entries archived) instead of hitting the slice-5 wall. The whole
+node faults back, hash-verified, on `page_in`; deep husks are **terminal** (not re-scored
+for further spill/compaction). Still lossless, still off by default (the `cold_deep` map
+is `serde`-elided when empty → byte-identical default snapshot/replay), and still
+**without** the bridge-edge blow-up that lossy contraction would inflict on hubs.
