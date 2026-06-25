@@ -821,6 +821,29 @@ impl MemoryGraph {
             .sum()
     }
 
+    /// Estimated **resident** bytes the COLD tier still holds in RAM — the part
+    /// that does *not* go to disk even when content is spilled: the `BTreeMap` key,
+    /// the node's id/label (and any inline content), the archived edges, and the
+    /// spill-hash stub. This is the O(N) footprint slice 5 would have to bound; a
+    /// logical estimate (string lengths + struct sizes, ignoring allocator slack),
+    /// honest for "how much RAM is stuck per cold entry".
+    pub fn cold_resident_bytes(&self) -> usize {
+        self.cold
+            .iter()
+            .map(|(k, c)| {
+                let mut b = std::mem::size_of::<ColdNode>() + std::mem::size_of::<NodeId>();
+                b += k.0.len() + c.node.id.0.len() + c.node.label.len() + c.node.content.len();
+                for e in &c.edges {
+                    b += std::mem::size_of::<GraphEdge>() + e.source.0.len() + e.target.0.len();
+                }
+                if let Some(s) = &c.spill {
+                    b += s.hash.len();
+                }
+                b
+            })
+            .sum()
+    }
+
     /// Flush the coldest resident COLD content to the spill store until resident
     /// COLD content is within `inline_budget`. Deterministic: candidates are
     /// ordered coldest-first by causal score, ties broken on node id. A no-op
@@ -2222,6 +2245,41 @@ mod tests {
     }
 
     // ── audit pass 4: spill-blob GC (F1) and compaction floor (F5) ────────────
+
+    #[test]
+    fn cold_resident_bytes_counts_metadata_and_edges() {
+        let build = |with_edge: bool| {
+            let mut g = MemoryGraph::new(0.2, usize::MAX);
+            g.upsert_node(
+                "file:a".into(),
+                "file:a".into(),
+                "A".repeat(200),
+                NodeType::Module,
+            );
+            g.upsert_node(
+                "sym:a:f".into(),
+                "sym:a:f".into(),
+                "b".repeat(200),
+                NodeType::Symbol,
+            );
+            if with_edge {
+                g.add_edge("file:a".into(), "sym:a:f".into(), 0.6, EdgeType::Contains);
+            }
+            g.max_in_memory_nodes = 0;
+            g.enforce_paging();
+            g
+        };
+        let g = build(true);
+        assert!(
+            g.cold_resident_bytes() >= "file:a".len() + "sym:a:f".len(),
+            "counts at least the node ids"
+        );
+        // The archived edge contributes resident bytes (it stays in RAM).
+        assert!(
+            build(true).cold_resident_bytes() > build(false).cold_resident_bytes(),
+            "an archived edge adds to the resident COLD footprint"
+        );
+    }
 
     #[test]
     fn removing_a_spilled_node_reclaims_its_blob() {
