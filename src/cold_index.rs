@@ -267,6 +267,9 @@ impl Lru {
     fn remove(&mut self, key: &str) {
         self.map.remove(key);
     }
+    fn resident_bytes(&self) -> usize {
+        self.map.iter().map(|(k, (v, _))| k.len() + v.len()).sum()
+    }
 }
 
 /// A stored value is tagged so a delete can shadow an older value across segments:
@@ -466,6 +469,44 @@ impl HuskStore {
     pub fn segment_count(&self) -> usize {
         self.segments.len()
     }
+
+    /// Every live `(key, value)` pair in key order — the memtable and all segments
+    /// merged newest-first, with tombstones and shadowed duplicates dropped. A full
+    /// scan (`O(total records)`); for callers that must enumerate the whole store
+    /// (e.g. a cold-neighbour sweep) until a keyed index makes that unnecessary.
+    pub fn live_entries(&self) -> io::Result<Vec<(String, Vec<u8>)>> {
+        let mut merged: std::collections::BTreeMap<String, Option<Vec<u8>>> = Default::default();
+        for seg in &self.segments {
+            // oldest → newest, so a newer write (or tombstone) overwrites an older.
+            for (k, raw) in seg.records()? {
+                if let Some(inner) = decode_value(&raw) {
+                    merged.insert(k, inner);
+                }
+            }
+        }
+        for (k, slot) in &self.buffer {
+            merged.insert(k.clone(), slot.clone()); // the memtable is newest
+        }
+        Ok(merged
+            .into_iter()
+            .filter_map(|(k, v)| v.map(|val| (k, val)))
+            .collect())
+    }
+
+    /// Rough resident-byte estimate: the memtable values + the sparse indices + the
+    /// read cache. Bounded by `buffer_limit`, `cache_cap`, and `O(total / STRIDE)` —
+    /// the whole point of the tier. Used by the COLD budget loop, where a heuristic
+    /// is fine.
+    pub fn resident_bytes(&self) -> usize {
+        let buffer: usize = self
+            .buffer
+            .iter()
+            .map(|(k, v)| k.len() + v.as_ref().map_or(0, Vec::len))
+            .sum();
+        // ~key + 8-byte offset per sparse entry (keys are short ids).
+        let sparse: usize = self.segments.iter().map(|s| s.sparse_len() * 48).sum();
+        buffer + sparse + self.cache.borrow().resident_bytes()
+    }
 }
 
 #[cfg(test)]
@@ -581,6 +622,11 @@ mod tests {
                 let got = store.get(k).unwrap();
                 prop_assert_eq!(got.as_ref(), Some(v), "live get {}", k);
             }
+            // live_entries() enumerates exactly the live model, in key order.
+            let live = store.live_entries().unwrap();
+            let model_vec: Vec<(String, Vec<u8>)> =
+                model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            prop_assert_eq!(&live, &model_vec, "live_entries mismatch");
             // Survives compaction + re-open (segments reloaded from disk).
             store.compact().unwrap();
             let reopened = HuskStore::open(&dir, 8, 4).unwrap();
@@ -588,6 +634,8 @@ mod tests {
                 let got = reopened.get(k).unwrap();
                 prop_assert_eq!(got.as_ref(), Some(v), "post-compact-reopen get {}", k);
             }
+            let live2 = reopened.live_entries().unwrap();
+            prop_assert_eq!(&live2, &model_vec, "live_entries mismatch after compact+reopen");
             std::fs::remove_dir_all(&dir).ok();
         }
     }
