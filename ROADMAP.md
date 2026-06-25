@@ -69,8 +69,19 @@ cognitive MMU, made real: page, don't drop.
   (~108K/120K entries archived). Deep husks are terminal (excluded from further
   spill/compaction); still lossless, deterministic, and off by default
   (`cold_deep` serde-elided when empty ⇒ byte-identical default path). This bounds
-  the per-entry resident *size*; bounding the entry *count* (an on-disk husk index)
-  remains the next lever. (M)
+  the per-entry resident *size*; bounding the entry *count* is slice 5c below. (M)
+- ✅ **Slice 5c — bound the entry *count* → an `O(1)`-resident COLD tier ("Lever 2").**
+  The deep tier no longer keeps a `BTreeMap` node per husk in RAM. Husks live in a
+  hand-rolled, dependency-free LSM-lite (`src/cold_index.rs`: sorted segments + sparse
+  index, memtable + flush, tombstones + compaction, bounded LRU cache, each model-check
+  property-tested before wiring). The resident `cold_deep` map is gone; `cold_neighbours`
+  is `O(degree)` via a keyed on-disk **reverse-adjacency** index, and `flush_cold_tier`
+  durabilises at checkpoint (crash-recovery tested). Measured (`examples/cold_count.rs`):
+  **≈2 B/husk resident** (vs 146 B), 1 GiB at **~537 M husks**. `replay == live` is
+  untouched (the log is the source of truth; the cold tier is a rebuildable cache). A
+  cross-cutting *NodeId interning* would shave resident id strings further but is a poor
+  trade on the already-bounded engine (public-API + hot-path ripple) — designed,
+  deferred. See `docs/DESIGN_cold_entry_count.md`. (L)
 
 ## 🎯 Direction — better retrieval
 - ✅ **Slice A — hybrid entry fusion.** A new `Recall::Hybrid` resolves a
@@ -113,9 +124,20 @@ cognitive MMU, made real: page, don't drop.
   hybrid's overall hit-rate 58%→38%). It works in the micro-test but its dense-ranking
   strength doesn't transfer to picking a single entry node; so it **stays opt-in and
   off**, awaiting a future experiment that wires it into a *ranking* stage. The
-  capability is built and honest; the recommendation is "not yet." **The
-  better-retrieval arc is complete (A·B·C); hybrid (A) is validated by measurement,
-  LSA (B) is not.** (L)
+  capability is built and honest; the recommendation is "not yet." (L)
+- ✅ **Slice D — LSA wired where it earns its keep: re-ranking, not entry selection.**
+  The follow-up B's measurement asked for. `set_lsa_rerank(Some(rank))` (opt-in) re-orders
+  the recalled *region* by rank-`rank` LSA similarity — the recall@k≥5 regime, not
+  recall@1. Measured (`examples/lsa_rerank.rs`): target mean rank 11.8 → 2.1. Honest
+  limiter, also measured: synonym *entry* selection (TF-IDF scores a synonym ≈0) gates it,
+  so re-ranking re-orders what entry selection found and never repairs an empty region.
+  Deterministic; `replay == live` untouched (recall is read-only). (M)
+- ✅ **Slice E — natural-language queries match code identifiers (subword tokenization).**
+  The TF-IDF tokenizer splits `snake_case`/`camelCase`, so a query like "connection pool
+  acquire" — which shared *zero* tokens with `connection_pool_acquire` before — now
+  matches. Measured (`examples/identifier_recall.rs`): 6/6 NL queries recall their target
+  at rank ≤2; on the LSA corpus the topic target's mean rank improves 11.8 → 2.0 (the
+  semantic signal, not just a re-ranker, now does the work). Deterministic. (S)
 
 ## ✅ Done — audit pass 4 (hardening the new arcs)
 
