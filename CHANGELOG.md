@@ -8,6 +8,59 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **COLD entry-count bound — an on-disk husk index (slice 5c, "Lever 2"; the
+  `O(1)`-resident COLD tier).** Slices 3–5b bounded each COLD entry's *size*; this
+  bounds their *count*. The deep-spill tier no longer keeps one `BTreeMap` node per
+  husk in RAM — husks live in a hand-rolled, dependency-free LSM-lite
+  (`src/cold_index.rs`): immutable sorted segments with a sparse resident index, a
+  memtable + flush, tombstone deletes + compaction, and a bounded LRU read cache, each
+  verified standalone by a model-check property test before wiring. `MemoryGraph`'s
+  resident `cold_deep` map is gone; `cold_neighbours` is answered `O(degree)` by a
+  keyed on-disk **reverse-adjacency** index (`<dir>.radj`), and `flush_cold_tier`
+  durabilises the indices at checkpoint. Measured (`examples/cold_count.rs`): **≈2 B
+  per husk resident** (vs 146 B fully resident), 1 GiB at **~537 M husks**. Lossless
+  round-trip, no-leak GC and crash recovery are property-/model-checked;
+  dependency-free (`std` only); `replay == live` is untouched (the event log is the
+  source of truth, the cold tier a rebuildable cache). See
+  `docs/DESIGN_cold_entry_count.md`.
+- **Natural-language queries match code identifiers (subword tokenization).** The
+  TF-IDF tokenizer now splits each token on `snake_case` and `camelCase` boundaries,
+  so `connection_pool_acquire` yields `connection`, `pool`, … — a query like
+  "connection pool acquire" shared *zero* tokens with it before, making the semantic
+  signal zero. Measured (`examples/identifier_recall.rs`): 6/6 NL queries recall their
+  identifier-named target at rank ≤2 (overlap 0 → 3/3); on the `lsa_rerank` corpus the
+  topic target's mean rank improves 11.8 → 2.0. Deterministic.
+- **LSA re-ranking stage for recall (`set_lsa_rerank`, opt-in).** Wires the LSA
+  embedder where #39 measured it earns its keep — *re-ranking* the recalled region
+  (recall@k≥5), not entry selection (recall@1=0). A node's score is multiplied by
+  `1 + w·max(0, cosine)` (only ever promotes). Measured (`examples/lsa_rerank.rs`):
+  target mean rank 11.8 → 2.1; the honest limiter is entry selection (synonyms score
+  ≈0), which re-ranking can't repair. Deterministic, `replay == live` untouched.
+
+### Changed
+
+- **Spill stubs hold a raw `[u8; 32]` hash, not a 64-char hex `String`** — −56 B and
+  one fewer heap allocation per COLD spill/husk stub (serialized form unchanged via
+  serde-hex). **Snapshots are byte-canonical** — the resident `nodes` `HashMap` now
+  serializes in sorted key order, so identical state ⇒ byte-identical snapshot, not
+  merely identical *sorted* hash. Both verified by property tests.
+
+### Fixed
+
+- **A COLD spill blob leaked on page-in.** When `page_in` faulted a blob back and
+  dropped its last reference (content folded inline, or a husk removed), the on-disk
+  blob became unreferenced but was never reclaimed — a slow disk leak no later
+  `remove` could find. Caught by a new cross-tier hardening property test (lossless
+  round-trip + no orphaned blobs under random op streams); `page_in` now reclaims the
+  dropped blob in both paths. The headline `replay == live` invariant is now also
+  **fuzzed** (byte-identical full-graph hash over random op streams), as is snapshot
+  round-trip and the on-disk index's model.
+- **An on-disk lossless codec for the spill store (LZSS, dependency-free).** Spill
+  blobs are LZSS-compressed on write and verified on read (the key is the original
+  content's SHA-256, so dedup is unchanged and any codec bug is a recoverable
+  cold-miss); a `proptest` round-trip pins `decompress(compress(x)) == x`. Closes the
+  "no codec yet" gap.
+
 - **Structural-centrality scoring term** (from a design discussion — the one idea in
   that conversation CCOS's score didn't already have). `compute_node_score` gains a
   `w_centrality · ln(1 + in_degree)` term: a hub (a shared module / interface many
