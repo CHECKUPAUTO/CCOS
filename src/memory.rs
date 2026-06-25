@@ -229,17 +229,6 @@ pub struct MemoryGraph {
     /// pre-existing snapshots loadable.
     #[serde(default)]
     cold: BTreeMap<NodeId, ColdNode>,
-    /// The **deep-spilled** COLD entries (slice 5b) — the coldest tail, archived
-    /// whole to disk and represented in RAM only by a compact `DeepHusk` (body-blob
-    /// stub + neighbour ids) instead of a full `ColdNode`. Kept in its own map so
-    /// the common COLD paths (compaction/spill enforcement) never pay for them and
-    /// the husk type stays small. `serde(default)` + elided-when-empty keeps the
-    /// default path byte-identical; populated only once a resident budget is set
-    /// (a runtime knob), so replay/snapshot of the deterministic default is
-    /// untouched. The directory travels alongside and re-attaches on restore, like
-    /// the content-spill stubs.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    cold_deep: BTreeMap<NodeId, DeepHusk>,
     /// Optional on-disk **spill store** for COLD content — the "swap file". A
     /// runtime handle only (`#[serde(skip)]`): a snapshot records the spilled
     /// *stubs* (see [`ColdNode::spill`]), and the directory travels alongside,
@@ -249,14 +238,13 @@ pub struct MemoryGraph {
     /// invariant (replay == live, snapshot hash) is untouched on the default path.
     #[serde(skip)]
     spill: Option<SpillConfig>,
-    /// Lever 2 (slice 5c): an on-disk index mirroring the deep-spill husks, so the
-    /// COLD tier can eventually bound its resident *entry count* (not just per-entry
-    /// size) by living in segments + a bounded cache rather than one `BTreeMap` node
-    /// per husk. Runtime handle only (`#[serde(skip)]`), opened in a `husks/` subdir
-    /// of the spill directory and re-attached on restore like the spill store itself.
-    /// In this brick it is a **write-through mirror**: `cold_deep` stays authoritative
-    /// and behaviour is unchanged; a later brick flips reads to it and drops the
-    /// resident map.
+    /// Lever 2 (slice 5c): the **authoritative** on-disk index of deep-spilled husks.
+    /// The COLD tier's *entry count* is no longer `O(N)` resident — husks live in
+    /// segments + a bounded cache, not one `BTreeMap` node each. Runtime handle only
+    /// (`#[serde(skip)]`), opened in a sibling `<dir>.husks` directory and re-attached
+    /// on restore like the spill store; deep-spilled state thus travels in that
+    /// directory, not the JSON snapshot. `None` (the default, no spill attached) ⇒ no
+    /// deep tier, byte-identical to a graph that never knew about it.
     #[serde(skip)]
     husk_store: Option<HuskStore>,
     /// Optional **compaction budget** for the COLD tier (slice 4). When `Some(b)`,
@@ -509,7 +497,6 @@ impl MemoryGraph {
             scoring_weights: ScoringWeights::default(),
             eviction_policy: EvictionPolicy::new(),
             cold: BTreeMap::new(),
-            cold_deep: BTreeMap::new(),
             spill: None,
             husk_store: None,
             cold_content_budget: None,
@@ -821,11 +808,8 @@ impl MemoryGraph {
         // whole serialized node back (hash-verified) into the full COLD map first,
         // then the normal page-in path below runs unchanged. A missing / tampered /
         // undeserializable body is a cold-miss — never a silent half-restore.
-        if self.cold_deep.contains_key(id) {
-            let body_hash = match self.cold_deep.get(id) {
-                Some(h) => h.body.hash,
-                None => return false,
-            };
+        if let Some(husk) = self.deep_get(id) {
+            let body_hash = husk.body.hash;
             match self
                 .spill
                 .as_ref()
@@ -833,9 +817,8 @@ impl MemoryGraph {
                 .and_then(|s| serde_json::from_str::<ColdNode>(&s).ok())
             {
                 Some(node) => {
-                    self.cold_deep.remove(id);
                     if let Some(hs) = self.husk_store.as_mut() {
-                        let _ = hs.delete(&id.0); // keep the mirror consistent
+                        let _ = hs.delete(&id.0); // the husk leaves the on-disk tier
                     }
                     self.cold.insert(id.clone(), node);
                     // The husk's body blob is now unreferenced — the node is back with
@@ -918,19 +901,37 @@ impl MemoryGraph {
     /// Number of nodes in the COLD tier (demoted but retrievable via [`page_in`](Self::page_in)) —
     /// full entries plus deep-spilled husks.
     pub fn cold_count(&self) -> usize {
-        self.cold.len() + self.cold_deep.len()
+        self.cold.len() + self.deep_count()
     }
 
     /// Whether `id` is currently demoted to the COLD tier (full entry or deep husk).
     pub fn is_cold(&self, id: &NodeId) -> bool {
-        self.cold.contains_key(id) || self.cold_deep.contains_key(id)
+        self.cold.contains_key(id) || self.deep_contains(id)
+    }
+
+    /// Live deep-spilled ids (keys only, no husk deserialization).
+    fn deep_live_keys(&self) -> Vec<NodeId> {
+        self.husk_store.as_ref().map_or(Vec::new(), |hs| {
+            hs.live_entries()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(k, _)| NodeId(k))
+                .collect()
+        })
     }
 
     /// The ids currently in the COLD tier, in sorted (deterministic) order — both
-    /// full entries and deep-spilled husks.
-    pub fn cold_ids(&self) -> impl Iterator<Item = &NodeId> + '_ {
-        let mut ids: Vec<&NodeId> = self.cold.keys().chain(self.cold_deep.keys()).collect();
+    /// full entries and deep-spilled husks (the latter from the on-disk index).
+    /// Yields owned ids (the deep ones are reconstructed from the index, not borrowed).
+    pub fn cold_ids(&self) -> impl Iterator<Item = NodeId> + '_ {
+        let mut ids: Vec<NodeId> = self
+            .cold
+            .keys()
+            .cloned()
+            .chain(self.deep_live_keys())
+            .collect();
         ids.sort();
+        ids.dedup();
         ids.into_iter()
     }
 
@@ -946,6 +947,10 @@ impl MemoryGraph {
     /// resident edge would be — region paging never has to touch disk to find the
     /// cold neighbourhood.
     pub fn cold_neighbours(&self, id: &NodeId) -> Vec<NodeId> {
+        // Snapshot the deep-spilled ids once (resident set) so the membership test
+        // below is O(1), not a disk lookup per edge. Lever 2 brick 6: the husks
+        // themselves come from the on-disk index via a full scan.
+        let deep_keys: BTreeSet<NodeId> = self.deep_live_keys().into_iter().collect();
         let mut out: BTreeSet<NodeId> = BTreeSet::new();
         let consider = |a: &NodeId, b: &NodeId, out: &mut BTreeSet<NodeId>| {
             let other = if a == id {
@@ -955,8 +960,7 @@ impl MemoryGraph {
             } else {
                 return;
             };
-            if other != id && (self.cold.contains_key(other) || self.cold_deep.contains_key(other))
-            {
+            if other != id && (self.cold.contains_key(other) || deep_keys.contains(other)) {
                 out.insert(other.clone());
             }
         };
@@ -967,11 +971,10 @@ impl MemoryGraph {
             }
         }
         // Deep husks keep only neighbour ids — each `o` stands for the undirected
-        // edge `husk-id ── o`, read exactly as a resident edge would be, so region
-        // paging never has to fault a body blob to find the cold neighbourhood.
-        for (hid, h) in &self.cold_deep {
+        // edge `husk-id ── o`, read exactly as a resident edge would be.
+        for (hid, h) in self.deep_entries() {
             for o in unpack_adj(&h.adj) {
-                consider(hid, &NodeId(o.to_owned()), &mut out);
+                consider(&hid, &NodeId(o.to_owned()), &mut out);
             }
         }
         out.into_iter().collect()
@@ -1065,11 +1068,13 @@ impl MemoryGraph {
             .iter()
             .map(|(k, c)| Self::entry_resident_bytes(k, c))
             .sum();
-        let deep: usize = self
-            .cold_deep
-            .iter()
-            .map(|(k, h)| Self::husk_resident_bytes(k, h))
-            .sum();
+        // Deep-spilled husks live in the on-disk index now; their resident cost is the
+        // store's bounded footprint (memtable + sparse indices + cache), not one entry
+        // per husk — the whole point of Lever 2.
+        let deep = self
+            .husk_store
+            .as_ref()
+            .map_or(0, HuskStore::resident_bytes);
         full + deep
     }
 
@@ -1086,15 +1091,6 @@ impl MemoryGraph {
             b += std::mem::size_of::<GraphEdge>() + e.source.0.len() + e.target.0.len();
         }
         b
-    }
-
-    /// Resident-byte estimate for a compact `DeepHusk`: the `BTreeMap` key, the
-    /// husk struct (body-blob hash inline) and the resident neighbour ids. No
-    /// `ColdNode`, label, content or edge records — those live in the body blob.
-    fn husk_resident_bytes(key: &NodeId, h: &DeepHusk) -> usize {
-        // The neighbour ids live in one packed buffer (`adj`), so they cost just its
-        // length — one allocation, not a `Vec` + a `String` per id (slice 5c Lever 1).
-        std::mem::size_of::<DeepHusk>() + std::mem::size_of::<NodeId>() + key.0.len() + h.adj.len()
     }
 
     /// Flush the coldest resident COLD content to the spill store until resident
@@ -1161,16 +1157,56 @@ impl MemoryGraph {
         self.enforce_cold_resident_budget();
     }
 
+    /// Read a deep-spilled husk from the on-disk [`HuskStore`] (Lever 2). `None` if no
+    /// store is attached, the key is absent, or the bytes don't deserialize.
+    fn deep_get(&self, id: &NodeId) -> Option<DeepHusk> {
+        let bytes = self.husk_store.as_ref()?.get(&id.0).ok().flatten()?;
+        serde_json::from_slice::<DeepHusk>(&bytes).ok()
+    }
+
+    /// Whether `id` has a deep-spilled husk in the on-disk store.
+    fn deep_contains(&self, id: &NodeId) -> bool {
+        self.husk_store
+            .as_ref()
+            .and_then(|hs| hs.get(&id.0).ok().flatten())
+            .is_some()
+    }
+
+    /// Every live deep-spilled `(id, husk)` — a full store scan. Lever 2 brick 6:
+    /// until a keyed adjacency index lands, cold-neighbour and GC sweeps enumerate
+    /// the whole deep tier this way.
+    fn deep_entries(&self) -> Vec<(NodeId, DeepHusk)> {
+        let Some(hs) = self.husk_store.as_ref() else {
+            return Vec::new();
+        };
+        hs.live_entries()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(k, b)| {
+                serde_json::from_slice::<DeepHusk>(&b)
+                    .ok()
+                    .map(|h| (NodeId(k), h))
+            })
+            .collect()
+    }
+
+    /// Number of live deep-spilled husks.
+    fn deep_count(&self) -> usize {
+        self.husk_store
+            .as_ref()
+            .map_or(0, |hs| hs.live_entries().map_or(0, |v| v.len()))
+    }
+
     /// Number of COLD entries deep-spilled to disk (archived whole, represented in
-    /// RAM only by a compact `DeepHusk`).
+    /// RAM only by a compact `DeepHusk` in the on-disk index).
     pub fn cold_deep_spilled_count(&self) -> usize {
-        self.cold_deep.len()
+        self.deep_count()
     }
 
     /// Whether `id` is a deep-spilled COLD entry (its whole node on disk, only a
-    /// compact husk — body-blob stub + neighbour ids — resident).
+    /// compact husk — body-blob stub + neighbour ids — in the index).
     pub fn is_deep_spilled(&self, id: &NodeId) -> bool {
-        self.cold_deep.contains_key(id)
+        self.deep_contains(id)
     }
 
     /// Deep-spill the coldest COLD entries until resident COLD metadata
@@ -1271,8 +1307,9 @@ impl MemoryGraph {
             let Some(body_hash) = cfg.store.put(&serialized).ok() else {
                 continue;
             };
-            // Commit: swap the full entry for a compact husk in `cold_deep`.
-            self.cold.remove(&id);
+            // Commit: archive the whole entry as a husk in the on-disk index, then
+            // drop the resident full entry. The index is authoritative now (Lever 2),
+            // so if the store write fails we leave the entry full rather than lose it.
             let husk = DeepHusk {
                 body: SpillRef {
                     hash: body_hash,
@@ -1280,23 +1317,23 @@ impl MemoryGraph {
                 },
                 adj: pack_adj(&adj),
             };
-            // Lever 2 write-through: mirror the husk into the on-disk index.
-            // Best-effort — `cold_deep` stays authoritative this brick, so a mirror
-            // miss can never break the resident tier.
-            if let Some(hs) = self.husk_store.as_mut() {
-                if let Ok(bytes) = serde_json::to_vec(&husk) {
-                    let _ = hs.put(&id.0, bytes);
-                }
+            let Ok(bytes) = serde_json::to_vec(&husk) else {
+                continue;
+            };
+            let stored = self
+                .husk_store
+                .as_mut()
+                .is_some_and(|hs| hs.put(&id.0, bytes).is_ok());
+            if !stored {
+                continue;
             }
-            self.cold_deep.insert(id.clone(), husk);
+            self.cold.remove(&id);
             if let Some(hash) = old_content_hash {
                 self.release_blob_if_orphan(&hash);
             }
-            let after = self
-                .cold_deep
-                .get(&id)
-                .map_or(0, |h| Self::husk_resident_bytes(&id, h));
-            resident = resident.saturating_sub(before.saturating_sub(after));
+            // The full entry's resident cost is freed; the husk's is the store's
+            // bounded footprint (counted in `cold_resident_bytes`), not per-entry.
+            resident = resident.saturating_sub(before);
         }
     }
 
@@ -1364,7 +1401,12 @@ impl MemoryGraph {
             .cold
             .values()
             .any(|c| c.spill.as_ref().is_some_and(|s| s.hash == *hash));
-        let referenced_by_husk = self.cold_deep.values().any(|h| h.body.hash == *hash);
+        // Lever 2 brick 6: husks are on disk, so this scans the index (full deep
+        // sweep) — correct but O(N) per release until a body-hash index lands.
+        let referenced_by_husk = self
+            .deep_entries()
+            .iter()
+            .any(|(_, h)| h.body.hash == *hash);
         if !referenced_by_full && !referenced_by_husk {
             cfg.store.remove(hash);
         }
@@ -1379,9 +1421,9 @@ impl MemoryGraph {
                 self.release_blob_if_orphan(&s.hash);
             }
         }
-        if let Some(husk) = self.cold_deep.remove(id) {
+        if let Some(husk) = self.deep_get(id) {
             if let Some(hs) = self.husk_store.as_mut() {
-                let _ = hs.delete(&id.0); // keep the mirror consistent
+                let _ = hs.delete(&id.0); // drop the husk from the on-disk index
             }
             self.release_blob_if_orphan(&husk.body.hash);
         }
@@ -2425,11 +2467,7 @@ mod tests {
                 );
             }
             g.attach_cold_spill(dir, 50).unwrap();
-            let mut out: Vec<NodeId> = g
-                .cold_ids()
-                .filter(|id| g.is_spilled(id))
-                .cloned()
-                .collect();
+            let mut out: Vec<NodeId> = g.cold_ids().filter(|id| g.is_spilled(id)).collect();
             out.sort();
             out
         }
@@ -2487,11 +2525,7 @@ mod tests {
         }
         let dir = spill_temp_dir("tamper");
         g.attach_cold_spill(&dir, 0).unwrap(); // budget 0 ⇒ spill all cold content
-        let spilled: Vec<NodeId> = g
-            .cold_ids()
-            .filter(|id| g.is_spilled(id))
-            .cloned()
-            .collect();
+        let spilled: Vec<NodeId> = g.cold_ids().filter(|id| g.is_spilled(id)).collect();
         assert!(spilled.len() >= 2, "expected several spilled nodes");
 
         // Tamper: rewrite every blob so its bytes no longer hash to its name.
@@ -2572,7 +2606,7 @@ mod tests {
 
         // Lossy contract on compacted entries; lossless on the spared one.
         let originals = [("a", &a), ("b", &b), ("c", &c)];
-        let cold_ids: Vec<NodeId> = g.cold_ids().cloned().collect();
+        let cold_ids: Vec<NodeId> = g.cold_ids().collect();
         for cid in cold_ids {
             let orig = originals.iter().find(|(id, _)| *id == cid.0).unwrap().1;
             let was_compacted = g.is_compacted(&cid);
@@ -2648,11 +2682,7 @@ mod tests {
                 );
             }
             g.set_cold_content_budget(Some(900));
-            let mut out: Vec<NodeId> = g
-                .cold_ids()
-                .filter(|id| g.is_compacted(id))
-                .cloned()
-                .collect();
+            let mut out: Vec<NodeId> = g.cold_ids().filter(|id| g.is_compacted(id)).collect();
             out.sort();
             out
         }
@@ -2719,11 +2749,7 @@ mod tests {
         }
         let dir = spill_temp_dir("gc_remove");
         g.attach_cold_spill(&dir, 0).unwrap(); // budget 0 ⇒ spill all cold content
-        let spilled: Vec<NodeId> = g
-            .cold_ids()
-            .filter(|id| g.is_spilled(id))
-            .cloned()
-            .collect();
+        let spilled: Vec<NodeId> = g.cold_ids().filter(|id| g.is_spilled(id)).collect();
         assert!(spilled.len() >= 2, "expected several spilled nodes");
         let before = std::fs::read_dir(&dir).unwrap().count();
         let victim = spilled[0].clone();
@@ -2985,32 +3011,33 @@ mod tests {
     }
 
     #[test]
-    fn husk_store_mirrors_cold_deep() {
-        // Lever 2 brick 5: deep-spilling writes each husk through to the on-disk
-        // index, byte-identical, and page-in removes it from the mirror too.
-        let dir = spill_temp_dir("husk_mirror");
+    fn deep_tier_lives_in_the_husk_store() {
+        // Lever 2 brick 6: the deep tier IS the on-disk index — every deep-spilled
+        // entry is reachable via `deep_get`, counted by `deep_count`, and page-in
+        // removes it from the store.
+        let dir = spill_temp_dir("husk_auth");
         let mut g = cold_region(&dir);
+        let total = g.cold_count();
         g.set_cold_resident_budget(Some(0)); // deep-spill every cold entry
 
-        assert!(!g.cold_deep.is_empty(), "expected deep-spilled husks");
-        {
-            let hs = g.husk_store.as_ref().expect("husk store attached");
-            for (id, husk) in &g.cold_deep {
-                let got = hs.get(&id.0).unwrap();
-                let want = serde_json::to_vec(husk).unwrap();
-                assert_eq!(got, Some(want), "mirror byte-match for {}", id.0);
-            }
+        assert_eq!(
+            g.cold_deep_spilled_count(),
+            total,
+            "all entries deep-spilled"
+        );
+        for id in g.cold_ids().collect::<Vec<_>>() {
+            assert!(g.is_deep_spilled(&id), "{} is in the deep tier", id.0);
+            assert!(g.deep_get(&id).is_some(), "husk readable for {}", id.0);
         }
 
-        // Page one back in: it leaves both `cold_deep` and the mirror.
-        let some_id = g.cold_deep.keys().next().unwrap().clone();
+        // Page one back in: it leaves the on-disk tier entirely.
+        let some_id = g.cold_ids().next().unwrap();
         g.max_in_memory_nodes = 100;
         assert!(g.page_in(&some_id), "paged back in");
-        assert!(!g.cold_deep.contains_key(&some_id), "left cold_deep");
-        assert_eq!(
-            g.husk_store.as_ref().unwrap().get(&some_id.0).unwrap(),
-            None,
-            "mirror deleted on page_in",
+        assert!(!g.is_deep_spilled(&some_id), "left the deep tier");
+        assert!(
+            g.deep_get(&some_id).is_none(),
+            "husk removed from the store"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3054,7 +3081,7 @@ mod tests {
                 !g.cold.contains_key(&NodeId("b".into())),
                 "no full ColdNode kept for a deep entry"
             );
-            let h = g.cold_deep.get(&NodeId("b".into())).unwrap();
+            let h = g.deep_get(&NodeId("b".into())).unwrap();
             assert_eq!(
                 unpack_adj(&h.adj).collect::<Vec<_>>(),
                 vec!["a"],
@@ -3128,11 +3155,7 @@ mod tests {
         fn deep_set(dir: &std::path::Path) -> Vec<NodeId> {
             let mut g = cold_region(dir);
             g.set_cold_resident_budget(Some(g.cold_resident_bytes() / 3));
-            let mut out: Vec<NodeId> = g
-                .cold_ids()
-                .filter(|id| g.is_deep_spilled(id))
-                .cloned()
-                .collect();
+            let mut out: Vec<NodeId> = g.cold_ids().filter(|id| g.is_deep_spilled(id)).collect();
             out.sort();
             out
         }
@@ -3215,7 +3238,6 @@ mod tests {
         let victim = g
             .cold_ids()
             .find(|id| g.is_deep_spilled(id))
-            .cloned()
             .expect("at least one entry deep-spilled");
         let files_before = std::fs::read_dir(&dir).unwrap().count();
         // Removing a deep-spilled node reclaims its body (and content) blobs when no
@@ -3235,7 +3257,7 @@ mod tests {
         let mut g = cold_region(&dir);
         g.set_cold_resident_budget(Some(0));
         let bid = NodeId("b".into());
-        let body_hash = g.cold_deep.get(&bid).unwrap().body.hash;
+        let body_hash = g.deep_get(&bid).unwrap().body.hash;
         // Delete the on-disk body blob (its filename is the hex of the hash): page_in
         // must refuse — no silent half-restore.
         std::fs::remove_file(dir.join(hex32(&body_hash))).unwrap();
