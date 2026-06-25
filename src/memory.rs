@@ -305,23 +305,27 @@ impl ColdSpill {
     }
 
     /// Write `content` addressed by its SHA-256, returning the raw 32-byte key. The
-    /// on-disk filename is its [`hex32`]. Idempotent — content-addressed, so
-    /// re-spilling the same blob is a no-op write.
+    /// on-disk filename is its [`hex32`] and the file holds the **LZSS-compressed**
+    /// bytes (lossless; the key/integrity hash is of the *original* content, so
+    /// dedup is unchanged). Idempotent — content-addressed *and* the codec is
+    /// deterministic, so re-spilling the same blob is a no-op write.
     fn put(&self, content: &str) -> std::io::Result<[u8; 32]> {
         let hash = sha256_bytes(content);
         let path = self.dir.join(hex32(&hash));
         if !path.exists() {
-            std::fs::write(&path, content.as_bytes())?;
+            std::fs::write(&path, crate::lzss::compress(content.as_bytes()))?;
         }
         Ok(hash)
     }
 
-    /// Read a blob by hash, **verifying** integrity. `None` if the file is
-    /// missing, not valid UTF-8, or its content no longer hashes to `hash`
-    /// (tampered/corrupt) — all surfaced as a cold-miss by the caller.
+    /// Read a blob by hash: decompress, then **verify** integrity. `None` if the
+    /// file is missing, the codec stream is malformed, the bytes aren't UTF-8, or
+    /// the decompressed content no longer hashes to `hash` (tampered/corrupt /
+    /// codec bug) — all surfaced as a cold-miss by the caller, never a silent wrong
+    /// restore.
     fn get(&self, hash: &[u8; 32]) -> Option<String> {
-        let bytes = std::fs::read(self.dir.join(hex32(hash))).ok()?;
-        let text = String::from_utf8(bytes).ok()?;
+        let blob = std::fs::read(self.dir.join(hex32(hash))).ok()?;
+        let text = String::from_utf8(crate::lzss::decompress(&blob)?).ok()?;
         (sha256_bytes(&text) == *hash).then_some(text)
     }
 
