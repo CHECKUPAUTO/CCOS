@@ -169,6 +169,110 @@ fn read_string(f: &mut impl Read) -> io::Result<String> {
     String::from_utf8(read_bytes(f)?).map_err(|_| corrupt("non-utf8 key"))
 }
 
+/// Lever 2, brick 2 — a staged on-disk key→bytes store: a resident write buffer
+/// (the "memtable", a `BTreeMap`) flushed to an immutable sorted [`Segment`] once it
+/// grows past `buffer_limit`, with reads layered **newest-first** (buffer, then
+/// segments newest→oldest). Updates are last-write-wins; a re-`open` reloads the
+/// segments, so the store survives a restart.
+///
+/// Resident cost is the buffer (bounded by `buffer_limit`) plus each segment's
+/// sparse index — `O(total / STRIDE)` overall, not one entry per key, which is what
+/// will let the COLD tier hold far more husks than fit in RAM. Still **unwired**;
+/// deletion (tombstones) and segment compaction are later bricks.
+pub struct HuskStore {
+    dir: PathBuf,
+    buffer: std::collections::BTreeMap<String, Vec<u8>>,
+    buffer_limit: usize,
+    segments: Vec<Segment>, // oldest → newest
+    next_seq: u64,
+}
+
+impl HuskStore {
+    /// Open (creating if needed) a store under `dir`, reloading any segments left by
+    /// a previous run. `buffer_limit` is the memtable size that triggers a flush.
+    pub fn open(dir: impl Into<PathBuf>, buffer_limit: usize) -> io::Result<Self> {
+        let dir = dir.into();
+        std::fs::create_dir_all(&dir)?;
+        let mut found: Vec<(u64, PathBuf)> = Vec::new();
+        for entry in std::fs::read_dir(&dir)? {
+            let path = entry?.path();
+            if let Some(seq) = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_prefix("seg-"))
+                .and_then(|n| n.parse::<u64>().ok())
+            {
+                found.push((seq, path));
+            }
+        }
+        found.sort_by_key(|(seq, _)| *seq);
+        let next_seq = found.last().map_or(0, |(seq, _)| seq + 1);
+        let segments = found
+            .iter()
+            .map(|(_, p)| Segment::open(p))
+            .collect::<io::Result<Vec<_>>>()?;
+        Ok(Self {
+            dir,
+            buffer: std::collections::BTreeMap::new(),
+            buffer_limit: buffer_limit.max(1),
+            segments,
+            next_seq,
+        })
+    }
+
+    /// Insert/update `key`, flushing the memtable to a segment if it is now full.
+    pub fn put(&mut self, key: &str, value: Vec<u8>) -> io::Result<()> {
+        self.buffer.insert(key.to_string(), value);
+        if self.buffer.len() >= self.buffer_limit {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Fetch the current value for `key` — the memtable wins, else the newest segment
+    /// that has it (last-write-wins).
+    pub fn get(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
+        if let Some(v) = self.buffer.get(key) {
+            return Ok(Some(v.clone()));
+        }
+        for seg in self.segments.iter().rev() {
+            if let Some(v) = seg.get(key)? {
+                return Ok(Some(v));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Flush the memtable to a new immutable segment (a no-op if empty).
+    pub fn flush(&mut self) -> io::Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        let path = self.dir.join(format!("seg-{:020}", self.next_seq));
+        let recs: Vec<(&str, &[u8])> = self
+            .buffer
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_slice()))
+            .collect();
+        write_segment(&path, &recs)?;
+        self.segments.push(Segment::open(&path)?);
+        self.next_seq += 1;
+        self.buffer.clear();
+        Ok(())
+    }
+
+    /// Total resident index entries: the memtable plus every segment's sparse index —
+    /// the bounded `O(total / STRIDE)` footprint, not one per key.
+    pub fn resident_index_len(&self) -> usize {
+        self.buffer.len() + self.segments.iter().map(Segment::sparse_len).sum::<usize>()
+    }
+
+    /// Number of flushed segments (for tests/observability).
+    pub fn segment_count(&self) -> usize {
+        self.segments.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,6 +339,56 @@ mod tests {
             }
             prop_assert_eq!(seg.get("\u{7f}absent").unwrap(), None);
             std::fs::remove_file(&path).ok();
+        }
+    }
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CASE: AtomicU64 = AtomicU64::new(0);
+    fn store_dir() -> PathBuf {
+        let n = CASE.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("ccos_huskstore_{}_{}", std::process::id(), n))
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(80))]
+
+        /// HuskStore must behave as a last-write-wins map under any put/flush/get
+        /// stream — including across a re-open, which reloads the segments from disk.
+        #[test]
+        fn husk_store_matches_a_btreemap_model(
+            ops in prop::collection::vec(
+                (0u8..3u8, "[a-z]{1,3}", prop::collection::vec(any::<u8>(), 0..16)),
+                1..200,
+            )
+        ) {
+            let dir = store_dir();
+            let mut store = HuskStore::open(&dir, 8).unwrap(); // tiny buffer ⇒ frequent flushes
+            let mut model: std::collections::BTreeMap<String, Vec<u8>> = Default::default();
+            for (op, k, v) in &ops {
+                match op % 3 {
+                    0 => {
+                        store.put(k, v.clone()).unwrap();
+                        model.insert(k.clone(), v.clone());
+                    }
+                    1 => store.flush().unwrap(),
+                    _ => {
+                        let got = store.get(k).unwrap();
+                        prop_assert_eq!(got.as_ref(), model.get(k));
+                    }
+                }
+            }
+            for (k, v) in &model {
+                let got = store.get(k).unwrap();
+                prop_assert_eq!(got.as_ref(), Some(v), "live get {}", k);
+            }
+            // Survives a flush + re-open (segments reloaded from disk).
+            store.flush().unwrap();
+            let reopened = HuskStore::open(&dir, 8).unwrap();
+            for (k, v) in &model {
+                let got = reopened.get(k).unwrap();
+                prop_assert_eq!(got.as_ref(), Some(v), "post-reopen get {}", k);
+            }
+            std::fs::remove_dir_all(&dir).ok();
         }
     }
 }
