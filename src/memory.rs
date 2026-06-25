@@ -221,7 +221,7 @@ pub struct MemoryGraph {
     /// `Some(b)`, the bytes the COLD tier keeps in RAM ([`cold_resident_bytes`](Self::cold_resident_bytes))
     /// are driven toward `b` by **deep-spilling** the coldest entries — moving each
     /// one's `label` and full `edges` to the on-disk store and keeping only the
-    /// neighbour ids ([`ColdNode::adj`]) resident. Still **lossless** (the body
+    /// neighbour ids (`adj`) resident. Still **lossless** (the body
     /// faults back on [`page_in`](Self::page_in)); the measured-dominant resident
     /// cost (edges, `docs/MEASUREMENT_cold_ram.md`) is shrunk to ids, not dropped or
     /// contracted. A runtime knob (`#[serde(skip)]`); `None` (default) ⇒ no
@@ -330,7 +330,7 @@ struct ColdNode {
     /// When `Some`, this entry has been **deep-spilled** (slice 5): its `label` and
     /// its archived `edges` have been serialized into a single on-disk blob (keyed
     /// by SHA-256, like content spill), `node.label` is empty and `edges` is empty,
-    /// and only [`adj`](ColdNode::adj) — the neighbour *ids* — is kept resident so
+    /// and only `adj` — the neighbour *ids* — is kept resident so
     /// [`cold_neighbours`](MemoryGraph::cold_neighbours) and region paging still work
     /// without touching disk. The full edge records (weights, types, timestamps) and
     /// the label fault back in [`page_in`](MemoryGraph::page_in). This is the most
@@ -825,7 +825,7 @@ impl MemoryGraph {
     /// entry is not enough for a symmetric answer). Sorted (deterministic).
     ///
     /// A **deep-spilled** entry's full edges are on disk, but its resident
-    /// neighbour ids ([`ColdNode::adj`]) carry the same undirected adjacency: each
+    /// neighbour ids (`adj`) carry the same undirected adjacency: each
     /// id `o` there stands for the edge `entry ── o`, so it is read exactly like a
     /// resident edge would be — region paging never has to touch disk to find the
     /// cold neighbourhood.
@@ -930,7 +930,7 @@ impl MemoryGraph {
     /// estimate (string lengths + struct sizes, ignoring allocator slack), honest
     /// for "how much RAM is stuck per cold entry". A **deep-spilled** entry's edges
     /// and label are on disk, so they no longer count here — only its resident
-    /// neighbour ids ([`ColdNode::adj`]) and the deep-stub hash do.
+    /// neighbour ids (`adj`) and the deep-stub hash do.
     pub fn cold_resident_bytes(&self) -> usize {
         self.cold
             .iter()
@@ -1039,7 +1039,7 @@ impl MemoryGraph {
     /// ([`cold_resident_bytes`](Self::cold_resident_bytes)) is within
     /// [`cold_resident_budget`](Self::cold_resident_budget). For each entry this
     /// serializes its `label` + full `edges` into one content-addressed blob, keeps
-    /// only the neighbour ids ([`ColdNode::adj`]) resident, and — so the entry's
+    /// only the neighbour ids (`adj`) resident, and — so the entry's
     /// *content* leaves RAM too — spills any still-inline content via the same
     /// store. Deterministic: coldest-first by causal score, ties on id. **Lossless**:
     /// everything faults back in [`page_in`](Self::page_in). A no-op without an
