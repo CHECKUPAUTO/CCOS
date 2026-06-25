@@ -6,6 +6,20 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Structural-centrality scoring term** (from a design discussion — the one idea in
+  that conversation CCOS's score didn't already have). `compute_node_score` gains a
+  `w_centrality · ln(1 + in_degree)` term: a hub (a shared module / interface many
+  nodes depend on) is structurally more important than a leaf, independent of recency.
+  **Off by default** (`w_centrality = 0.0`, `skip_serializing_if` elides it) ⇒ the
+  score is byte-identical to before and replay/snapshots are unchanged. In-degree is
+  computed via a cache keyed on `edges.len()` (edges are append/`retain`-only) and is
+  only built when the term is enabled, so the default path pays nothing.
+  `CCOS_W_CENTRALITY` overrides it, and the log-tuner
+  (`AgentSession::tune_recall_weights`) now learns it too (absolute candidates, since
+  a multiplicative move can't escape 0). Deterministic.
+
 ### Performance
 
 - **Per-recall caches make recall up to ~5700× faster at scale** (the perf pass —
