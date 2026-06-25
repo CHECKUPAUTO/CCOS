@@ -1,3 +1,4 @@
+use crate::cold_index::HuskStore;
 use crate::compressor::{CausalAst, CausalCrusher, CausalSumm, ContentRouter, Route};
 use crate::eviction_policy::{
     bucket_pressure, bucket_recency, bucket_score, bucket_size, EvictionPolicy, PagingState, EVICT,
@@ -9,6 +10,12 @@ use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
 use std::path::PathBuf;
+
+/// Memtable size (husks buffered before flushing to a segment) and read-cache
+/// capacity for the Lever 2 [`HuskStore`]. Runtime tuning constants; generous enough
+/// that the on-disk index stays cheap on small graphs.
+const HUSK_BUFFER_LIMIT: usize = 4096;
+const HUSK_CACHE_CAP: usize = 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeId(pub String);
@@ -242,6 +249,16 @@ pub struct MemoryGraph {
     /// invariant (replay == live, snapshot hash) is untouched on the default path.
     #[serde(skip)]
     spill: Option<SpillConfig>,
+    /// Lever 2 (slice 5c): an on-disk index mirroring the deep-spill husks, so the
+    /// COLD tier can eventually bound its resident *entry count* (not just per-entry
+    /// size) by living in segments + a bounded cache rather than one `BTreeMap` node
+    /// per husk. Runtime handle only (`#[serde(skip)]`), opened in a `husks/` subdir
+    /// of the spill directory and re-attached on restore like the spill store itself.
+    /// In this brick it is a **write-through mirror**: `cold_deep` stays authoritative
+    /// and behaviour is unchanged; a later brick flips reads to it and drops the
+    /// resident map.
+    #[serde(skip)]
+    husk_store: Option<HuskStore>,
     /// Optional **compaction budget** for the COLD tier (slice 4). When `Some(b)`,
     /// total COLD *content* (inline + spilled) is kept toward `b` bytes by
     /// **lossily compacting** the coldest entries — code is skeletonised, prose
@@ -494,6 +511,7 @@ impl MemoryGraph {
             cold: BTreeMap::new(),
             cold_deep: BTreeMap::new(),
             spill: None,
+            husk_store: None,
             cold_content_budget: None,
             cold_resident_budget: None,
             indegree_cache: RefCell::new(None),
@@ -816,6 +834,9 @@ impl MemoryGraph {
             {
                 Some(node) => {
                     self.cold_deep.remove(id);
+                    if let Some(hs) = self.husk_store.as_mut() {
+                        let _ = hs.delete(&id.0); // keep the mirror consistent
+                    }
                     self.cold.insert(id.clone(), node);
                     // The husk's body blob is now unreferenced — the node is back with
                     // its content folded inline — so reclaim it unless another husk
@@ -968,11 +989,20 @@ impl MemoryGraph {
         dir: impl Into<PathBuf>,
         inline_budget: usize,
     ) -> std::io::Result<()> {
+        let dir = dir.into();
+        // Lever 2 husk index, in a *sibling* `<dir>.husks` directory — kept out of the
+        // spill (blob) directory so that stays purely the content-addressed blob store
+        // (the "no orphaned blobs" invariant counts only blobs there).
+        let mut husk_dir = dir.clone().into_os_string();
+        husk_dir.push(".husks");
+        let husk_store =
+            HuskStore::open(PathBuf::from(husk_dir), HUSK_BUFFER_LIMIT, HUSK_CACHE_CAP)?;
         let store = ColdSpill::new(dir)?;
         self.spill = Some(SpillConfig {
             store,
             inline_budget,
         });
+        self.husk_store = Some(husk_store);
         self.enforce_cold_budget();
         self.enforce_cold_resident_budget();
         Ok(())
@@ -983,6 +1013,7 @@ impl MemoryGraph {
     /// directory is re-attached. Mainly for tests and controlled teardown.
     pub fn detach_cold_spill(&mut self) {
         self.spill = None;
+        self.husk_store = None;
     }
 
     /// Whether an on-disk COLD spill store is currently attached.
@@ -1242,16 +1273,22 @@ impl MemoryGraph {
             };
             // Commit: swap the full entry for a compact husk in `cold_deep`.
             self.cold.remove(&id);
-            self.cold_deep.insert(
-                id.clone(),
-                DeepHusk {
-                    body: SpillRef {
-                        hash: body_hash,
-                        len: serialized.len(),
-                    },
-                    adj: pack_adj(&adj),
+            let husk = DeepHusk {
+                body: SpillRef {
+                    hash: body_hash,
+                    len: serialized.len(),
                 },
-            );
+                adj: pack_adj(&adj),
+            };
+            // Lever 2 write-through: mirror the husk into the on-disk index.
+            // Best-effort — `cold_deep` stays authoritative this brick, so a mirror
+            // miss can never break the resident tier.
+            if let Some(hs) = self.husk_store.as_mut() {
+                if let Ok(bytes) = serde_json::to_vec(&husk) {
+                    let _ = hs.put(&id.0, bytes);
+                }
+            }
+            self.cold_deep.insert(id.clone(), husk);
             if let Some(hash) = old_content_hash {
                 self.release_blob_if_orphan(&hash);
             }
@@ -1343,6 +1380,9 @@ impl MemoryGraph {
             }
         }
         if let Some(husk) = self.cold_deep.remove(id) {
+            if let Some(hs) = self.husk_store.as_mut() {
+                let _ = hs.delete(&id.0); // keep the mirror consistent
+            }
             self.release_blob_if_orphan(&husk.body.hash);
         }
     }
@@ -2942,6 +2982,37 @@ mod tests {
         g.max_in_memory_nodes = 0;
         g.enforce_paging(); // demote everything to COLD
         g
+    }
+
+    #[test]
+    fn husk_store_mirrors_cold_deep() {
+        // Lever 2 brick 5: deep-spilling writes each husk through to the on-disk
+        // index, byte-identical, and page-in removes it from the mirror too.
+        let dir = spill_temp_dir("husk_mirror");
+        let mut g = cold_region(&dir);
+        g.set_cold_resident_budget(Some(0)); // deep-spill every cold entry
+
+        assert!(!g.cold_deep.is_empty(), "expected deep-spilled husks");
+        {
+            let hs = g.husk_store.as_ref().expect("husk store attached");
+            for (id, husk) in &g.cold_deep {
+                let got = hs.get(&id.0).unwrap();
+                let want = serde_json::to_vec(husk).unwrap();
+                assert_eq!(got, Some(want), "mirror byte-match for {}", id.0);
+            }
+        }
+
+        // Page one back in: it leaves both `cold_deep` and the mirror.
+        let some_id = g.cold_deep.keys().next().unwrap().clone();
+        g.max_in_memory_nodes = 100;
+        assert!(g.page_in(&some_id), "paged back in");
+        assert!(!g.cold_deep.contains_key(&some_id), "left cold_deep");
+        assert_eq!(
+            g.husk_store.as_ref().unwrap().get(&some_id.0).unwrap(),
+            None,
+            "mirror deleted on page_in",
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

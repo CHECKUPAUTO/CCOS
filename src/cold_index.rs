@@ -71,6 +71,7 @@ pub fn write_segment(path: &Path, records: &[(&str, &[u8])]) -> io::Result<()> {
 
 /// A read handle over a written segment: the sparse index lives in RAM, the records
 /// stay on disk and are read on demand.
+#[derive(Debug, Clone)]
 pub struct Segment {
     path: PathBuf,
     sparse: Vec<(String, u64)>,
@@ -201,8 +202,12 @@ fn read_string(f: &mut impl Read) -> io::Result<String> {
 /// sparse index — `O(total / STRIDE)` overall, not one entry per key, which is what
 /// will let the COLD tier hold far more husks than fit in RAM. Updates are
 /// last-write-wins; a delete leaves a **tombstone** (`None`) that shadows older
-/// segments until [`compact`](Self::compact) merges them and drops it. Still
-/// **unwired**.
+/// segments until [`compact`](Self::compact) merges them and drops it.
+///
+/// `Clone` duplicates the handle (same directory, a fresh buffer/cache) — the same
+/// shape as [`ColdSpill`](crate::memory) cloning; a cloned store is for snapshotting,
+/// not concurrent independent mutation.
+#[derive(Debug, Clone)]
 pub struct HuskStore {
     dir: PathBuf,
     buffer: std::collections::BTreeMap<String, Option<Vec<u8>>>, // None = tombstone
@@ -219,6 +224,7 @@ pub struct HuskStore {
 /// the entry with the smallest clock is evicted (an `O(cap)` scan, fine for a small
 /// cap). Holds only present values — never tombstones or misses — so a hit is always
 /// a real value.
+#[derive(Debug, Clone)]
 struct Lru {
     cap: usize,
     clock: u64,
