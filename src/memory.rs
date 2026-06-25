@@ -165,8 +165,33 @@ impl ScoringWeights {
     }
 }
 
+/// Serialize a `NodeId → GraphNode` map in **sorted key order** so a snapshot is
+/// byte-canonical. The resident node map is a `HashMap` (O(1) lookups on the hot
+/// path) whose iteration order is nondeterministic, so a plain derive lets two
+/// memories with identical state serialize to different bytes (same length, shuffled
+/// order). Sorting on the way out makes the stronger invariant hold — *identical
+/// state ⇒ byte-identical snapshot*, not merely identical *sorted* hash.
+/// Deserialization is unaffected: a `HashMap` reads from a JSON map in any order.
+fn serialize_sorted_nodes<S>(
+    nodes: &HashMap<NodeId, GraphNode>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use serde::ser::SerializeMap;
+    let mut keys: Vec<&NodeId> = nodes.keys().collect();
+    keys.sort();
+    let mut map = serializer.serialize_map(Some(keys.len()))?;
+    for k in keys {
+        map.serialize_entry(k, &nodes[k])?;
+    }
+    map.end()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryGraph {
+    #[serde(serialize_with = "serialize_sorted_nodes")]
     pub(crate) nodes: HashMap<NodeId, GraphNode>,
     pub(crate) edges: Vec<GraphEdge>,
     pub paging_threshold: f64,
