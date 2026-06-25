@@ -385,14 +385,67 @@ fn is_false(b: &bool) -> bool {
 /// (`docs/MEASUREMENT_cold_ram.md`); the node faults back, hash-verified, on
 /// [`page_in`](MemoryGraph::page_in). Deep husks are **terminal** — already at the
 /// floor, they are not re-scored for further spill/compaction.
+/// Pack neighbour ids into one length-prefixed byte buffer (each id: a `u32` LE
+/// length + its UTF-8 bytes). One allocation for the whole adjacency instead of a
+/// `Vec` plus a `String` per id — slice 5c Lever 1, attacking the ~9× allocation
+/// overhead the measurement found (`docs/DESIGN_cold_entry_count.md`).
+fn pack_adj(ids: &[NodeId]) -> Box<[u8]> {
+    let mut buf = Vec::new();
+    for id in ids {
+        let bytes = id.0.as_bytes();
+        buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(bytes);
+    }
+    buf.into_boxed_slice()
+}
+
+/// Iterate the ids packed by [`pack_adj`] without allocating (yields borrowed
+/// `&str`). Stops cleanly on a truncated or non-UTF-8 buffer.
+fn unpack_adj(packed: &[u8]) -> impl Iterator<Item = &str> {
+    let mut pos = 0;
+    std::iter::from_fn(move || {
+        let lb = packed.get(pos..pos + 4)?;
+        let len = u32::from_le_bytes(lb.try_into().ok()?) as usize;
+        pos += 4;
+        let s = std::str::from_utf8(packed.get(pos..pos + len)?).ok()?;
+        pos += len;
+        Some(s)
+    })
+}
+
+/// (De)serialize the packed adjacency as a plain JSON array of id strings, so a
+/// deep-husk snapshot is byte-identical to the previous `Vec<NodeId>` layout while
+/// RAM holds the compact packed form.
+mod packed_adj {
+    use super::{pack_adj, unpack_adj, NodeId};
+    use serde::ser::SerializeSeq;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(adj: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        let ids: Vec<&str> = unpack_adj(adj).collect();
+        let mut seq = s.serialize_seq(Some(ids.len()))?;
+        for id in ids {
+            seq.serialize_element(id)?;
+        }
+        seq.end()
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Box<[u8]>, D::Error> {
+        let ids: Vec<String> = Vec::deserialize(d)?;
+        Ok(pack_adj(&ids.into_iter().map(NodeId).collect::<Vec<_>>()))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DeepHusk {
     /// Stub of the on-disk blob holding the whole serialized `ColdNode`.
     body: SpillRef,
     /// Neighbour ids — the other endpoint of each edge the entry carried at
-    /// deep-spill time. Sorted + deduped (deterministic); the only structure kept
-    /// resident, so the cold↔cold adjacency survives without faulting the blob.
-    adj: Vec<NodeId>,
+    /// deep-spill time — **packed** into one length-prefixed buffer (sorted + deduped
+    /// at deep-spill, so deterministic). The only structure kept resident, so the
+    /// cold↔cold adjacency survives without faulting the blob; see [`pack_adj`].
+    #[serde(with = "packed_adj")]
+    adj: Box<[u8]>,
 }
 
 /// (De)serialize a 32-byte content hash as its lowercase-hex string, so the stub
@@ -896,8 +949,8 @@ impl MemoryGraph {
         // edge `husk-id ── o`, read exactly as a resident edge would be, so region
         // paging never has to fault a body blob to find the cold neighbourhood.
         for (hid, h) in &self.cold_deep {
-            for o in &h.adj {
-                consider(hid, o, &mut out);
+            for o in unpack_adj(&h.adj) {
+                consider(hid, &NodeId(o.to_owned()), &mut out);
             }
         }
         out.into_iter().collect()
@@ -1008,12 +1061,9 @@ impl MemoryGraph {
     /// husk struct (body-blob hash inline) and the resident neighbour ids. No
     /// `ColdNode`, label, content or edge records — those live in the body blob.
     fn husk_resident_bytes(key: &NodeId, h: &DeepHusk) -> usize {
-        let mut b = std::mem::size_of::<DeepHusk>() + std::mem::size_of::<NodeId>();
-        b += key.0.len();
-        for n in &h.adj {
-            b += std::mem::size_of::<NodeId>() + n.0.len();
-        }
-        b
+        // The neighbour ids live in one packed buffer (`adj`), so they cost just its
+        // length — one allocation, not a `Vec` + a `String` per id (slice 5c Lever 1).
+        std::mem::size_of::<DeepHusk>() + std::mem::size_of::<NodeId>() + key.0.len() + h.adj.len()
     }
 
     /// Flush the coldest resident COLD content to the spill store until resident
@@ -1199,7 +1249,7 @@ impl MemoryGraph {
                         hash: body_hash,
                         len: serialized.len(),
                     },
-                    adj,
+                    adj: pack_adj(&adj),
                 },
             );
             if let Some(hash) = old_content_hash {
@@ -2844,6 +2894,31 @@ mod tests {
 
     // ── slice 5: COLD deep-spill (lossless full-entry archive; resident-bounded) ──
 
+    #[test]
+    fn pack_adj_round_trips_ids() {
+        // Empty, single, multi, and multibyte ids all survive the length-prefixed
+        // packing (slice 5c Lever 1).
+        for ids in [
+            vec![],
+            vec!["a"],
+            vec!["file:src/x.rs", "sym:src/x.rs:fn_é"],
+            vec!["", "x", "longer-id-with-dashes-0123456789"],
+        ] {
+            let nodes: Vec<NodeId> = ids.iter().map(|s| NodeId(s.to_string())).collect();
+            let packed = pack_adj(&nodes);
+            assert_eq!(
+                unpack_adj(&packed).collect::<Vec<_>>(),
+                ids,
+                "round-trip {ids:?}"
+            );
+        }
+        // A truncated buffer stops cleanly rather than panicking.
+        assert_eq!(
+            unpack_adj(&[5, 0, 0, 0, b'a']).collect::<Vec<_>>(),
+            Vec::<&str>::new()
+        );
+    }
+
     /// Five nodes — a chain a→b→c→d plus a hub `h` linked to all four — demoted to
     /// COLD with a spill store attached but no content/deep pressure yet. The caller
     /// sets a resident budget to drive deep-spill.
@@ -2910,9 +2985,9 @@ mod tests {
             );
             let h = g.cold_deep.get(&NodeId("b".into())).unwrap();
             assert_eq!(
-                h.adj,
-                vec![NodeId("a".into())],
-                "only the neighbour id kept"
+                unpack_adj(&h.adj).collect::<Vec<_>>(),
+                vec!["a"],
+                "only the neighbour id kept (packed)"
             );
             assert!(
                 h.body.len > 0,

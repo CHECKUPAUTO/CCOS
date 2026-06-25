@@ -15,18 +15,6 @@
 use ccos::memory::{EdgeType, MemoryGraph, NodeType};
 use std::path::Path;
 
-fn vmrss_kb() -> u64 {
-    std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("VmRSS:"))
-                .and_then(|l| l.split_whitespace().nth(1))
-                .and_then(|n| n.parse().ok())
-        })
-        .unwrap_or(0)
-}
-
 fn build_all_husks(files: usize, dir: &Path) -> MemoryGraph {
     let mut g = MemoryGraph::new(0.2, usize::MAX);
     for f in 0..files {
@@ -67,31 +55,32 @@ fn build_all_husks(files: usize, dir: &Path) -> MemoryGraph {
 fn main() {
     println!("# COLD husk-count RAM — the last O(N), input to slice 5c\n");
 
-    let rss0 = vmrss_kb();
     let dir = std::env::temp_dir().join(format!("ccos_coldcount_{}", std::process::id()));
     let g = build_all_husks(30000, &dir);
-    let rss1 = vmrss_kb();
 
     let n = g.cold_count();
     let deep = g.cold_deep_spilled_count();
     let resident = g.cold_resident_bytes();
     let per = resident / n.max(1);
-    let rss_per = (rss1.saturating_sub(rss0)) as usize * 1024 / n.max(1);
     let gib = 1024usize * 1024 * 1024;
 
     println!("nodes (all husks): {n}  (deep-spilled: {deep})");
-    println!("resident: {resident} B  →  {per} B / husk (logical)");
-    println!("VmRSS:    ~{rss_per} B / husk (actual, incl. BTreeMap node + allocator)");
+    println!("resident husk metadata: {resident} B  →  {per} B / husk (logical)");
     println!(
-        "\nExtrapolation: the husk tier alone reaches 1 GiB at ~{} husks (logical) / ~{} (VmRSS).",
-        gib / per.max(1),
-        gib / rss_per.max(1),
+        "\nExtrapolation: the husk tier reaches 1 GiB at ~{} husks.",
+        gib / per.max(1)
     );
     println!(
-        "The variable part is the resident **adjacency** (neighbour ids) — exactly what\n\
-         cold_neighbours reads without disk. Bounding the count below O(N) means moving\n\
-         that adjacency to disk and answering cold_neighbours from it (see\n\
-         docs/DESIGN_cold_entry_count.md)."
+        "Per husk that is the body-blob stub plus the **packed** neighbour ids (`adj` — slice\n\
+         5c Lever 1: one allocation, not a Vec + a String per id). The adjacency is exactly\n\
+         what cold_neighbours reads without disk, so bounding the *count* below O(N) means an\n\
+         on-disk adjacency index (Lever 2 — see docs/DESIGN_cold_entry_count.md)."
+    );
+    println!(
+        "\nNote (honest methodology): a process-RSS delta over this build is NOT a clean\n\
+         per-husk figure — the build materializes the whole graph (full nodes + content)\n\
+         before deep-spilling, so RSS reflects that transient peak, not the husk steady\n\
+         state. The logical bytes above are the honest per-husk metric."
     );
     drop(g);
     std::fs::remove_dir_all(&dir).ok();
