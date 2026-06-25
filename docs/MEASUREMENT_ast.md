@@ -1,16 +1,17 @@
 # Heuristic vs real-AST ingestion — how much "garbage in"?
 
-> Reproduce:
+> Reproduce (the AST is now the default; `--no-default-features` selects the heuristic):
 > ```bash
-> cargo run --release --example parse_accuracy                       > /tmp/heuristic.txt
-> cargo run --release --features syn-parser --example parse_accuracy > /tmp/ast.txt
+> cargo run --release --no-default-features --example parse_accuracy > /tmp/heuristic.txt
+> cargo run --release                        --example parse_accuracy > /tmp/ast.txt
 > diff /tmp/heuristic.txt /tmp/ast.txt
 > ```
 
 CCOS's causal graph is only as good as the ingestion that builds it — *garbage in, garbage
-out*. The default parser is a zero-dependency **line-based heuristic**; the `syn-parser`
-feature swaps in a **real Rust AST**. Before deciding whether the AST should be the default
-(ROADMAP P0.1 shipped it, but off by default), measure how wrong the heuristic actually is.
+out*. The original default parser was a zero-dependency **line-based heuristic**; a **real
+Rust AST** (`syn`) was available behind a feature. This measurement quantified how wrong the
+heuristic is and is **why the AST is now the default** (heuristic kept as the
+`--no-default-features` fallback).
 
 Method: parse CCOS's *own* `src/` tree (41 files) with each backend and emit a canonical,
 file-scoped, sorted dump of every symbol / `use` / module. The AST is a real parser, so on

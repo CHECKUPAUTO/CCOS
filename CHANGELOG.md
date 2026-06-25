@@ -6,6 +6,18 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **The real `syn` AST parser is now the default ingestion path** (was opt-in behind
+  the `syn-parser` feature). On real code the old line heuristic is **36.5% wrong**
+  structurally — import recall only 66.9% (grouped `use a::{b,c}` collapsed, so a third
+  of the cross-file dependency edges were invisible) plus 145 hallucinated symbols
+  (local consts promoted to top-level) — see `docs/MEASUREMENT_ast.md`. `syn` /
+  `proc-macro2` are already in the dependency tree via serde, so defaulting to the AST
+  pulls **no new dependency**; `--no-default-features` keeps the zero-extra-dependency
+  heuristic, retained as the fallback for non-Rust / unparseable input. Still no async
+  runtime and no TLS in the default build.
+
 ### Added
 
 - **COLD entry-count bound — an on-disk husk index (slice 5c, "Lever 2"; the

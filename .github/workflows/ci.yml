@@ -50,11 +50,11 @@ jobs:
       - name: Clippy (default + all features)
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
-      - name: Test (default — zero-dep heuristic parser)
+      - name: Test (default — real `syn` AST is now the default parser)
         run: cargo test --locked
 
-      - name: Test (syn-parser feature — real AST)
-        run: cargo test --features syn-parser --locked
+      - name: Test (--no-default-features — line-heuristic fallback)
+        run: cargo test --no-default-features --locked
 
       - name: Test (llm feature — async modules + binary)
         run: cargo test --features llm --locked

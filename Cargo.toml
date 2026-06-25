@@ -34,10 +34,15 @@ proc-macro2 = { version = "1", features = ["span-locations"], optional = true }
 mimalloc = { version = "0.1", optional = true }
 
 [features]
-# Default is the dependency-light **sync core**: causal memory, the hash-chained
-# event log, recall — no async runtime, no TLS. A library consumer that only
-# wants `ccos::event_log` / `ccos::memory` builds without tokio or reqwest.
-default = []
+# Default = the **sync core** (causal memory, hash-chained event log, recall) plus
+# the real `syn` **AST parser**, now the default ingestion path: it is 36.5% more
+# accurate than the line heuristic on real code (two-thirds vs full import recall —
+# see docs/MEASUREMENT_ast.md), and `syn`/`proc-macro2` are already in the tree via
+# serde's derive, so defaulting to it pulls **no new dependency**. Still no async
+# runtime and no TLS — a consumer of `ccos::memory` / `ccos::event_log` pulls neither
+# tokio nor reqwest. Opt out with `--no-default-features` for the zero-extra-dependency
+# line-based heuristic (kept as the fallback for non-Rust / unparseable input).
+default = ["syn-parser"]
 # The LLM / eval / workspace modules and the `ccos` binary (which drives them).
 llm = ["dep:tokio", "dep:reqwest"]
 syn-parser = ["dep:syn", "dep:proc-macro2"]
