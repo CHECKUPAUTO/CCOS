@@ -144,6 +144,26 @@ impl Segment {
         }
         Ok(None)
     }
+
+    /// Every `(key, value)` record in ascending key order — a full scan, used by
+    /// compaction to merge segments.
+    pub fn records(&self) -> io::Result<Vec<(String, Vec<u8>)>> {
+        let mut f = std::fs::File::open(&self.path)?;
+        let mut out = Vec::new();
+        let mut pos = 0u64;
+        while pos < self.records_end {
+            let k = read_string(&mut f)?;
+            let v = read_bytes(&mut f)?;
+            pos += 8 + k.len() as u64 + v.len() as u64;
+            out.push((k, v));
+        }
+        Ok(out)
+    }
+
+    /// The segment's on-disk path (used by compaction to delete a merged-away file).
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
 }
 
 fn corrupt(msg: &str) -> io::Error {
@@ -177,14 +197,43 @@ fn read_string(f: &mut impl Read) -> io::Result<String> {
 ///
 /// Resident cost is the buffer (bounded by `buffer_limit`) plus each segment's
 /// sparse index — `O(total / STRIDE)` overall, not one entry per key, which is what
-/// will let the COLD tier hold far more husks than fit in RAM. Still **unwired**;
-/// deletion (tombstones) and segment compaction are later bricks.
+/// will let the COLD tier hold far more husks than fit in RAM. Updates are
+/// last-write-wins; a delete leaves a **tombstone** (`None`) that shadows older
+/// segments until [`compact`](Self::compact) merges them and drops it. Still
+/// **unwired**.
 pub struct HuskStore {
     dir: PathBuf,
-    buffer: std::collections::BTreeMap<String, Vec<u8>>,
+    buffer: std::collections::BTreeMap<String, Option<Vec<u8>>>, // None = tombstone
     buffer_limit: usize,
     segments: Vec<Segment>, // oldest → newest
     next_seq: u64,
+}
+
+/// A stored value is tagged so a delete can shadow an older value across segments:
+/// `[1] ++ bytes` for a live value, a single `[0]` for a tombstone.
+const TAG_PRESENT: u8 = 1;
+const TAG_TOMBSTONE: u8 = 0;
+
+fn encode_value(v: Option<&[u8]>) -> Vec<u8> {
+    match v {
+        Some(b) => {
+            let mut out = Vec::with_capacity(b.len() + 1);
+            out.push(TAG_PRESENT);
+            out.extend_from_slice(b);
+            out
+        }
+        None => vec![TAG_TOMBSTONE],
+    }
+}
+
+/// `Some(Some(bytes))` for a live value, `Some(None)` for a tombstone, `None` if the
+/// tag byte is missing/invalid (a corrupt record — treated as a miss).
+fn decode_value(raw: &[u8]) -> Option<Option<Vec<u8>>> {
+    match raw.split_first() {
+        Some((&TAG_PRESENT, rest)) => Some(Some(rest.to_vec())),
+        Some((&TAG_TOMBSTONE, _)) => Some(None),
+        _ => None,
+    }
 }
 
 impl HuskStore {
@@ -222,35 +271,52 @@ impl HuskStore {
 
     /// Insert/update `key`, flushing the memtable to a segment if it is now full.
     pub fn put(&mut self, key: &str, value: Vec<u8>) -> io::Result<()> {
-        self.buffer.insert(key.to_string(), value);
-        if self.buffer.len() >= self.buffer_limit {
-            self.flush()?;
-        }
-        Ok(())
+        self.buffer.insert(key.to_string(), Some(value));
+        self.maybe_flush()
     }
 
-    /// Fetch the current value for `key` — the memtable wins, else the newest segment
-    /// that has it (last-write-wins).
+    /// Delete `key` — a tombstone shadows any older value until [`compact`](Self::compact).
+    pub fn delete(&mut self, key: &str) -> io::Result<()> {
+        self.buffer.insert(key.to_string(), None);
+        self.maybe_flush()
+    }
+
+    fn maybe_flush(&mut self) -> io::Result<()> {
+        if self.buffer.len() >= self.buffer_limit {
+            self.flush()
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Fetch the current value for `key`, or `None` if absent **or deleted** — the
+    /// memtable wins, else the newest segment that has the key (a tombstone there
+    /// means deleted).
     pub fn get(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
-        if let Some(v) = self.buffer.get(key) {
-            return Ok(Some(v.clone()));
+        if let Some(slot) = self.buffer.get(key) {
+            return Ok(slot.clone()); // Some(v) = live, None = tombstone ⇒ deleted
         }
         for seg in self.segments.iter().rev() {
-            if let Some(v) = seg.get(key)? {
-                return Ok(Some(v));
+            if let Some(raw) = seg.get(key)? {
+                return Ok(decode_value(&raw).flatten()); // first segment wins (newest)
             }
         }
         Ok(None)
     }
 
-    /// Flush the memtable to a new immutable segment (a no-op if empty).
+    /// Flush the memtable to a new immutable segment (a no-op if empty). Tombstones
+    /// are written too, so a delete persists across the flush.
     pub fn flush(&mut self) -> io::Result<()> {
         if self.buffer.is_empty() {
             return Ok(());
         }
-        let path = self.dir.join(format!("seg-{:020}", self.next_seq));
-        let recs: Vec<(&str, &[u8])> = self
+        let encoded: Vec<(String, Vec<u8>)> = self
             .buffer
+            .iter()
+            .map(|(k, v)| (k.clone(), encode_value(v.as_deref())))
+            .collect();
+        let path = self.dir.join(format!("seg-{:020}", self.next_seq));
+        let recs: Vec<(&str, &[u8])> = encoded
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_slice()))
             .collect();
@@ -258,6 +324,60 @@ impl HuskStore {
         self.segments.push(Segment::open(&path)?);
         self.next_seq += 1;
         self.buffer.clear();
+        Ok(())
+    }
+
+    /// Merge every segment into a single fresh one, dropping tombstones and
+    /// shadowed (older-duplicate) values, then delete the merged-away files. This is
+    /// the garbage collection that keeps deletes from growing the store forever.
+    /// Crash-safe: the merged segment gets the highest sequence number and is written
+    /// (atomically) before any old file is removed, so a crash mid-compaction leaves
+    /// the merged data shadowing the old, never a gap. The memtable is flushed first.
+    pub fn compact(&mut self) -> io::Result<()> {
+        self.flush()?;
+        if self.segments.len() < 2 {
+            return Ok(());
+        }
+        // Replay oldest→newest so a newer write overwrites an older, and a tombstone
+        // removes the key outright.
+        let mut live: std::collections::BTreeMap<String, Vec<u8>> = Default::default();
+        for seg in &self.segments {
+            for (k, raw) in seg.records()? {
+                match decode_value(&raw) {
+                    Some(Some(v)) => {
+                        live.insert(k, v);
+                    }
+                    Some(None) => {
+                        live.remove(&k);
+                    }
+                    None => {}
+                }
+            }
+        }
+        let old_paths: Vec<PathBuf> = self
+            .segments
+            .iter()
+            .map(|s| s.path().to_path_buf())
+            .collect();
+        let mut new_segments = Vec::new();
+        if !live.is_empty() {
+            let encoded: Vec<(String, Vec<u8>)> = live
+                .iter()
+                .map(|(k, v)| (k.clone(), encode_value(Some(v))))
+                .collect();
+            let path = self.dir.join(format!("seg-{:020}", self.next_seq));
+            let recs: Vec<(&str, &[u8])> = encoded
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_slice()))
+                .collect();
+            write_segment(&path, &recs)?;
+            new_segments.push(Segment::open(&path)?);
+            self.next_seq += 1;
+        }
+        self.segments = new_segments;
+        for p in old_paths {
+            let _ = std::fs::remove_file(p);
+        }
         Ok(())
     }
 
@@ -352,12 +472,13 @@ mod tests {
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(80))]
 
-        /// HuskStore must behave as a last-write-wins map under any put/flush/get
-        /// stream — including across a re-open, which reloads the segments from disk.
+        /// HuskStore must behave as a last-write-wins map under any
+        /// put/delete/flush/compact/get stream — including across a re-open, which
+        /// reloads the segments from disk.
         #[test]
         fn husk_store_matches_a_btreemap_model(
             ops in prop::collection::vec(
-                (0u8..3u8, "[a-z]{1,3}", prop::collection::vec(any::<u8>(), 0..16)),
+                (0u8..5u8, "[a-z]{1,3}", prop::collection::vec(any::<u8>(), 0..16)),
                 1..200,
             )
         ) {
@@ -365,28 +486,31 @@ mod tests {
             let mut store = HuskStore::open(&dir, 8).unwrap(); // tiny buffer ⇒ frequent flushes
             let mut model: std::collections::BTreeMap<String, Vec<u8>> = Default::default();
             for (op, k, v) in &ops {
-                match op % 3 {
-                    0 => {
+                match op % 5 {
+                    0 | 1 => {
                         store.put(k, v.clone()).unwrap();
                         model.insert(k.clone(), v.clone());
                     }
-                    1 => store.flush().unwrap(),
-                    _ => {
-                        let got = store.get(k).unwrap();
-                        prop_assert_eq!(got.as_ref(), model.get(k));
+                    2 => {
+                        store.delete(k).unwrap();
+                        model.remove(k);
                     }
+                    3 => store.flush().unwrap(),
+                    _ => store.compact().unwrap(),
                 }
+                let got = store.get(k).unwrap();
+                prop_assert_eq!(got.as_ref(), model.get(k), "get {} after op {}", k, op);
             }
             for (k, v) in &model {
                 let got = store.get(k).unwrap();
                 prop_assert_eq!(got.as_ref(), Some(v), "live get {}", k);
             }
-            // Survives a flush + re-open (segments reloaded from disk).
-            store.flush().unwrap();
+            // Survives compaction + re-open (segments reloaded from disk).
+            store.compact().unwrap();
             let reopened = HuskStore::open(&dir, 8).unwrap();
             for (k, v) in &model {
                 let got = reopened.get(k).unwrap();
-                prop_assert_eq!(got.as_ref(), Some(v), "post-reopen get {}", k);
+                prop_assert_eq!(got.as_ref(), Some(v), "post-compact-reopen get {}", k);
             }
             std::fs::remove_dir_all(&dir).ok();
         }
