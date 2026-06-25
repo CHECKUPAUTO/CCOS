@@ -13,6 +13,41 @@ pub fn sha256_hex(input: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// Raw 32-byte SHA-256 of a string. The compact form of [`sha256_hex`] — half the
+/// bytes, no heap allocation — used as the in-RAM key of a spilled COLD blob (the
+/// on-disk filename is still its [`hex32`]).
+pub fn sha256_bytes(input: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(input.as_bytes());
+    hasher.finalize().into()
+}
+
+/// Lowercase-hex of a 32-byte hash — the on-disk key / wire form of a content hash.
+pub fn hex32(bytes: &[u8; 32]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(64);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// Parse a 64-char lowercase-hex string back to a 32-byte hash; `None` unless it is
+/// exactly 64 valid hex digits.
+pub fn from_hex32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let mut out = [0u8; 32];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let hi = (bytes[2 * i] as char).to_digit(16)?;
+        let lo = (bytes[2 * i + 1] as char).to_digit(16)?;
+        *slot = (hi * 16 + lo) as u8;
+    }
+    Some(out)
+}
+
 /// Write `bytes` to `path` **durably and atomically**: write to a temporary
 /// sibling, `fsync` it, rename it over `path`, then best-effort `fsync` the
 /// parent directory. After this returns the data has reached stable storage and
@@ -65,6 +100,23 @@ mod tests {
             sha256_hex("abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn sha256_bytes_matches_hex_and_round_trips() {
+        // The raw form is exactly the hex form, just un-encoded.
+        assert_eq!(hex32(&sha256_bytes("abc")), sha256_hex("abc"));
+        for s in ["", "hello", "abc", "the quick brown fox"] {
+            let raw = sha256_bytes(s);
+            assert_eq!(
+                from_hex32(&hex32(&raw)),
+                Some(raw),
+                "hex round-trip for {s:?}"
+            );
+        }
+        // Malformed hex is rejected, not silently truncated.
+        assert_eq!(from_hex32("nothex"), None);
+        assert_eq!(from_hex32(&"a".repeat(63)), None);
     }
 
     #[test]
