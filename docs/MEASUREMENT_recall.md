@@ -112,9 +112,28 @@ at low rank*; the honest next step to make it earn the default path is to wire i
 a **re-ranking** stage (rank the region/window candidates) rather than entry selection.
 Until then it is correct but mis-placed, and off by default.
 
+## LSA re-ranking, wired and measured (the follow-up)
+
+The data-backed path above is now built: `set_lsa_rerank(Some(rank))` re-orders the
+recalled **region** by rank-`rank` LSA similarity to the query — the *ranking* stage,
+not entry selection. `examples/lsa_rerank.rs` measures it on a hub-and-spoke corpus
+(every topic reachable in the region) for queries that resolve:
+
+- **mean target-file rank: 11.8 → 2.1 (Δ −9.6)** with re-ranking on. The
+  semantically-central target is pulled from the middle of the window to near the top —
+  the recall@k≥5 win #39 predicted, now realised inside the pipeline.
+
+Honest limiter, also measured: only **3/8 pure-synonym queries resolve to a region at
+all** — entry selection (TF-IDF) scores a synonym ≈0, exactly #39's recall@1 finding.
+Re-ranking sits at the region stage, so it re-orders what entry selection found and
+**never repairs an empty region**. It is deterministic (id-sorted corpus, deterministic
+eigensolve — replay stays exact) and opt-in.
+
 ## Bottom line
 
 Hybrid fusion earns its place on the default path. The learned LSA embedder is now
-*measured*, not assumed: a genuine synonym-ranking win at rank 16, but useless for the
-entry selection it is currently wired into — so it stays opt-in, with a clear,
-data-backed path (re-ranking) to validate it later.
+*measured*, not assumed: useless for entry selection (recall@1=0), but a genuine
+ranking win — wired as a re-ranking stage it pulls the target from rank ~12 to ~2.
+It stays **opt-in** (its synonym benefit is gated by entry selection, and it carries a
+per-recall fit cost), now with the measurement to back enabling it where that trade
+pays.

@@ -212,7 +212,9 @@ fn hash_term(term: &str) -> u64 {
     h
 }
 
-fn tokenize(s: &str) -> Vec<String> {
+/// Split text into lowercase alphanumeric/`_` tokens — the tokenizer the TF-IDF
+/// embedder uses, exposed so a re-ranking stage can fit the same vocabulary.
+pub fn tokenize(s: &str) -> Vec<String> {
     s.split(|c: char| !c.is_alphanumeric() && c != '_')
         .filter(|t| t.len() > 1)
         .map(|t| t.to_lowercase())
