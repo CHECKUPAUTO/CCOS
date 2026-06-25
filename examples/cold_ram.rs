@@ -127,6 +127,27 @@ fn main() {
     let dir = std::env::temp_dir().join(format!("ccos_coldram_deep_{}", std::process::id()));
     let mut g = build_cold(30000, &dir);
     let before = g.cold_resident_bytes();
+
+    // Spill-codec ratio: at this point the store holds only the LZSS-compressed
+    // content blobs (deep-spill hasn't run yet), so compare on-disk bytes to the
+    // sum of original content lengths.
+    let logical_spilled = g.cold_spilled_bytes();
+    let disk_spilled: u64 = std::fs::read_dir(&dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .filter_map(|e| e.metadata().ok())
+                .map(|m| m.len())
+                .sum()
+        })
+        .unwrap_or(0);
+    println!(
+        "\nspill codec (LZSS): {} B on disk for {} B of original content — ~{:.2}x lossless \
+         (hash-verified on read).",
+        disk_spilled,
+        logical_spilled,
+        logical_spilled as f64 / disk_spilled.max(1) as f64,
+    );
+
     g.set_cold_resident_budget(Some(before / 2)); // ask to halve the resident metadata
     let after = g.cold_resident_bytes();
     println!(
