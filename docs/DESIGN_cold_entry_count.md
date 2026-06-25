@@ -14,23 +14,25 @@ worth it?
 
 | metric | value |
 |---|---|
-| resident, logical (`cold_resident_bytes`) | **174 B / husk** |
-| resident, actual (`VmRSS` delta) | **~1 567 B / husk** |
-| 1 GiB reached at | ~6.2 M husks (logical) / **~685 K husks (VmRSS)** |
+| resident, logical (`cold_resident_bytes`) | **~150–174 B / husk** |
+| 1 GiB reached at | **~6–7 M husks** |
 
-Two things stand out:
+> **Methodology correction.** An earlier draft also reported a `VmRSS`-delta of
+> ~1 567 B/husk and concluded "~685 K nodes for 1 GiB / a 9× overhead". That figure was
+> **wrong**: `examples/cold_count.rs` materializes the *whole* graph (full nodes + their
+> content) before deep-spilling, so the process-RSS delta measures that transient **build
+> peak**, not the husk steady state. The honest per-husk metric is the logical
+> `cold_resident_bytes` (~150–174 B), so the tier reaches 1 GiB at **~6–7 M cold nodes** —
+> still worth bounding for very large / long-lived deployments, but *less* urgent than the
+> peak-inclusive number implied, and comfortably tens of MB for a typical < 100 K-node
+> project.
 
-1. **The actual cost is ~9× the logical.** A husk is logically 174 B, but each one
-   costs ~1.5 KB of real RSS. The gap is **allocation overhead**: every husk is a
-   `BTreeMap` node holding a `DeepHusk` whose `adj: Vec<NodeId>` is a heap `Vec` of
-   heap `String`s — roughly `degree + 2` small allocations per husk, each with its own
-   allocator header, alignment slack and fragmentation. The logical byte count ignores
-   all of that; RSS doesn't.
-2. **It bites earlier than the husk size suggests.** At ~1.5 KB/husk the tier alone
-   reaches 1 GiB at **~685 K cold nodes** — reachable by a large monorepo or a
-   long-running daemon that accumulates history. So the count *is* worth bounding for
-   large/long-lived deployments (though not for a typical < 100 K-node project, which
-   sits at tens of MB).
+The husk's variable part is its resident **adjacency** (neighbour ids) — exactly what
+`cold_neighbours` reads without disk. The fixed part is the `BTreeMap` node + the
+`DeepHusk` stub. Two costs follow: the *bytes* (bounded by the logical figure above) and
+the *allocation count* (each husk previously held a `Vec` + a `String` per id — many tiny
+allocations, which inflate real RSS and fragment a long-running heap even though the
+logical byte count ignores them).
 
 ## Why bounding the count is hard — the `cold_neighbours` tension
 
@@ -56,14 +58,14 @@ explicit decision.
 
 ## Two levers (smallest first)
 
-**Lever 1 — collapse the per-husk allocation overhead (no disk, no DB).** Replace
-`adj: Vec<NodeId>` with a single length-prefixed `Box<[u8]>` of concatenated ids: **one**
-allocation per husk instead of `degree + 1`, and `cold_neighbours` decodes it in place.
-This attacks the measured 9× gap directly — pulling the ~1.5 KB actual toward the 174 B
-logical — and is contained (husk format + `cold_neighbours` + the enforce loop + serde),
-verifiable by the existing hardening/round-trip suites plus a resident-RSS assertion. It
-does **not** bound the count, but it cuts the constant by a large factor, pushing the
-1-GiB threshold from ~685 K toward a few million nodes.
+**Lever 1 — collapse the per-husk allocation overhead (no disk, no DB). ✅ Built.**
+`DeepHusk.adj` is now a single length-prefixed `Box<[u8]>` of concatenated ids
+(`pack_adj` / `unpack_adj`) instead of a `Vec<NodeId>`: **one** allocation per husk
+instead of `degree + 1`, and `cold_neighbours` decodes it in place. A `serde` adapter
+keeps the snapshot a plain array of id strings, so the on-disk form is byte-identical.
+This cuts the logical husk ~16 % (174 → ~146 B) and, more importantly, the *allocation
+count* — the steady-state allocator-overhead and long-running-heap fragmentation the
+build-peak RSS measurement couldn't isolate. It does **not** bound the count.
 
 A stronger variant of Lever 1 is to **intern `NodeId`s** (a shared string table; husks
 hold `u32` handles). That cuts both the per-id `String` allocations *and* the bytes
@@ -76,10 +78,12 @@ cost of the embedded-index machinery and disk-backed `cold_neighbours`.
 
 ## Verdict
 
-The husk **count** is a real `O(N)` that reaches 1 GiB at ~685 K cold nodes — worth
-addressing for very large or long-running deployments, but not urgent for typical
-projects. The **measured-dominant cost is allocation overhead, not algorithmic** — so
-**Lever 1 (pack the adjacency) is the high-return, low-risk next step**, and **Lever 2
-(the on-disk index) is the eventual `O(1)`-resident end state**, to be built only when a
-deployment's scale justifies the database-grade complexity. This document pins the
-design so that build is a decision, not a discovery.
+The husk **count** is a real `O(N)`, but — once the build-peak measurement error is
+corrected — a comfortably slow one: ~150–174 B/husk reaches 1 GiB only at ~6–7 M cold
+nodes, tens of MB for a typical project. **Lever 1 (pack the adjacency) is built**: it
+shrinks the bytes ~16 % and, more importantly, drops the per-husk allocation count to
+one, the steady-state and fragmentation win. **Lever 2 (the on-disk index) remains the
+eventual `O(1)`-resident end state**, to be built only when a deployment's scale
+genuinely justifies the database-grade complexity (disk I/O, cache eviction, symmetric
+adjacency, crash-consistency for `replay == live`). This document pins that design so
+the build is a decision, not a discovery.
