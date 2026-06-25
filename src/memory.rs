@@ -197,6 +197,17 @@ pub struct MemoryGraph {
     /// pre-existing snapshots loadable.
     #[serde(default)]
     cold: BTreeMap<NodeId, ColdNode>,
+    /// The **deep-spilled** COLD entries (slice 5b) — the coldest tail, archived
+    /// whole to disk and represented in RAM only by a compact `DeepHusk` (body-blob
+    /// stub + neighbour ids) instead of a full `ColdNode`. Kept in its own map so
+    /// the common COLD paths (compaction/spill enforcement) never pay for them and
+    /// the husk type stays small. `serde(default)` + elided-when-empty keeps the
+    /// default path byte-identical; populated only once a resident budget is set
+    /// (a runtime knob), so replay/snapshot of the deterministic default is
+    /// untouched. The directory travels alongside and re-attaches on restore, like
+    /// the content-spill stubs.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    cold_deep: BTreeMap<NodeId, DeepHusk>,
     /// Optional on-disk **spill store** for COLD content — the "swap file". A
     /// runtime handle only (`#[serde(skip)]`): a snapshot records the spilled
     /// *stubs* (see [`ColdNode::spill`]), and the directory travels alongside,
@@ -327,26 +338,6 @@ struct ColdNode {
     /// `false` (the default) — byte-identical serialization.
     #[serde(default, skip_serializing_if = "is_false")]
     at_floor: bool,
-    /// When `Some`, this entry has been **deep-spilled** (slice 5): its `label` and
-    /// its archived `edges` have been serialized into a single on-disk blob (keyed
-    /// by SHA-256, like content spill), `node.label` is empty and `edges` is empty,
-    /// and only `adj` — the neighbour *ids* — is kept resident so
-    /// [`cold_neighbours`](MemoryGraph::cold_neighbours) and region paging still work
-    /// without touching disk. The full edge records (weights, types, timestamps) and
-    /// the label fault back in [`page_in`](MemoryGraph::page_in). This is the most
-    /// aggressive, still-lossless COLD tier: it bounds the *resident* metadata the
-    /// measurement found dominates (`docs/MEASUREMENT_cold_ram.md`) by shrinking
-    /// edges to ids rather than dropping or contracting them. Elided from the
-    /// serialized form when `None` (the default) — byte-identical layout.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    deep: Option<SpillRef>,
-    /// The neighbour ids kept resident for a **deep-spilled** entry — the other
-    /// endpoint of each edge archived under this entry, so the cold↔cold adjacency
-    /// survives in RAM (ids only) even though the full edge records are on disk.
-    /// Sorted + deduped (deterministic). Empty (and elided) for a non-deep entry,
-    /// whose adjacency is still read straight from its resident `edges`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    adj: Vec<NodeId>,
 }
 
 /// `skip_serializing_if` predicate: elide a `bool` field when it is `false`.
@@ -354,13 +345,24 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
-/// The body of a **deep-spilled** COLD entry — the `label` and full `edges` moved
-/// to the on-disk store as one blob. Serialized verbatim (lossless) and faulted
-/// back, hash-verified, on [`page_in`](MemoryGraph::page_in).
-#[derive(Debug, Serialize, Deserialize)]
-struct DeepBody {
-    label: String,
-    edges: Vec<GraphEdge>,
+/// A **deep-spilled** COLD entry (slice 5b): the most aggressive, still-lossless
+/// tier. The *entire* `ColdNode` (node, content folded inline, edges, flags) is
+/// serialized into one content-addressed blob, and all that stays resident is this
+/// compact husk — the body-blob stub plus the neighbour **ids** (`adj`), so
+/// [`cold_neighbours`](MemoryGraph::cold_neighbours) and region paging keep working
+/// without touching disk. Replacing the full ~`size_of::<ColdNode>()` struct with
+/// this husk is what bounds the per-entry resident *floor* the measurement flagged
+/// (`docs/MEASUREMENT_cold_ram.md`); the node faults back, hash-verified, on
+/// [`page_in`](MemoryGraph::page_in). Deep husks are **terminal** — already at the
+/// floor, they are not re-scored for further spill/compaction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DeepHusk {
+    /// Stub of the on-disk blob holding the whole serialized `ColdNode`.
+    body: SpillRef,
+    /// Neighbour ids — the other endpoint of each edge the entry carried at
+    /// deep-spill time. Sorted + deduped (deterministic); the only structure kept
+    /// resident, so the cold↔cold adjacency survives without faulting the blob.
+    adj: Vec<NodeId>,
 }
 
 /// Length in bytes of a SHA-256 hex digest (the key/stub of every spilled blob) —
@@ -391,6 +393,7 @@ impl MemoryGraph {
             scoring_weights: ScoringWeights::default(),
             eviction_policy: EvictionPolicy::new(),
             cold: BTreeMap::new(),
+            cold_deep: BTreeMap::new(),
             spill: None,
             cold_content_budget: None,
             cold_resident_budget: None,
@@ -432,17 +435,10 @@ impl MemoryGraph {
 
     pub fn upsert_node(&mut self, id: NodeId, label: String, content: String, node_type: NodeType) {
         let now = self.clock;
-        // A fresh ingest supersedes any demoted (COLD) shadow of this node;
-        // reclaim that shadow's spill blob(s) — content and/or deep-spilled body —
-        // if it was the last referent.
-        if let Some(old) = self.cold.remove(&id) {
-            if let Some(s) = old.spill {
-                self.release_blob_if_orphan(&s.hash);
-            }
-            if let Some(d) = old.deep {
-                self.release_blob_if_orphan(&d.hash);
-            }
-        }
+        // A fresh ingest supersedes any demoted (COLD) shadow of this node — full
+        // entry or deep husk — reclaiming its on-disk blob(s) if it was the last
+        // referent.
+        self.forget_cold_shadow(&id);
         match self.nodes.get_mut(&id) {
             Some(existing) => {
                 existing.label = label;
@@ -507,17 +503,9 @@ impl MemoryGraph {
 
     pub fn remove_node(&mut self, id: &NodeId) {
         self.nodes.remove(id);
-        // Explicit removal forgets the COLD shadow too — and reclaims its spill
-        // blob(s) (content and/or deep-spilled body) if no other cold entry still
-        // references them.
-        if let Some(old) = self.cold.remove(id) {
-            if let Some(s) = old.spill {
-                self.release_blob_if_orphan(&s.hash);
-            }
-            if let Some(d) = old.deep {
-                self.release_blob_if_orphan(&d.hash);
-            }
-        }
+        // Explicit removal forgets the COLD shadow too — full entry or deep husk —
+        // and reclaims its on-disk blob(s) if no other entry still references them.
+        self.forget_cold_shadow(id);
         self.edges.retain(|e| &e.source != id && &e.target != id);
     }
 
@@ -700,8 +688,6 @@ impl MemoryGraph {
                     spill: None,
                     compacted: false,
                     at_floor: false,
-                    deep: None,
-                    adj: Vec::new(),
                 },
             );
         }
@@ -714,9 +700,27 @@ impl MemoryGraph {
     /// whose other endpoint is resident is re-linked. Returns `true` if the node
     /// was cold and is now resident. Deterministic (tie-break on id).
     pub fn page_in(&mut self, id: &NodeId) -> bool {
-        // Fault spilled content back from disk first (verified by hash). A
-        // spilled entry whose blob is missing/tampered, or whose store has been
-        // detached, is a cold-miss — never a silent empty restore.
+        // A deep-spilled entry lives as a compact husk in `cold_deep`: fault its
+        // whole serialized node back (hash-verified) into the full COLD map first,
+        // then the normal page-in path below runs unchanged. A missing / tampered /
+        // undeserializable body is a cold-miss — never a silent half-restore.
+        if self.cold_deep.contains_key(id) {
+            let body_hash = self.cold_deep.get(id).map(|h| h.body.hash.clone());
+            match body_hash
+                .and_then(|h| self.spill.as_ref().and_then(|cfg| cfg.store.get(&h)))
+                .and_then(|s| serde_json::from_str::<ColdNode>(&s).ok())
+            {
+                Some(node) => {
+                    self.cold_deep.remove(id);
+                    self.cold.insert(id.clone(), node);
+                }
+                None => return false,
+            }
+        }
+        // Fault spilled content back from disk (verified by hash). A spilled entry
+        // whose blob is missing/tampered, or whose store has been detached, is a
+        // cold-miss — never a silent empty restore. (A just-restored deep husk has
+        // its content folded inline, so this is a no-op for it.)
         let spilled_hash = self
             .cold
             .get(id)
@@ -727,32 +731,6 @@ impl MemoryGraph {
                     if let Some(entry) = self.cold.get_mut(id) {
                         entry.node.content = text;
                         entry.spill = None;
-                    }
-                }
-                None => return false,
-            }
-        }
-        // Fault the deep-spilled body (label + full edges) back, same hash-verified
-        // contract: a missing/tampered/undeserializable blob is a cold-miss, never a
-        // silent half-restore. Restoring the full edges here lets the re-link below
-        // run identically to a never-deep-spilled entry.
-        let deep_hash = self
-            .cold
-            .get(id)
-            .and_then(|c| c.deep.as_ref().map(|s| s.hash.clone()));
-        if let Some(hash) = deep_hash {
-            match self
-                .spill
-                .as_ref()
-                .and_then(|cfg| cfg.store.get(&hash))
-                .and_then(|s| serde_json::from_str::<DeepBody>(&s).ok())
-            {
-                Some(body) => {
-                    if let Some(entry) = self.cold.get_mut(id) {
-                        entry.node.label = body.label;
-                        entry.edges = body.edges;
-                        entry.adj = Vec::new();
-                        entry.deep = None;
                     }
                 }
                 None => return false,
@@ -803,19 +781,23 @@ impl MemoryGraph {
         true
     }
 
-    /// Number of nodes in the COLD tier (demoted but retrievable via [`page_in`](Self::page_in)).
+    /// Number of nodes in the COLD tier (demoted but retrievable via [`page_in`](Self::page_in)) —
+    /// full entries plus deep-spilled husks.
     pub fn cold_count(&self) -> usize {
-        self.cold.len()
+        self.cold.len() + self.cold_deep.len()
     }
 
-    /// Whether `id` is currently demoted to the COLD tier.
+    /// Whether `id` is currently demoted to the COLD tier (full entry or deep husk).
     pub fn is_cold(&self, id: &NodeId) -> bool {
-        self.cold.contains_key(id)
+        self.cold.contains_key(id) || self.cold_deep.contains_key(id)
     }
 
-    /// The ids currently in the COLD tier, in sorted (deterministic) order.
+    /// The ids currently in the COLD tier, in sorted (deterministic) order — both
+    /// full entries and deep-spilled husks.
     pub fn cold_ids(&self) -> impl Iterator<Item = &NodeId> + '_ {
-        self.cold.keys()
+        let mut ids: Vec<&NodeId> = self.cold.keys().chain(self.cold_deep.keys()).collect();
+        ids.sort();
+        ids.into_iter()
     }
 
     /// The **cold** neighbours of `id` — the other endpoints of any COLD-archived
@@ -839,21 +821,23 @@ impl MemoryGraph {
             } else {
                 return;
             };
-            if other != id && self.cold.contains_key(other) {
+            if other != id && (self.cold.contains_key(other) || self.cold_deep.contains_key(other))
+            {
                 out.insert(other.clone());
             }
         };
+        // Full entries carry their edges resident; read them straight.
         for c in self.cold.values() {
-            if c.deep.is_some() {
-                // Edges are on disk; the resident adjacency stands in for them, each
-                // `o` meaning the undirected edge `c.node.id ── o`.
-                for o in &c.adj {
-                    consider(&c.node.id, o, &mut out);
-                }
-            } else {
-                for e in &c.edges {
-                    consider(&e.source, &e.target, &mut out);
-                }
+            for e in &c.edges {
+                consider(&e.source, &e.target, &mut out);
+            }
+        }
+        // Deep husks keep only neighbour ids — each `o` stands for the undirected
+        // edge `husk-id ── o`, read exactly as a resident edge would be, so region
+        // paging never has to fault a body blob to find the cold neighbourhood.
+        for (hid, h) in &self.cold_deep {
+            for o in &h.adj {
+                consider(hid, o, &mut out);
             }
         }
         out.into_iter().collect()
@@ -928,34 +912,46 @@ impl MemoryGraph {
     /// the node's id/label (and any inline content), the archived edges, and the
     /// spill-hash stub. This is the O(N) footprint slice 5 bounds; a logical
     /// estimate (string lengths + struct sizes, ignoring allocator slack), honest
-    /// for "how much RAM is stuck per cold entry". A **deep-spilled** entry's edges
-    /// and label are on disk, so they no longer count here — only its resident
-    /// neighbour ids (`adj`) and the deep-stub hash do.
+    /// for "how much RAM is stuck per cold entry". A **deep-spilled** entry is just
+    /// a compact `DeepHusk` — body-blob hash + neighbour ids — so it contributes a
+    /// small fraction of a full entry (the whole `ColdNode` struct is gone).
     pub fn cold_resident_bytes(&self) -> usize {
-        self.cold
+        let full: usize = self
+            .cold
             .iter()
             .map(|(k, c)| Self::entry_resident_bytes(k, c))
-            .sum()
+            .sum();
+        let deep: usize = self
+            .cold_deep
+            .iter()
+            .map(|(k, h)| Self::husk_resident_bytes(k, h))
+            .sum();
+        full + deep
     }
 
-    /// Per-entry resident-byte estimate shared by [`cold_resident_bytes`](Self::cold_resident_bytes)
-    /// and the deep-spill enforcer (so the budget loop accounts exactly as the stat
-    /// reports). A deep-spilled entry contributes empty `label`/`edges` (on disk),
-    /// plus its resident `adj` ids and the deep-stub hash.
+    /// Per-entry resident-byte estimate for a full `ColdNode`, shared by
+    /// [`cold_resident_bytes`](Self::cold_resident_bytes) and the deep-spill enforcer
+    /// (so the budget loop accounts exactly as the stat reports).
     fn entry_resident_bytes(key: &NodeId, c: &ColdNode) -> usize {
         let mut b = std::mem::size_of::<ColdNode>() + std::mem::size_of::<NodeId>();
         b += key.0.len() + c.node.id.0.len() + c.node.label.len() + c.node.content.len();
         for e in &c.edges {
             b += std::mem::size_of::<GraphEdge>() + e.source.0.len() + e.target.0.len();
         }
-        for n in &c.adj {
-            b += std::mem::size_of::<NodeId>() + n.0.len();
-        }
         if let Some(s) = &c.spill {
             b += s.hash.len();
         }
-        if let Some(d) = &c.deep {
-            b += d.hash.len();
+        b
+    }
+
+    /// Resident-byte estimate for a compact `DeepHusk`: the `BTreeMap` key, the
+    /// husk struct, the body-blob hash, and the resident neighbour ids. No
+    /// `ColdNode`, label, content or edge records — those live in the body blob.
+    fn husk_resident_bytes(key: &NodeId, h: &DeepHusk) -> usize {
+        let mut b = std::mem::size_of::<DeepHusk>() + std::mem::size_of::<NodeId>();
+        b += key.0.len() + h.body.hash.len();
+        for n in &h.adj {
+            b += std::mem::size_of::<NodeId>() + n.0.len();
         }
         b
     }
@@ -1024,29 +1020,31 @@ impl MemoryGraph {
         self.enforce_cold_resident_budget();
     }
 
-    /// Number of COLD entries whose `label` + `edges` have been deep-spilled to disk.
+    /// Number of COLD entries deep-spilled to disk (archived whole, represented in
+    /// RAM only by a compact `DeepHusk`).
     pub fn cold_deep_spilled_count(&self) -> usize {
-        self.cold.values().filter(|c| c.deep.is_some()).count()
+        self.cold_deep.len()
     }
 
-    /// Whether `id` is a COLD entry that has been deep-spilled (label + edges on
-    /// disk, only neighbour ids resident).
+    /// Whether `id` is a deep-spilled COLD entry (its whole node on disk, only a
+    /// compact husk — body-blob stub + neighbour ids — resident).
     pub fn is_deep_spilled(&self, id: &NodeId) -> bool {
-        self.cold.get(id).is_some_and(|c| c.deep.is_some())
+        self.cold_deep.contains_key(id)
     }
 
     /// Deep-spill the coldest COLD entries until resident COLD metadata
     /// ([`cold_resident_bytes`](Self::cold_resident_bytes)) is within
-    /// [`cold_resident_budget`](Self::cold_resident_budget). For each entry this
-    /// serializes its `label` + full `edges` into one content-addressed blob, keeps
-    /// only the neighbour ids (`adj`) resident, and — so the entry's
-    /// *content* leaves RAM too — spills any still-inline content via the same
-    /// store. Deterministic: coldest-first by causal score, ties on id. **Lossless**:
-    /// everything faults back in [`page_in`](Self::page_in). A no-op without an
+    /// [`cold_resident_budget`](Self::cold_resident_budget). Each chosen entry is
+    /// serialized **whole** (node + content folded inline + edges) into one
+    /// content-addressed blob and replaced in RAM by a compact `DeepHusk` (the
+    /// body-blob stub + the neighbour ids) moved into [`cold_deep`](Self::cold_deep) —
+    /// shedding the full `ColdNode` struct, which is the per-entry resident floor.
+    /// Deterministic: coldest-first by causal score, ties on id. **Lossless**: the
+    /// whole node faults back in [`page_in`](Self::page_in). A no-op without an
     /// attached store or a budget, or when already within it. An entry whose blob
-    /// fails to write is left intact (deep-spill never drops data); the budget is
-    /// approached best-effort, never by dropping a node and never below the
-    /// irreducible stub + neighbour-id floor.
+    /// fails to write (or whose spilled content can't be faulted to fold in) is left
+    /// intact — deep-spill never drops data; the budget is approached best-effort,
+    /// never by dropping a node and never below the compact-husk floor.
     fn enforce_cold_resident_budget(&mut self) {
         let Some(budget) = self.cold_resident_budget else {
             return;
@@ -1058,12 +1056,12 @@ impl MemoryGraph {
         if resident <= budget {
             return;
         }
-        // Coldest-first candidates: not already deep-spilled. Scored up front so the
-        // mutation loop borrows neither the weights nor the map.
+        // Coldest-first candidates from the full COLD map (deep husks already live in
+        // `cold_deep` and are terminal). Scored up front so the mutation loop borrows
+        // neither the weights nor the map.
         let mut candidates: Vec<(NodeId, f64)> = self
             .cold
             .iter()
-            .filter(|(_, c)| c.deep.is_none())
             .map(|(id, c)| (id.clone(), self.compute_node_score(&c.node)))
             .collect();
         candidates.sort_by(|a, b| {
@@ -1075,13 +1073,12 @@ impl MemoryGraph {
             if resident <= budget {
                 break;
             }
-            // Snapshot what the blob needs (clone out before mutating).
             let Some(c) = self.cold.get(&id) else {
                 continue;
             };
             let before = Self::entry_resident_bytes(&id, c);
-            // Neighbour ids = the other endpoint of each archived edge (every edge
-            // here is incident to this node), sorted + deduped, self-loops dropped.
+            // Neighbour ids = the other endpoint of each archived edge (each is
+            // incident to this node), sorted + deduped, self-loops dropped.
             let mut adj: Vec<NodeId> = c
                 .edges
                 .iter()
@@ -1096,76 +1093,64 @@ impl MemoryGraph {
                 .collect();
             adj.sort();
             adj.dedup();
-            let inline_content =
-                (c.spill.is_none() && !c.node.content.is_empty()).then(|| c.node.content.clone());
-            // Only deep-spill when it actually shrinks this entry: the label, full
-            // edges and any still-inline content move out (freed), replaced by the
-            // resident neighbour ids and the on-disk stub hashes (added; a SHA-256
-            // hex is `HASH_HEX_LEN` bytes — one for the body, one if content spills).
-            // A tiny, low-degree entry whose stubs would cost more than they save is
-            // left intact — the resident floor, approached best-effort, never by
-            // dropping a node (mirrors the compaction floor).
-            let edge_bytes: usize = c
-                .edges
-                .iter()
-                .map(|e| std::mem::size_of::<GraphEdge>() + e.source.0.len() + e.target.0.len())
-                .sum();
             let adj_bytes: usize = adj
                 .iter()
                 .map(|n| std::mem::size_of::<NodeId>() + n.0.len())
                 .sum();
-            let freed =
-                c.node.label.len() + edge_bytes + inline_content.as_ref().map_or(0, |t| t.len());
-            let added = adj_bytes
+            // The full `ColdNode` struct is replaced by a compact husk (body stub +
+            // ids), so this almost always shrinks; the guard still parks the rare
+            // entry that wouldn't — the floor, never a drop (mirrors compaction).
+            let projected = std::mem::size_of::<DeepHusk>()
+                + std::mem::size_of::<NodeId>()
                 + HASH_HEX_LEN
-                + if inline_content.is_some() {
-                    HASH_HEX_LEN
-                } else {
-                    0
-                };
-            if freed <= added {
+                + adj_bytes;
+            if projected >= before {
                 continue;
             }
-            let body = DeepBody {
-                label: c.node.label.clone(),
-                edges: c.edges.clone(),
-            };
-            let Ok(serialized) = serde_json::to_string(&body) else {
+            // Fault any spilled content back inline so the body blob is
+            // self-contained (one blob per husk → simple GC); its old content blob is
+            // then orphaned and reclaimed below.
+            let mut entry = c.clone();
+            let old_content_hash = entry.spill.as_ref().map(|s| s.hash.clone());
+            if let Some(hash) = &old_content_hash {
+                match self.spill.as_ref().and_then(|cfg| cfg.store.get(hash)) {
+                    Some(text) => {
+                        entry.node.content = text;
+                        entry.spill = None;
+                    }
+                    None => continue, // content blob missing — leave the entry intact
+                }
+            }
+            // Serialize the whole content-inline node as the body blob.
+            let Ok(serialized) = serde_json::to_string(&entry) else {
                 continue;
             };
-            // Write the structure blob, then the content blob if still inline. Either
-            // failure leaves the whole entry intact (never a partial deep-spill).
             let Some(cfg) = self.spill.as_ref() else {
                 return;
             };
-            let Some(deep_hash) = cfg.store.put(&serialized).ok() else {
+            let Some(body_hash) = cfg.store.put(&serialized).ok() else {
                 continue;
             };
-            let content_ref = match &inline_content {
-                Some(text) => match cfg.store.put(text).ok() {
-                    Some(h) => Some(SpillRef {
-                        hash: h,
-                        len: text.len(),
-                    }),
-                    None => continue,
+            // Commit: swap the full entry for a compact husk in `cold_deep`.
+            self.cold.remove(&id);
+            self.cold_deep.insert(
+                id.clone(),
+                DeepHusk {
+                    body: SpillRef {
+                        hash: body_hash,
+                        len: serialized.len(),
+                    },
+                    adj,
                 },
-                None => None,
-            };
-            if let Some(entry) = self.cold.get_mut(&id) {
-                entry.node.label = String::new();
-                entry.edges = Vec::new();
-                entry.adj = adj;
-                entry.deep = Some(SpillRef {
-                    hash: deep_hash,
-                    len: serialized.len(),
-                });
-                if let Some(sr) = content_ref {
-                    entry.node.content = String::new();
-                    entry.spill = Some(sr);
-                }
-                let after = Self::entry_resident_bytes(&id, entry);
-                resident = resident.saturating_sub(before.saturating_sub(after));
+            );
+            if let Some(hash) = old_content_hash {
+                self.release_blob_if_orphan(&hash);
             }
+            let after = self
+                .cold_deep
+                .get(&id)
+                .map_or(0, |h| Self::husk_resident_bytes(&id, h));
+            resident = resident.saturating_sub(before.saturating_sub(after));
         }
     }
 
@@ -1229,12 +1214,27 @@ impl MemoryGraph {
         let Some(cfg) = self.spill.as_ref() else {
             return;
         };
-        let still_referenced = self.cold.values().any(|c| {
-            c.spill.as_ref().is_some_and(|s| s.hash == hash)
-                || c.deep.as_ref().is_some_and(|s| s.hash == hash)
-        });
-        if !still_referenced {
+        let referenced_by_full = self
+            .cold
+            .values()
+            .any(|c| c.spill.as_ref().is_some_and(|s| s.hash == hash));
+        let referenced_by_husk = self.cold_deep.values().any(|h| h.body.hash == hash);
+        if !referenced_by_full && !referenced_by_husk {
             cfg.store.remove(hash);
+        }
+    }
+
+    /// Drop any COLD shadow of `id` — a full `ColdNode` or a deep `DeepHusk` —
+    /// and reclaim its on-disk blob(s) if no other entry still references them. Used
+    /// when a fresh ingest supersedes the shadow, or on explicit removal.
+    fn forget_cold_shadow(&mut self, id: &NodeId) {
+        if let Some(old) = self.cold.remove(id) {
+            if let Some(s) = old.spill {
+                self.release_blob_if_orphan(&s.hash);
+            }
+        }
+        if let Some(husk) = self.cold_deep.remove(id) {
+            self.release_blob_if_orphan(&husk.body.hash);
         }
     }
 
@@ -2844,19 +2844,20 @@ mod tests {
         g.set_cold_resident_budget(Some(0)); // force deep-spill of every cold entry
         assert!(g.is_deep_spilled(&NodeId("b".into())), "b deep-spilled");
         {
-            let c = g.cold.get(&NodeId("b".into())).unwrap();
+            // The full ColdNode is gone from RAM — only a compact husk remains.
             assert!(
-                c.edges.is_empty() && c.node.label.is_empty(),
-                "label + edges vacated from RAM"
+                !g.cold.contains_key(&NodeId("b".into())),
+                "no full ColdNode kept for a deep entry"
             );
+            let h = g.cold_deep.get(&NodeId("b".into())).unwrap();
             assert_eq!(
-                c.adj,
+                h.adj,
                 vec![NodeId("a".into())],
                 "only the neighbour id kept"
             );
             assert!(
-                c.deep.is_some() && c.spill.is_some(),
-                "body and content both on disk"
+                !h.body.hash.is_empty(),
+                "whole node archived to a body blob"
             );
         }
 
@@ -2884,14 +2885,14 @@ mod tests {
             .map(|s| NodeId(s.to_string()))
             .collect();
         let before: Vec<Vec<NodeId>> = ids.iter().map(|id| g.cold_neighbours(id)).collect();
-        g.set_cold_resident_budget(Some(0)); // drive deep-spill as far as it helps
-                                             // A mix results: entries that hold archived edges deep-spill (adj path);
-                                             // those whose edges live under a neighbour, or that are too small to shrink,
-                                             // stay non-deep (edge path). Both branches must answer identically.
-        assert!(g.cold_deep_spilled_count() > 0, "some entries deep-spilled");
-        assert!(
-            g.cold_deep_spilled_count() < g.cold_count(),
-            "and some stayed non-deep — exercises the mixed adjacency scan"
+        g.set_cold_resident_budget(Some(0)); // deep-spill the whole tier
+                                             // Every entry now lives only as a husk (the compact form beats the full
+                                             // ColdNode for any entry), so cold_neighbours answers purely from resident
+                                             // `adj` ids — and must reproduce the original adjacency exactly.
+        assert_eq!(
+            g.cold_deep_spilled_count(),
+            g.cold_count(),
+            "all entries deep-spilled"
         );
         let after: Vec<Vec<NodeId>> = ids.iter().map(|id| g.cold_neighbours(id)).collect();
         assert_eq!(
@@ -2906,16 +2907,12 @@ mod tests {
         let dir = spill_temp_dir("deep_off");
         let g = cold_region(&dir);
         assert_eq!(g.cold_deep_spilled_count(), 0, "no budget ⇒ no deep-spill");
-        // The new stub fields are absent and elided, so the JSON is byte-identical to
-        // a graph that never knew about deep-spill — and still round-trips.
+        // The deep-husk map is empty and elided, so the JSON is byte-identical to a
+        // graph that never knew about deep-spill — and still round-trips.
         let json = serde_json::to_string(&g).unwrap();
         assert!(
-            !json.contains("\"deep\""),
-            "no deep stub on the default path"
-        );
-        assert!(
-            !json.contains("\"adj\""),
-            "no adjacency stub on the default path"
+            !json.contains("cold_deep"),
+            "no deep-husk map on the default path"
         );
         let _back: MemoryGraph = serde_json::from_str(&json).unwrap();
         std::fs::remove_dir_all(&dir).ok();
@@ -2970,10 +2967,10 @@ mod tests {
     }
 
     #[test]
-    fn deep_spill_skips_entries_it_cannot_shrink() {
-        // `big` (large content) shrinks when deep-spilled; `tiny` (1-byte, no label,
-        // no edges) would only grow — two hash stubs cost more than the byte saved —
-        // so it is left resident at the floor, never dropped.
+    fn deep_spill_compacts_even_a_tiny_isolated_entry() {
+        // The whole point of the compact husk (slice 5b): the husk is smaller than a
+        // full ColdNode struct, so *every* entry shrinks — even a 1-byte, edge-less,
+        // label-less one that slice 5 had to leave at the floor. The floor is gone.
         let dir = spill_temp_dir("deep_floor");
         let mut g = MemoryGraph::new(0.2, 100);
         g.upsert_node(
@@ -2986,16 +2983,22 @@ mod tests {
         g.attach_cold_spill(&dir, usize::MAX).unwrap();
         g.max_in_memory_nodes = 0;
         g.enforce_paging();
+        let before = g.cold_resident_bytes();
         g.set_cold_resident_budget(Some(0));
         assert!(
             g.is_deep_spilled(&NodeId("big".into())),
-            "a large entry shrinks → deep-spilled"
+            "the large entry shrinks"
         );
         assert!(
-            !g.is_deep_spilled(&NodeId("tiny".into())),
-            "a 1-byte isolated entry would only grow → parked at the floor"
+            g.is_deep_spilled(&NodeId("tiny".into())),
+            "and so does the tiny isolated one — no per-entry struct floor any more"
         );
-        assert!(g.is_cold(&NodeId("tiny".into())), "still cold, not dropped");
+        assert!(
+            g.cold_resident_bytes() < before,
+            "resident dropped ({} → {})",
+            before,
+            g.cold_resident_bytes()
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3027,15 +3030,7 @@ mod tests {
         let mut g = cold_region(&dir);
         g.set_cold_resident_budget(Some(0));
         let bid = NodeId("b".into());
-        let body_hash = g
-            .cold
-            .get(&bid)
-            .unwrap()
-            .deep
-            .as_ref()
-            .unwrap()
-            .hash
-            .clone();
+        let body_hash = g.cold_deep.get(&bid).unwrap().body.hash.clone();
         // Delete the on-disk body blob: page_in must refuse — no silent half-restore.
         std::fs::remove_file(dir.join(&body_hash)).unwrap();
         g.max_in_memory_nodes = 100;
