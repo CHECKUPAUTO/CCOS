@@ -780,7 +780,12 @@ impl CcosMemory {
         #[cfg(not(feature = "learned-embed"))]
         store.fit_and_embed(pairs);
         #[cfg(feature = "learned-embed")]
-        store.fit_and_embed_lsa(pairs, 48);
+        // Rank 16, chosen by measurement (`examples/embed_ranking.rs`): a low
+        // truncation is what gives the latent space its synonym-smoothing — rank 48
+        // showed no benefit (recall@10 10% = TF-IDF), rank 16 recovered synonyms
+        // (recall@10 80%). LSA's win is in *ranking* (recall@k≥5), not entry
+        // selection (recall@1 stays 0%); see docs/MEASUREMENT_recall.md.
+        store.fit_and_embed_lsa(pairs, 16);
         *self.embed_cache.borrow_mut() = Some((self.version, store.clone()));
         store
     }
