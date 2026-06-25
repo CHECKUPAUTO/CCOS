@@ -3,7 +3,7 @@ use crate::eviction_policy::{
     bucket_pressure, bucket_recency, bucket_score, bucket_size, EvictionPolicy, PagingState, EVICT,
     KEEP,
 };
-use crate::util::sha256_hex;
+use crate::util::{hex32, sha256_bytes};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::cmp::Ordering;
@@ -304,11 +304,12 @@ impl ColdSpill {
         Ok(Self { dir })
     }
 
-    /// Write `content` addressed by its SHA-256, returning the hex key. Idempotent
-    /// — content-addressed, so re-spilling the same blob is a no-op write.
-    fn put(&self, content: &str) -> std::io::Result<String> {
-        let hash = sha256_hex(content);
-        let path = self.dir.join(&hash);
+    /// Write `content` addressed by its SHA-256, returning the raw 32-byte key. The
+    /// on-disk filename is its [`hex32`]. Idempotent — content-addressed, so
+    /// re-spilling the same blob is a no-op write.
+    fn put(&self, content: &str) -> std::io::Result<[u8; 32]> {
+        let hash = sha256_bytes(content);
+        let path = self.dir.join(hex32(&hash));
         if !path.exists() {
             std::fs::write(&path, content.as_bytes())?;
         }
@@ -318,17 +319,17 @@ impl ColdSpill {
     /// Read a blob by hash, **verifying** integrity. `None` if the file is
     /// missing, not valid UTF-8, or its content no longer hashes to `hash`
     /// (tampered/corrupt) — all surfaced as a cold-miss by the caller.
-    fn get(&self, hash: &str) -> Option<String> {
-        let bytes = std::fs::read(self.dir.join(hash)).ok()?;
+    fn get(&self, hash: &[u8; 32]) -> Option<String> {
+        let bytes = std::fs::read(self.dir.join(hex32(hash))).ok()?;
         let text = String::from_utf8(bytes).ok()?;
-        (sha256_hex(&text) == hash).then_some(text)
+        (sha256_bytes(&text) == *hash).then_some(text)
     }
 
     /// Delete a blob by hash (best-effort; a missing file is fine). Used to
     /// reclaim a spilled original once no COLD entry references it any more — the
     /// content-addressed store's garbage collection.
-    fn remove(&self, hash: &str) {
-        let _ = std::fs::remove_file(self.dir.join(hash));
+    fn remove(&self, hash: &[u8; 32]) {
+        let _ = std::fs::remove_file(self.dir.join(hex32(hash)));
     }
 }
 
@@ -390,18 +391,34 @@ struct DeepHusk {
     adj: Vec<NodeId>,
 }
 
-/// Length in bytes of a SHA-256 hex digest (the key/stub of every spilled blob) —
-/// what a resident stub costs in place of the data it replaced.
-const HASH_HEX_LEN: usize = 64;
+/// (De)serialize a 32-byte content hash as its lowercase-hex string, so the stub
+/// keeps its compact in-RAM form (a raw `[u8; 32]` — no heap allocation) while the
+/// *serialized* snapshot stays the same readable, canonical hex it always was.
+mod hex_hash {
+    use crate::util::{from_hex32, hex32};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(h: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&hex32(h))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
+        let s = String::deserialize(d)?;
+        from_hex32(&s).ok_or_else(|| serde::de::Error::custom("invalid 32-byte hex hash"))
+    }
+}
 
 /// A stub left in RAM after a COLD node's content is flushed to the on-disk spill
 /// store: enough to fault it back (the hash key + integrity check) and to account
-/// for its disk footprint (the original length) without touching the disk.
+/// for its disk footprint (the original length) without touching the disk. The hash
+/// is held raw (`[u8; 32]`, no heap) — its on-disk filename and serialized form are
+/// the hex of it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SpillRef {
-    /// SHA-256 hex of the vacated content — the on-disk key *and* the read-time
-    /// integrity check.
-    hash: String,
+    /// Raw SHA-256 of the vacated content — the on-disk key (as [`hex32`]) *and* the
+    /// read-time integrity check.
+    #[serde(with = "hex_hash")]
+    hash: [u8; 32],
     /// Byte length of the original content (so budget/stat math need not fault
     /// the blob back in).
     len: usize,
@@ -731,7 +748,7 @@ impl MemoryGraph {
         // undeserializable body is a cold-miss — never a silent half-restore.
         if self.cold_deep.contains_key(id) {
             let body_hash = match self.cold_deep.get(id) {
-                Some(h) => h.body.hash.clone(),
+                Some(h) => h.body.hash,
                 None => return false,
             };
             match self
@@ -759,7 +776,7 @@ impl MemoryGraph {
         let spilled_hash = self
             .cold
             .get(id)
-            .and_then(|c| c.spill.as_ref().map(|s| s.hash.clone()));
+            .and_then(|c| c.spill.as_ref().map(|s| s.hash));
         if let Some(hash) = spilled_hash {
             match self.spill.as_ref().and_then(|cfg| cfg.store.get(&hash)) {
                 Some(text) => {
@@ -972,23 +989,23 @@ impl MemoryGraph {
     /// [`cold_resident_bytes`](Self::cold_resident_bytes) and the deep-spill enforcer
     /// (so the budget loop accounts exactly as the stat reports).
     fn entry_resident_bytes(key: &NodeId, c: &ColdNode) -> usize {
+        // The spill stub's hash is a raw `[u8; 32]` inline in `size_of::<ColdNode>()`
+        // (no heap), so it needs no separate term — only the variable-length strings
+        // and archived edges do.
         let mut b = std::mem::size_of::<ColdNode>() + std::mem::size_of::<NodeId>();
         b += key.0.len() + c.node.id.0.len() + c.node.label.len() + c.node.content.len();
         for e in &c.edges {
             b += std::mem::size_of::<GraphEdge>() + e.source.0.len() + e.target.0.len();
         }
-        if let Some(s) = &c.spill {
-            b += s.hash.len();
-        }
         b
     }
 
     /// Resident-byte estimate for a compact `DeepHusk`: the `BTreeMap` key, the
-    /// husk struct, the body-blob hash, and the resident neighbour ids. No
+    /// husk struct (body-blob hash inline) and the resident neighbour ids. No
     /// `ColdNode`, label, content or edge records — those live in the body blob.
     fn husk_resident_bytes(key: &NodeId, h: &DeepHusk) -> usize {
         let mut b = std::mem::size_of::<DeepHusk>() + std::mem::size_of::<NodeId>();
-        b += key.0.len() + h.body.hash.len();
+        b += key.0.len();
         for n in &h.adj {
             b += std::mem::size_of::<NodeId>() + n.0.len();
         }
@@ -1138,11 +1155,10 @@ impl MemoryGraph {
                 .sum();
             // The full `ColdNode` struct is replaced by a compact husk (body stub +
             // ids), so this almost always shrinks; the guard still parks the rare
-            // entry that wouldn't — the floor, never a drop (mirrors compaction).
-            let projected = std::mem::size_of::<DeepHusk>()
-                + std::mem::size_of::<NodeId>()
-                + HASH_HEX_LEN
-                + adj_bytes;
+            // entry that wouldn't — the floor, never a drop (mirrors compaction). The
+            // body hash is inline in `size_of::<DeepHusk>()` (a raw `[u8; 32]`).
+            let projected =
+                std::mem::size_of::<DeepHusk>() + std::mem::size_of::<NodeId>() + adj_bytes;
             if projected >= before {
                 continue;
             }
@@ -1150,7 +1166,7 @@ impl MemoryGraph {
             // self-contained (one blob per husk → simple GC); its old content blob is
             // then orphaned and reclaimed below.
             let mut entry = c.clone();
-            let old_content_hash = entry.spill.as_ref().map(|s| s.hash.clone());
+            let old_content_hash = entry.spill.as_ref().map(|s| s.hash);
             if let Some(hash) = &old_content_hash {
                 match self.spill.as_ref().and_then(|cfg| cfg.store.get(hash)) {
                     Some(text) => {
@@ -1249,15 +1265,15 @@ impl MemoryGraph {
     /// the file is deleted only once its last referent is gone. A no-op without an
     /// attached store. This is the GC that keeps the spill store from leaking
     /// orphaned blobs when a spilled node is re-ingested, removed, or compacted.
-    fn release_blob_if_orphan(&self, hash: &str) {
+    fn release_blob_if_orphan(&self, hash: &[u8; 32]) {
         let Some(cfg) = self.spill.as_ref() else {
             return;
         };
         let referenced_by_full = self
             .cold
             .values()
-            .any(|c| c.spill.as_ref().is_some_and(|s| s.hash == hash));
-        let referenced_by_husk = self.cold_deep.values().any(|h| h.body.hash == hash);
+            .any(|c| c.spill.as_ref().is_some_and(|s| s.hash == *hash));
+        let referenced_by_husk = self.cold_deep.values().any(|h| h.body.hash == *hash);
         if !referenced_by_full && !referenced_by_husk {
             cfg.store.remove(hash);
         }
@@ -1310,7 +1326,7 @@ impl MemoryGraph {
                     match &c.spill {
                         Some(s) => match self.spill.as_ref().and_then(|cfg| cfg.store.get(&s.hash))
                         {
-                            Some(text) => (text, kind, s.len, Some(s.hash.clone())),
+                            Some(text) => (text, kind, s.len, Some(s.hash)),
                             None => continue, // store detached / blob gone — leave it
                         },
                         None => (c.node.content.clone(), kind, c.node.content.len(), None),
@@ -2895,8 +2911,8 @@ mod tests {
                 "only the neighbour id kept"
             );
             assert!(
-                !h.body.hash.is_empty(),
-                "whole node archived to a body blob"
+                h.body.len > 0,
+                "whole node archived to a non-empty body blob"
             );
         }
 
@@ -3069,9 +3085,10 @@ mod tests {
         let mut g = cold_region(&dir);
         g.set_cold_resident_budget(Some(0));
         let bid = NodeId("b".into());
-        let body_hash = g.cold_deep.get(&bid).unwrap().body.hash.clone();
-        // Delete the on-disk body blob: page_in must refuse — no silent half-restore.
-        std::fs::remove_file(dir.join(&body_hash)).unwrap();
+        let body_hash = g.cold_deep.get(&bid).unwrap().body.hash;
+        // Delete the on-disk body blob (its filename is the hex of the hash): page_in
+        // must refuse — no silent half-restore.
+        std::fs::remove_file(dir.join(hex32(&body_hash))).unwrap();
         g.max_in_memory_nodes = 100;
         assert!(!g.page_in(&bid), "missing deep body ⇒ cold-miss");
         assert!(g.is_cold(&bid), "node stays cold, not half-restored");
