@@ -19,6 +19,28 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `CCOS_W_CENTRALITY` overrides it, and the log-tuner
   (`AgentSession::tune_recall_weights`) now learns it too (absolute candidates, since
   a multiplicative move can't escape 0). Deterministic.
+- **COLD-tier deep-spill — bound the per-entry *resident* metadata, losslessly**
+  (slices 5 & 5b; measure-then-fix, see `docs/MEASUREMENT_cold_ram.md`, reproduce with
+  `examples/cold_ram.rs`). A measurement first showed slice 3 left the COLD tier's
+  dominant RAM cost as per-entry **metadata** — ~2.8× the spilled content, ~60% of it
+  edges — and that lossy edge-contraction is the *wrong* lever (it inflates that edge
+  cost on hubs). So `set_cold_resident_budget(Some(b))` drives resident COLD metadata
+  toward `b` by **deep-spilling** the coldest entries: each is archived *whole* to the
+  content-addressed store and represented in RAM only by a compact `DeepHusk`
+  (body-blob stub + the neighbour **ids** that `cold_neighbours`/region paging need),
+  held in a separate `cold_deep` map. Because the husk is far smaller than a full
+  `ColdNode`, *every* entry shrinks when spilled and the budget is actually reached —
+  resident COLD metadata **halves (−50%)** on the 120K-node fixture (slice 5's
+  full-husk first cut had stalled at ~11% against the `size_of::<ColdNode>()` floor).
+  **Lossless** (the node faults back, hash-verified, on `page_in`; a missing/tampered
+  body is a cold-miss, never a half-restore), **deterministic** (coldest-first), and
+  **off by default** (`cold_deep` is `serde`-elided when empty and the budget is a
+  runtime knob ⇒ byte-identical default snapshot/replay). Deep husks are *terminal*
+  (excluded from further spill/compaction). Shrinks edges to ids — never adds bridge
+  edges — so hubs get cheaper, not the O(degree²) blow-up contraction would cause.
+  Observable via `cold_deep_spilled_count` / `is_deep_spilled`. **Honest scope:** this
+  bounds the per-entry resident *size*; bounding the entry *count* (an on-disk husk
+  index) remains future work.
 
 ### Performance
 

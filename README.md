@@ -104,7 +104,14 @@ measurements behind the numbers above are in
   back transparently. And at the deepest tier, opt in to `set_cold_content_budget(bytes)`:
   once the backing store itself must stay frugal, the coldest content is **compacted** —
   code skeletonised, prose summarised — to a causal summary (lossy, but **observable** via
-  `cold_compacted`, **never silently dropped**). The cognitive-MMU promise made literal —
+  `cold_compacted`, **never silently dropped**). And once even the per-entry *metadata*
+  must shrink — measured to be the COLD tier's dominant *resident* cost, ~2.8× the spilled
+  content — opt in to `set_cold_resident_budget(bytes)`: the coldest entries are
+  **deep-spilled**, archived whole to the same store and kept in RAM as a compact husk (a
+  stub plus the neighbour ids paging needs), so the COLD tier's *resident* footprint is
+  bounded too, not just its content — losslessly (faults back hash-verified on `page_in`),
+  and by shrinking edges to ids rather than the bridge-edge blow-up a lossy contraction
+  would inflict on hubs. The cognitive-MMU promise made literal —
   "infinite" working memory as a *direction*, expressed concretely as **frugality × available
   RAM** (`MemoryStats.cold` / `cold_spilled` / `cold_compacted` surface the tier).
   Deterministic; lossless and off by default — spill and compaction are opt-in modes.
