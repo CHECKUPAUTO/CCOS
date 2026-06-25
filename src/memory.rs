@@ -705,14 +705,24 @@ impl MemoryGraph {
         // then the normal page-in path below runs unchanged. A missing / tampered /
         // undeserializable body is a cold-miss — never a silent half-restore.
         if self.cold_deep.contains_key(id) {
-            let body_hash = self.cold_deep.get(id).map(|h| h.body.hash.clone());
-            match body_hash
-                .and_then(|h| self.spill.as_ref().and_then(|cfg| cfg.store.get(&h)))
+            let body_hash = match self.cold_deep.get(id) {
+                Some(h) => h.body.hash.clone(),
+                None => return false,
+            };
+            match self
+                .spill
+                .as_ref()
+                .and_then(|cfg| cfg.store.get(&body_hash))
                 .and_then(|s| serde_json::from_str::<ColdNode>(&s).ok())
             {
                 Some(node) => {
                     self.cold_deep.remove(id);
                     self.cold.insert(id.clone(), node);
+                    // The husk's body blob is now unreferenced — the node is back with
+                    // its content folded inline — so reclaim it unless another husk
+                    // still shares it. (Without this, page-in orphans the blob: a slow
+                    // disk leak no later `remove` can find.)
+                    self.release_blob_if_orphan(&body_hash);
                 }
                 None => return false,
             }
@@ -732,6 +742,10 @@ impl MemoryGraph {
                         entry.node.content = text;
                         entry.spill = None;
                     }
+                    // The content blob is now unreferenced by this entry; reclaim it
+                    // unless another cold entry shares it — same anti-leak as the deep
+                    // path above.
+                    self.release_blob_if_orphan(&hash);
                 }
                 None => return false,
             }
