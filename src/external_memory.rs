@@ -346,6 +346,13 @@ pub struct CcosMemory {
     /// re-fit TF-IDF (and, under `learned-embed`, re-run the LSA eigensolve) over
     /// all nodes on every semantic/hybrid recall.
     embed_cache: RefCell<Option<(u64, crate::embeddings::CausalEmbeddings)>>,
+    /// Optional **LSA re-ranking** rank for query recalls (`Semantic`/`Hybrid`).
+    /// `Some(r)` re-orders the recalled region by latent-semantic (rank-`r` LSA)
+    /// similarity to the query — the *ranking* stage where LSA earns its keep
+    /// (`docs/MEASUREMENT_recall.md`: recall@k≥5 for synonyms), as opposed to entry
+    /// selection where it does not. `None` (default) ⇒ off; a runtime knob, so it
+    /// never touches the deterministic graph state (recall is read-only).
+    lsa_rerank_rank: Option<usize>,
 }
 
 impl Default for CcosMemory {
@@ -367,6 +374,7 @@ impl CcosMemory {
             version: 0,
             region_cache: RefCell::new(None),
             embed_cache: RefCell::new(None),
+            lsa_rerank_rank: None,
         }
     }
 
@@ -422,6 +430,7 @@ impl CcosMemory {
             version: 0,
             region_cache: RefCell::new(None),
             embed_cache: RefCell::new(None),
+            lsa_rerank_rank: None,
         })
     }
 
@@ -949,17 +958,73 @@ impl CcosMemory {
         dist
     }
 
+    /// Enable (`Some(rank)`) or disable (`None`) LSA re-ranking of query recalls
+    /// (`Semantic`/`Hybrid`): re-order the recalled region by latent-semantic
+    /// (rank-`rank`) similarity to the query — the *ranking* stage where LSA earns its
+    /// keep (`docs/MEASUREMENT_recall.md`), not entry selection. Opt-in (default off),
+    /// a runtime knob that never touches the deterministic graph state.
+    pub fn set_lsa_rerank(&mut self, rank: Option<usize>) {
+        self.lsa_rerank_rank = rank;
+    }
+
+    /// LSA re-ranking signal for `region_ids`: cosine similarity of each region node
+    /// to `query` in a rank-`rank` latent-semantic space fitted on the whole corpus.
+    /// Deterministic (the corpus is taken in id-sorted order and the LSA eigensolve
+    /// is deterministic), so a recall stays replayable. Empty on an empty graph.
+    fn lsa_region_scores(
+        &self,
+        query: &str,
+        region_ids: &[NodeId],
+        rank: usize,
+    ) -> HashMap<NodeId, f64> {
+        use crate::embeddings::{tokenize, TfidfEmbedder};
+        let mut corpus: Vec<(String, String)> = self
+            .graph
+            .nodes
+            .values()
+            .map(|n| (n.id.0.clone(), format!("{} {}", n.label, n.content)))
+            .collect();
+        corpus.sort_by(|a, b| a.0.cmp(&b.0));
+        if corpus.is_empty() {
+            return HashMap::new();
+        }
+        let mut embedder = TfidfEmbedder::new(128);
+        let tokenized: Vec<Vec<String>> = corpus.iter().map(|(_, t)| tokenize(t)).collect();
+        embedder.fit(&tokenized);
+        let rows: Vec<Vec<f32>> = corpus.iter().map(|(_, t)| embedder.embed_str(t)).collect();
+        let projection = crate::lsa::lsa_projection(&rows, rank);
+        if projection.is_empty() {
+            return HashMap::new();
+        }
+        let q_proj = crate::lsa::project(&embedder.embed_str(query), &projection);
+        region_ids
+            .iter()
+            .filter_map(|id| {
+                let n = self.graph.nodes.get(id)?;
+                let v = embedder.embed_str(&format!("{} {}", n.label, n.content));
+                let p = crate::lsa::project(&v, &projection);
+                Some((id.clone(), TfidfEmbedder::cosine(&p, &q_proj)))
+            })
+            .collect()
+    }
+
     /// Score, order (by `(score, uri)`), and budget-truncate a set of nodes. When
     /// `proximity` is `Some((dist, decay, max_hops))`, each node's score is scaled
     /// by `decay^hops_from_anchor` so near neighbours outrank distant ones — the
     /// locality term `around`/`task` need in a densely-connected repo (where the
     /// causal region is nearly the whole graph; see `FIELD_CAMPAIGN_H.md` #3).
+    ///
+    /// When `lsa` is `Some(map)`, each node's score is additionally boosted by its
+    /// latent-semantic similarity to the query — the re-ranking stage (recall@k) LSA
+    /// is good at; `1 + w·max(0, sim)` so it only ever promotes, never demotes below
+    /// the causal baseline.
     fn assemble_window(
         &self,
         strategy: &str,
         ids: Vec<NodeId>,
         budget: usize,
         proximity: Option<(&HashMap<NodeId, u32>, f64, u32)>,
+        lsa: Option<&HashMap<NodeId, f64>>,
     ) -> RecallWindow {
         let mut seen = BTreeSet::new();
         let mut scored: Vec<RecallItem> = Vec::new();
@@ -980,6 +1045,10 @@ impl CcosMemory {
                 if let Some((dist, decay, max_hops)) = proximity {
                     let hops = dist.get(&id).copied().unwrap_or(max_hops + 1);
                     score *= decay.powi(hops as i32);
+                }
+                if let Some(sim) = lsa.and_then(|m| m.get(&id)) {
+                    // Promote query-similar nodes (the re-ranking stage); never demote.
+                    score *= 1.0 + RECALL_LSA_WEIGHT * sim.max(0.0);
                 }
                 scored.push(RecallItem {
                     uri: id.0.clone(),
@@ -1059,6 +1128,10 @@ fn recall_file_cap() -> f64 {
         .filter(|x| x.is_finite() && *x > 0.0 && *x <= 1.0)
         .unwrap_or(0.40)
 }
+
+/// Weight of the LSA re-ranking boost: a region node's score is multiplied by
+/// `1 + RECALL_LSA_WEIGHT · max(0, cosine_sim)` when re-ranking is enabled.
+const RECALL_LSA_WEIGHT: f64 = 3.0;
 
 /// Hop radius for anchor-proximity weighting. Default 6; override with
 /// `CCOS_PROXIMITY_HOPS` (at least 1).
@@ -1187,7 +1260,7 @@ impl ExternalMemory for CcosMemory {
                     .into_iter()
                     .map(|(id, _)| id)
                     .collect();
-                self.assemble_window("working-set", ids, budget_tokens, None)
+                self.assemble_window("working-set", ids, budget_tokens, None, None)
             }
             Recall::Around(uri) => {
                 let anchor = NodeId(normalize(uri));
@@ -1195,7 +1268,7 @@ impl ExternalMemory for CcosMemory {
                 let hops = proximity_hops();
                 let dist = self.hop_distances(&anchor, hops);
                 let prox = (&dist, proximity_decay(), hops);
-                self.assemble_window("region", ids, budget_tokens, Some(prox))
+                self.assemble_window("region", ids, budget_tokens, Some(prox), None)
             }
             Recall::Task(text) => match self.lexical_entry(text) {
                 Some(entry) => {
@@ -1204,9 +1277,9 @@ impl ExternalMemory for CcosMemory {
                     let hops = proximity_hops();
                     let dist = self.hop_distances(&anchor, hops);
                     let prox = (&dist, proximity_decay(), hops);
-                    self.assemble_window("task-region", ids, budget_tokens, Some(prox))
+                    self.assemble_window("task-region", ids, budget_tokens, Some(prox), None)
                 }
-                None => self.assemble_window("task-region", Vec::new(), budget_tokens, None),
+                None => self.assemble_window("task-region", Vec::new(), budget_tokens, None, None),
             },
             Recall::Semantic(text) => {
                 // Build the INT4 TF-IDF store on the fly (deterministic; the same
@@ -1217,14 +1290,27 @@ impl ExternalMemory for CcosMemory {
                     Some(entry) => {
                         let anchor = NodeId(normalize(&entry));
                         let ids = self.region_member_ids(&entry);
+                        let lsa = self
+                            .lsa_rerank_rank
+                            .map(|r| self.lsa_region_scores(text, &ids, r));
                         let hops = proximity_hops();
                         let dist = self.hop_distances(&anchor, hops);
                         let prox = (&dist, proximity_decay(), hops);
-                        self.assemble_window("semantic-region", ids, budget_tokens, Some(prox))
+                        self.assemble_window(
+                            "semantic-region",
+                            ids,
+                            budget_tokens,
+                            Some(prox),
+                            lsa.as_ref(),
+                        )
                     }
-                    None => {
-                        self.assemble_window("semantic-region", Vec::new(), budget_tokens, None)
-                    }
+                    None => self.assemble_window(
+                        "semantic-region",
+                        Vec::new(),
+                        budget_tokens,
+                        None,
+                        None,
+                    ),
                 }
             }
             Recall::Hybrid(text) => {
@@ -1233,12 +1319,23 @@ impl ExternalMemory for CcosMemory {
                     Some(entry) => {
                         let anchor = NodeId(normalize(&entry));
                         let ids = self.region_member_ids(&entry);
+                        let lsa = self
+                            .lsa_rerank_rank
+                            .map(|r| self.lsa_region_scores(text, &ids, r));
                         let hops = proximity_hops();
                         let dist = self.hop_distances(&anchor, hops);
                         let prox = (&dist, proximity_decay(), hops);
-                        self.assemble_window("hybrid-region", ids, budget_tokens, Some(prox))
+                        self.assemble_window(
+                            "hybrid-region",
+                            ids,
+                            budget_tokens,
+                            Some(prox),
+                            lsa.as_ref(),
+                        )
                     }
-                    None => self.assemble_window("hybrid-region", Vec::new(), budget_tokens, None),
+                    None => {
+                        self.assemble_window("hybrid-region", Vec::new(), budget_tokens, None, None)
+                    }
                 }
             }
         }
@@ -1709,6 +1806,43 @@ mod tests {
             win.items.iter().any(|i| i.uri.contains("db.rs")),
             "hybrid window includes the topic file: {:?}",
             win.items.iter().map(|i| &i.uri).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn lsa_rerank_is_deterministic_and_opt_in() {
+        let mut mem = CcosMemory::new();
+        mem.ingest_source(
+            "src/api.rs",
+            "use crate::db;\nuse crate::cache;\nuse crate::auth;\npub fn handler() {}\n",
+        );
+        mem.ingest_source(
+            "src/db.rs",
+            "pub fn connection_pool_acquire() -> u32 { 30 }\n",
+        );
+        mem.ingest_source("src/cache.rs", "pub fn evict_lru_entry() {}\n");
+        mem.ingest_source("src/auth.rs", "pub fn verify_session_token() {}\n");
+
+        let q = Recall::semantic("connection pool acquire");
+        let uris = |w: &RecallWindow| w.items.iter().map(|i| i.uri.clone()).collect::<Vec<_>>();
+
+        // Off by default → a normal window.
+        let base = mem.recall(&q, 2048);
+        assert!(!base.items.is_empty());
+
+        // On → deterministic across calls, still a valid window.
+        mem.set_lsa_rerank(Some(16));
+        let a = mem.recall(&q, 2048);
+        let b = mem.recall(&q, 2048);
+        assert_eq!(uris(&a), uris(&b), "LSA re-ranking is deterministic");
+        assert!(!a.items.is_empty(), "re-ranked window is non-empty");
+
+        // Back off → identical to the baseline: the knob never leaks state.
+        mem.set_lsa_rerank(None);
+        assert_eq!(
+            uris(&base),
+            uris(&mem.recall(&q, 2048)),
+            "disabling re-ranking restores the baseline exactly"
         );
     }
 
