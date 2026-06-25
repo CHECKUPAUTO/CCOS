@@ -247,6 +247,16 @@ pub struct MemoryGraph {
     /// deep tier, byte-identical to a graph that never knew about it.
     #[serde(skip)]
     husk_store: Option<HuskStore>,
+    /// Lever 2 brick 8: an on-disk **reverse-adjacency index** of the COLD tier —
+    /// for every archived cold edge `a─b`, the keys `"a\x1fb"` and `"b\x1fa"`. Lets
+    /// [`cold_neighbours`](Self::cold_neighbours) answer with one prefix scan
+    /// (`O(degree)`) instead of deserializing the whole deep tier (`O(N)`). Maintained
+    /// at demote (add) and page-in / removal (drop), opened in a sibling `<dir>.radj`
+    /// directory, runtime-only (`#[serde(skip)]`) and backfilled from the current cold
+    /// tier on attach. `None` ⇒ no spill attached, and `cold_neighbours` falls back to
+    /// the resident edge scan (there is no deep tier then).
+    #[serde(skip)]
+    radj: Option<HuskStore>,
     /// Optional **compaction budget** for the COLD tier (slice 4). When `Some(b)`,
     /// total COLD *content* (inline + spilled) is kept toward `b` bytes by
     /// **lossily compacting** the coldest entries — code is skeletonised, prose
@@ -499,6 +509,7 @@ impl MemoryGraph {
             cold: BTreeMap::new(),
             spill: None,
             husk_store: None,
+            radj: None,
             cold_content_budget: None,
             cold_resident_budget: None,
             indegree_cache: RefCell::new(None),
@@ -784,6 +795,18 @@ impl MemoryGraph {
                 .cloned()
                 .collect();
             self.edges.retain(|e| &e.source != id && &e.target != id);
+            // The other endpoint of each archived edge — recorded in the reverse index
+            // (brick 8) so cold_neighbours is O(degree), not an O(N) tier scan.
+            let others: Vec<NodeId> = incident
+                .iter()
+                .map(|e| {
+                    if &e.source == id {
+                        e.target.clone()
+                    } else {
+                        e.source.clone()
+                    }
+                })
+                .collect();
             self.cold.insert(
                 id.clone(),
                 ColdNode {
@@ -794,6 +817,9 @@ impl MemoryGraph {
                     at_floor: false,
                 },
             );
+            for other in others {
+                self.radj_add_edge(id, &other);
+            }
         }
     }
 
@@ -855,6 +881,18 @@ impl MemoryGraph {
         let Some(mut cold) = self.cold.remove(id) else {
             return false;
         };
+        // The node leaves the cold tier, so drop its reverse-adjacency entries.
+        let others: Vec<NodeId> = cold
+            .edges
+            .iter()
+            .map(|e| {
+                if &e.source == id {
+                    e.target.clone()
+                } else {
+                    e.source.clone()
+                }
+            })
+            .collect();
         cold.node.recency = 1.0;
         cold.node.last_accessed = self.clock;
         cold.node.access_count = cold.node.access_count.saturating_add(1);
@@ -868,6 +906,9 @@ impl MemoryGraph {
             {
                 self.edges.push(e);
             }
+        }
+        for other in others {
+            self.radj_del_edge(id, &other);
         }
         // Swap: while over capacity, demote the lowest-scored node *other* than
         // the one just paged in (deterministic tie-break on id).
@@ -935,45 +976,39 @@ impl MemoryGraph {
     }
 
     /// The **cold** neighbours of `id` — the other endpoints of any COLD-archived
-    /// edge incident to `id` that are themselves cold, i.e. the rest of `id`'s
-    /// causal region that would page in alongside it. Scans all COLD entries (an
-    /// edge is archived with whichever endpoint was demoted first, so a single
-    /// entry is not enough for a symmetric answer). Sorted (deterministic).
+    /// edge incident to `id` that are themselves cold, i.e. the rest of `id`'s causal
+    /// region that would page in alongside it. Sorted (deterministic).
     ///
-    /// A **deep-spilled** entry's full edges are on disk, but its resident
-    /// neighbour ids (`adj`) carry the same undirected adjacency: each
-    /// id `o` there stands for the edge `entry ── o`, so it is read exactly like a
-    /// resident edge would be — region paging never has to touch disk to find the
-    /// cold neighbourhood.
+    /// With the reverse-adjacency index attached (Lever 2 brick 8), a single keyed
+    /// prefix scan gives every cold edge incident to `id` in both directions —
+    /// `O(degree)`, no deep-tier scan. Without a spill store there is no deep tier, so
+    /// it falls back to reading the resident cold-full entries' edges directly.
     pub fn cold_neighbours(&self, id: &NodeId) -> Vec<NodeId> {
-        // Snapshot the deep-spilled ids once (resident set) so the membership test
-        // below is O(1), not a disk lookup per edge. Lever 2 brick 6: the husks
-        // themselves come from the on-disk index via a full scan.
-        let deep_keys: BTreeSet<NodeId> = self.deep_live_keys().into_iter().collect();
         let mut out: BTreeSet<NodeId> = BTreeSet::new();
-        let consider = |a: &NodeId, b: &NodeId, out: &mut BTreeSet<NodeId>| {
-            let other = if a == id {
-                b
-            } else if b == id {
-                a
-            } else {
-                return;
-            };
-            if other != id && (self.cold.contains_key(other) || deep_keys.contains(other)) {
-                out.insert(other.clone());
+        if let Some(radj) = self.radj.as_ref() {
+            let prefix = format!("{}\u{1f}", id.0);
+            for (k, _) in radj.scan_prefix(&prefix).unwrap_or_default() {
+                let other = NodeId(k[prefix.len()..].to_owned());
+                // Keep only neighbours that are themselves still cold.
+                if other != *id && (self.cold.contains_key(&other) || self.deep_contains(&other)) {
+                    out.insert(other);
+                }
             }
-        };
-        // Full entries carry their edges resident; read them straight.
+            return out.into_iter().collect();
+        }
+        // No spill store ⇒ no deep tier; read the resident cold-full edges straight.
         for c in self.cold.values() {
             for e in &c.edges {
-                consider(&e.source, &e.target, &mut out);
-            }
-        }
-        // Deep husks keep only neighbour ids — each `o` stands for the undirected
-        // edge `husk-id ── o`, read exactly as a resident edge would be.
-        for (hid, h) in self.deep_entries() {
-            for o in unpack_adj(&h.adj) {
-                consider(&hid, &NodeId(o.to_owned()), &mut out);
+                let other = if &e.source == id {
+                    &e.target
+                } else if &e.target == id {
+                    &e.source
+                } else {
+                    continue;
+                };
+                if other != id && self.cold.contains_key(other) {
+                    out.insert(other.clone());
+                }
             }
         }
         out.into_iter().collect()
@@ -999,15 +1034,46 @@ impl MemoryGraph {
         husk_dir.push(".husks");
         let husk_store =
             HuskStore::open(PathBuf::from(husk_dir), HUSK_BUFFER_LIMIT, HUSK_CACHE_CAP)?;
+        // Reverse-adjacency index (brick 8), a second sibling directory.
+        let mut radj_dir = dir.clone().into_os_string();
+        radj_dir.push(".radj");
+        let radj = HuskStore::open(PathBuf::from(radj_dir), HUSK_BUFFER_LIMIT, HUSK_CACHE_CAP)?;
         let store = ColdSpill::new(dir)?;
         self.spill = Some(SpillConfig {
             store,
             inline_budget,
         });
         self.husk_store = Some(husk_store);
+        self.radj = Some(radj);
+        self.backfill_radj();
         self.enforce_cold_budget();
         self.enforce_cold_resident_budget();
         Ok(())
+    }
+
+    /// Seed the reverse-adjacency index from the COLD tier already present at attach
+    /// time (entries demoted before the index existed, or restored from a snapshot),
+    /// so [`cold_neighbours`](Self::cold_neighbours) is correct immediately.
+    fn backfill_radj(&mut self) {
+        let mut edges: Vec<(NodeId, NodeId)> = Vec::new();
+        for (id, c) in &self.cold {
+            for e in &c.edges {
+                let other = if &e.source == id {
+                    &e.target
+                } else {
+                    &e.source
+                };
+                edges.push((id.clone(), other.clone()));
+            }
+        }
+        for (id, h) in self.deep_entries() {
+            for o in unpack_adj(&h.adj) {
+                edges.push((id.clone(), NodeId(o.to_owned())));
+            }
+        }
+        for (a, b) in edges {
+            self.radj_add_edge(&a, &b);
+        }
     }
 
     /// Detach the spill store. Already-spilled entries stay stubbed and become
@@ -1016,6 +1082,25 @@ impl MemoryGraph {
     pub fn detach_cold_spill(&mut self) {
         self.spill = None;
         self.husk_store = None;
+        self.radj = None;
+    }
+
+    /// Record an archived cold edge `a─b` in the reverse-adjacency index (both
+    /// directions). A no-op without an attached index. Best-effort: a write miss only
+    /// degrades `cold_neighbours` to (still-correct) incompleteness, never corrupts.
+    fn radj_add_edge(&mut self, a: &NodeId, b: &NodeId) {
+        if let Some(radj) = self.radj.as_mut() {
+            let _ = radj.put(&format!("{}\u{1f}{}", a.0, b.0), Vec::new());
+            let _ = radj.put(&format!("{}\u{1f}{}", b.0, a.0), Vec::new());
+        }
+    }
+
+    /// Drop the reverse-adjacency entries for edge `a─b` (both directions).
+    fn radj_del_edge(&mut self, a: &NodeId, b: &NodeId) {
+        if let Some(radj) = self.radj.as_mut() {
+            let _ = radj.delete(&format!("{}\u{1f}{}", a.0, b.0));
+            let _ = radj.delete(&format!("{}\u{1f}{}", b.0, a.0));
+        }
     }
 
     /// Whether an on-disk COLD spill store is currently attached.
@@ -1435,16 +1520,32 @@ impl MemoryGraph {
     /// and reclaim its on-disk blob(s) if no other entry still references them. Used
     /// when a fresh ingest supersedes the shadow, or on explicit removal.
     fn forget_cold_shadow(&mut self, id: &NodeId) {
+        // Gather the reverse-adjacency entries to drop (full entry: archived edges;
+        // deep husk: neighbour ids) alongside reclaiming the blobs.
+        let mut others: Vec<NodeId> = Vec::new();
         if let Some(old) = self.cold.remove(id) {
+            for e in &old.edges {
+                others.push(if &e.source == id {
+                    e.target.clone()
+                } else {
+                    e.source.clone()
+                });
+            }
             if let Some(s) = old.spill {
                 self.release_content_blob_if_orphan(&s.hash);
             }
         }
         if let Some(husk) = self.deep_get(id) {
+            for o in unpack_adj(&husk.adj) {
+                others.push(NodeId(o.to_owned()));
+            }
             if let Some(hs) = self.husk_store.as_mut() {
                 let _ = hs.delete(&id.0); // drop the husk from the on-disk index
             }
             self.release_blob_if_orphan(&husk.body.hash);
+        }
+        for other in others {
+            self.radj_del_edge(id, &other);
         }
     }
 
@@ -3027,6 +3128,93 @@ mod tests {
         g.max_in_memory_nodes = 0;
         g.enforce_paging(); // demote everything to COLD
         g
+    }
+
+    /// Ground-truth cold neighbours: scan the cold tier's actual adjacency (resident
+    /// full-entry edges + deep husk ids) directly — what `cold_neighbours` returned
+    /// before the reverse index. The `radj`-backed implementation must match this.
+    fn reference_cold_neighbours(g: &MemoryGraph, id: &NodeId) -> Vec<NodeId> {
+        let mut out: BTreeSet<NodeId> = BTreeSet::new();
+        let mut consider = |a: &NodeId, b: &NodeId| {
+            let other = if a == id {
+                Some(b.clone())
+            } else if b == id {
+                Some(a.clone())
+            } else {
+                None
+            };
+            if let Some(o) = other {
+                if o != *id && (g.cold.contains_key(&o) || g.deep_contains(&o)) {
+                    out.insert(o);
+                }
+            }
+        };
+        for c in g.cold.values() {
+            for e in &c.edges {
+                consider(&e.source, &e.target);
+            }
+        }
+        for (hid, h) in g.deep_entries() {
+            for o in unpack_adj(&h.adj) {
+                consider(&hid, &NodeId(o.to_owned()));
+            }
+        }
+        out.into_iter().collect()
+    }
+
+    #[test]
+    fn radj_cold_neighbours_match_ground_truth_under_random_ops() {
+        // Lever 2 brick 8: the reverse-adjacency index must agree with a direct scan
+        // of the cold tier after any sequence of demote / page-in / remove.
+        let dir = spill_temp_dir("radj_equiv");
+        let mut g = MemoryGraph::new(0.2, 6);
+        g.attach_cold_spill(&dir, usize::MAX).unwrap();
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let mut rng = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as u32
+        };
+        for step in 0..500 {
+            match rng() % 6 {
+                0 | 1 => {
+                    let a = format!("n{}", rng() % 12);
+                    g.upsert_node(
+                        a.clone().into(),
+                        format!("l{a}"),
+                        format!("c{a} {}", "x".repeat((rng() % 30) as usize)),
+                        NodeType::Symbol,
+                    );
+                    let b = format!("n{}", rng() % 12);
+                    if a != b {
+                        g.page_in(&a.clone().into());
+                        g.page_in(&b.clone().into());
+                        g.add_edge(a.into(), b.into(), 0.5, EdgeType::DependsOn);
+                    }
+                }
+                2 => {
+                    g.max_in_memory_nodes = (rng() % 5) as usize;
+                    g.enforce_paging();
+                }
+                3 => g.set_cold_resident_budget(Some((rng() % 256) as usize)),
+                4 => {
+                    g.page_in(&format!("n{}", rng() % 12).into());
+                }
+                _ => g.remove_node(&format!("n{}", rng() % 12).into()),
+            }
+            if step % 5 == 0 {
+                for id in g.cold_ids().collect::<Vec<_>>() {
+                    assert_eq!(
+                        g.cold_neighbours(&id),
+                        reference_cold_neighbours(&g, &id),
+                        "radj mismatch for {} at step {step}",
+                        id.0,
+                    );
+                }
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
