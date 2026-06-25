@@ -792,6 +792,11 @@ impl MemoryGraph {
                 outdeg[s] += 1;
             }
         }
+        // Canonical edge order so the floating-point accumulation below is invariant to how
+        // the edges were *inserted* (import resolution adds them in HashMap order). With the
+        // sorted ids above, this makes eigencentrality a pure function of the graph's
+        // *structure*, not its construction order — deterministic across processes.
+        edges.sort_unstable();
         const ITERS: usize = 64;
         const DAMP: f64 = 0.85;
         let base = (1.0 - DAMP) / n as f64;
@@ -1987,19 +1992,25 @@ impl MemoryGraph {
     /// returns the number of edges added. Opt-in — callers invoke it after
     /// ingesting a set of files (see [`crate::external_memory`]).
     pub fn link_module_imports(&mut self) -> usize {
+        // Deterministic iteration: visit node ids in sorted order so the HashMap seed can't
+        // change import resolution across processes (e.g. which file wins a `(crate, module)`
+        // key collision via the last `insert`) — fresh ingestion must be reproducible, the
+        // same property replay relies on.
+        let mut sorted_ids: Vec<&NodeId> = self.nodes.keys().collect();
+        sorted_ids.sort();
         // (crate, intra-module path) → file node.
         let mut index: HashMap<(String, String), NodeId> = HashMap::new();
-        for id in self.nodes.keys() {
+        for id in &sorted_ids {
             if let Some(path) = id.0.strip_prefix("file:") {
                 if let Some(km) = crate_and_module(path) {
-                    index.insert(km, id.clone());
+                    index.insert(km, (*id).clone());
                 }
             }
         }
         let mut to_add: Vec<(NodeId, NodeId, EdgeType)> = Vec::new();
 
         // (a) imports: importer → defining file.
-        for id in self.nodes.keys() {
+        for id in &sorted_ids {
             let Some(rest) = id.0.strip_prefix("use:") else {
                 continue;
             };
@@ -2022,8 +2033,9 @@ impl MemoryGraph {
         // (e.g. `filter/mod.rs → filter/owner.rs`). The parser records `pub mod x;`
         // only as a node, so without this a sub-module reached through a re-export
         // is orphaned and failure pressure can never flow into it.
-        let entries: Vec<((String, String), NodeId)> =
+        let mut entries: Vec<((String, String), NodeId)> =
             index.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        entries.sort();
         for ((krate, module), child) in &entries {
             if module.is_empty() {
                 continue;
@@ -2533,6 +2545,42 @@ mod tests {
                 "hub outranks its leaves"
             );
         }
+    }
+
+    /// Eigencentrality must be invariant to the *order* edges were inserted (import
+    /// resolution adds them in HashMap order), not merely reproducible for one fixed order —
+    /// otherwise its `f64`s drift across processes. Same graph, edges added in two different
+    /// orders ⇒ identical vector.
+    #[test]
+    fn eigencentrality_is_invariant_to_edge_insertion_order() {
+        let mk = |edges: &[(&str, &str)]| {
+            let mut g = MemoryGraph::new(0.2, usize::MAX);
+            for n in ["a", "b", "c", "d", "hub"] {
+                g.upsert_node(n.into(), n.into(), "".into(), NodeType::Module);
+            }
+            for &(s, t) in edges {
+                g.add_edge(s.into(), t.into(), 1.0, EdgeType::DependsOn);
+            }
+            g.eigencentrality()
+        };
+        let forward = mk(&[
+            ("a", "hub"),
+            ("b", "hub"),
+            ("c", "hub"),
+            ("d", "c"),
+            ("c", "b"),
+        ]);
+        let shuffled = mk(&[
+            ("c", "b"),
+            ("d", "c"),
+            ("c", "hub"),
+            ("a", "hub"),
+            ("b", "hub"),
+        ]);
+        assert_eq!(
+            forward, shuffled,
+            "eigencentrality must not depend on edge insertion order"
+        );
     }
 
     /// The point of eigenvector centrality: it ranks a *recursively* central node above
