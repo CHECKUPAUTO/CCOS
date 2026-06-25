@@ -100,6 +100,7 @@
 
 pub mod adversarial;
 pub mod agent_session;
+pub mod cold_index;
 pub mod compressor;
 pub mod consensus;
 pub mod distributed_event_log;
