@@ -104,7 +104,7 @@ proptest! {
         let everywhere: Vec<NodeId> = g
             .node_ids()
             .cloned()
-            .chain(g.cold_ids().cloned())
+            .chain(g.cold_ids())
             .collect();
         for nid in everywhere {
             g.remove_node(&nid);
@@ -163,7 +163,7 @@ proptest! {
         }
 
         // No leaked blobs across all four tiers.
-        let everywhere: Vec<NodeId> = g.node_ids().cloned().chain(g.cold_ids().cloned()).collect();
+        let everywhere: Vec<NodeId> = g.node_ids().cloned().chain(g.cold_ids()).collect();
         for nid in everywhere {
             g.remove_node(&nid);
         }
