@@ -428,6 +428,9 @@ impl CcosMemory {
     /// Persist to an explicit path and bind it for later [`checkpoint`](ExternalMemory::checkpoint).
     pub fn checkpoint_to(&mut self, path: impl AsRef<Path>) -> Result<(), MemoryError> {
         let p = path.as_ref().to_path_buf();
+        // Durabilize the COLD-tier indices so the spill directory is consistent with
+        // the snapshot we're about to write (Lever 2 crash-consistency).
+        self.graph.flush_cold_tier()?;
         self.write_to(&p)?;
         self.path = Some(p);
         Ok(())

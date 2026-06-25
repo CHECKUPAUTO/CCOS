@@ -1085,6 +1085,27 @@ impl MemoryGraph {
         self.radj = None;
     }
 
+    /// Flush the COLD tier's on-disk indices (husk store + reverse adjacency) so their
+    /// in-RAM write buffers reach durable segments. Call before a checkpoint so the
+    /// `<dir>.husks` / `<dir>.radj` directories are consistent with the snapshot and a
+    /// crash loses nothing committed since the last checkpoint. Spill *blobs* are
+    /// already written durably on each put (and segments via `write_durable`), so the
+    /// only volatile cold-tier state is these two memtables. A no-op without a store.
+    ///
+    /// Crash model: the **event log** is the source of truth — `replay == live` is
+    /// reconstructed from it regardless of the cold tier, which is a rebuildable cache.
+    /// This flush makes the cache itself recover to its last checkpoint instead of its
+    /// last segment flush.
+    pub fn flush_cold_tier(&mut self) -> std::io::Result<()> {
+        if let Some(hs) = self.husk_store.as_mut() {
+            hs.flush()?;
+        }
+        if let Some(radj) = self.radj.as_mut() {
+            radj.flush()?;
+        }
+        Ok(())
+    }
+
     /// Record an archived cold edge `a─b` in the reverse-adjacency index (both
     /// directions). A no-op without an attached index. Best-effort: a write miss only
     /// degrades `cold_neighbours` to (still-correct) incompleteness, never corrupts.
@@ -3213,6 +3234,60 @@ mod tests {
                     );
                 }
             }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn deep_tier_survives_a_simulated_crash() {
+        // Lever 2 brick 9: deep-spill + flush_cold_tier makes the husk and reverse-
+        // adjacency indices durable, so a *fresh* graph re-attaching the same directory
+        // recovers the whole deep tier — content, neighbours and all.
+        let dir = spill_temp_dir("crash");
+        let expected: Vec<(NodeId, Vec<NodeId>)>;
+        {
+            // First "process": build a cold region, deep-spill it, flush, drop the graph.
+            let mut g = cold_region(&dir);
+            g.set_cold_resident_budget(Some(0)); // deep-spill every entry
+            expected = g
+                .cold_ids()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|id| {
+                    let n = g.cold_neighbours(&id);
+                    (id, n)
+                })
+                .collect();
+            g.flush_cold_tier().unwrap();
+            // `g` drops here: the in-RAM write buffers vanish, the directory persists.
+        }
+
+        // Second "process": a fresh graph re-attaches the same directory.
+        let mut g2 = MemoryGraph::new(0.2, 100);
+        g2.attach_cold_spill(&dir, usize::MAX).unwrap();
+        assert!(!expected.is_empty(), "expected deep entries");
+
+        // Adjacency and membership recover — checked before any page-in changes the
+        // cold set.
+        for (id, neighbours) in &expected {
+            assert!(g2.is_deep_spilled(id), "{} recovered as deep-spilled", id.0);
+            assert_eq!(
+                &g2.cold_neighbours(id),
+                neighbours,
+                "reverse adjacency recovered for {}",
+                id.0
+            );
+        }
+        // Content recovers losslessly through the disk trip.
+        for (id, _) in &expected {
+            assert!(g2.page_in(id), "{} pages back in after the crash", id.0);
+            let node = g2.node(id).expect("resident after page-in");
+            assert_eq!(
+                node.content,
+                format!("content of {} {}", id.0, "x".repeat(40)),
+                "content recovered losslessly for {}",
+                id.0
+            );
         }
         std::fs::remove_dir_all(&dir).ok();
     }
