@@ -212,13 +212,36 @@ fn hash_term(term: &str) -> u64 {
     h
 }
 
-/// Split text into lowercase alphanumeric/`_` tokens — the tokenizer the TF-IDF
-/// embedder uses, exposed so a re-ranking stage can fit the same vocabulary.
+/// Split text into lowercase subword tokens — the tokenizer the TF-IDF embedder uses
+/// (exposed so a re-ranking stage can fit the same vocabulary). Code identifiers are
+/// split on `snake_case` and `camelCase` boundaries, so a natural-language query
+/// matches them: `connection_pool_acquire` and `connectionPool` both yield
+/// `connection`, `pool`, … — without this, a query like "connection pool" shares *no*
+/// token with the identifier and the semantic signal is zero.
 pub fn tokenize(s: &str) -> Vec<String> {
-    s.split(|c: char| !c.is_alphanumeric() && c != '_')
-        .filter(|t| t.len() > 1)
-        .map(|t| t.to_lowercase())
-        .collect()
+    let mut out = Vec::new();
+    for raw in s.split(|c: char| !c.is_alphanumeric() && c != '_') {
+        for part in raw.split('_') {
+            let chars: Vec<char> = part.chars().collect();
+            let mut start = 0;
+            for i in 1..chars.len() {
+                // A lowercase/digit → uppercase transition is a camelCase boundary.
+                if chars[i].is_uppercase() && !chars[i - 1].is_uppercase() {
+                    push_subword(&mut out, &chars[start..i]);
+                    start = i;
+                }
+            }
+            push_subword(&mut out, &chars[start..]);
+        }
+    }
+    out
+}
+
+fn push_subword(out: &mut Vec<String>, chars: &[char]) {
+    // Keep the length>1 filter of the original tokenizer.
+    if chars.len() > 1 {
+        out.push(chars.iter().collect::<String>().to_lowercase());
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -452,6 +475,26 @@ impl CausalEmbeddings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tokenize_splits_code_identifiers_into_subwords() {
+        assert_eq!(
+            tokenize("connection_pool_acquire"),
+            vec!["connection", "pool", "acquire"]
+        );
+        assert_eq!(
+            tokenize("connectionPoolAcquire"),
+            vec!["connection", "pool", "acquire"]
+        );
+        // A natural-language query now shares every token with the identifier — the
+        // semantic signal that was zero before this split.
+        let q = tokenize("connection pool acquire");
+        let ident = tokenize("connection_pool_acquire");
+        assert!(
+            q.iter().all(|t| ident.contains(t)),
+            "query {q:?} fully overlaps identifier subwords {ident:?}"
+        );
+    }
 
     #[test]
     fn int4_round_trip_preserves_direction() {
