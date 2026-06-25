@@ -846,9 +846,8 @@ impl MemoryGraph {
                         entry.spill = None;
                     }
                     // The content blob is now unreferenced by this entry; reclaim it
-                    // unless another cold entry shares it — same anti-leak as the deep
-                    // path above.
-                    self.release_blob_if_orphan(&hash);
+                    // unless another cold entry shares it (content blob ⇒ cheap variant).
+                    self.release_content_blob_if_orphan(&hash);
                 }
                 None => return false,
             }
@@ -1329,7 +1328,7 @@ impl MemoryGraph {
             }
             self.cold.remove(&id);
             if let Some(hash) = old_content_hash {
-                self.release_blob_if_orphan(&hash);
+                self.release_content_blob_if_orphan(&hash);
             }
             // The full entry's resident cost is freed; the husk's is the store's
             // bounded footprint (counted in `cold_resident_bytes`), not per-entry.
@@ -1393,6 +1392,25 @@ impl MemoryGraph {
     /// the file is deleted only once its last referent is gone. A no-op without an
     /// attached store. This is the GC that keeps the spill store from leaking
     /// orphaned blobs when a spilled node is re-ingested, removed, or compacted.
+    /// Reclaim a spilled **content** blob iff no resident COLD full entry references
+    /// it. A content hash is never a deep-husk *body* hash (different byte strings ⇒
+    /// different SHA-256), so this deliberately skips the husk scan that
+    /// [`release_blob_if_orphan`](Self::release_blob_if_orphan) does — keeping the
+    /// deep-spill and compaction loops, which release content blobs, off the `O(N)`
+    /// deep-tier sweep (otherwise deep-spilling N entries is `O(N²)` disk).
+    fn release_content_blob_if_orphan(&self, hash: &[u8; 32]) {
+        let Some(cfg) = self.spill.as_ref() else {
+            return;
+        };
+        let referenced = self
+            .cold
+            .values()
+            .any(|c| c.spill.as_ref().is_some_and(|s| s.hash == *hash));
+        if !referenced {
+            cfg.store.remove(hash);
+        }
+    }
+
     fn release_blob_if_orphan(&self, hash: &[u8; 32]) {
         let Some(cfg) = self.spill.as_ref() else {
             return;
@@ -1401,8 +1419,9 @@ impl MemoryGraph {
             .cold
             .values()
             .any(|c| c.spill.as_ref().is_some_and(|s| s.hash == *hash));
-        // Lever 2 brick 6: husks are on disk, so this scans the index (full deep
-        // sweep) — correct but O(N) per release until a body-hash index lands.
+        // Lever 2: husks are on disk, so this scans the index — correct but O(N) per
+        // release. Only body-blob releases (page-in, removal) hit it; content-blob
+        // releases use the cheaper variant above.
         let referenced_by_husk = self
             .deep_entries()
             .iter()
@@ -1418,7 +1437,7 @@ impl MemoryGraph {
     fn forget_cold_shadow(&mut self, id: &NodeId) {
         if let Some(old) = self.cold.remove(id) {
             if let Some(s) = old.spill {
-                self.release_blob_if_orphan(&s.hash);
+                self.release_content_blob_if_orphan(&s.hash);
             }
         }
         if let Some(husk) = self.deep_get(id) {
@@ -1485,9 +1504,9 @@ impl MemoryGraph {
                 entry.spill = None; // discard the full original
                 entry.compacted = true;
             }
-            // The original blob may now be orphaned — reclaim it if so.
+            // The original (content) blob may now be orphaned — reclaim it if so.
             if let Some(h) = old_hash {
-                self.release_blob_if_orphan(&h);
+                self.release_content_blob_if_orphan(&h);
             }
             total = total.saturating_sub(old_len).saturating_add(new_len);
         }
