@@ -45,10 +45,32 @@ cognitive MMU, made real: page, don't drop.
   memory as a *direction*" bottoms out: at the floor frugality wins, and CCOS
   compacts to a summary — **never silently drops**. Off by default ⇒ COLD stays
   lossless, serialization byte-identical. **Honest scope:** this bounds the cold
-  *content* footprint, **not** the entry *count* (the `BTreeMap` still holds an
-  O(N) stub per node — an on-disk index is future work); compaction is lossy and,
-  like spill, an operational mode layered on the deterministic default, not part of
-  replay. (M)
+  *content* footprint, **not** the entry *count* (the `BTreeMap` still holds a stub
+  per node — its resident *size* is bounded by slices 5/5b below; bounding the
+  *count* itself is still future work); compaction is lossy and, like spill, an
+  operational mode layered on the deterministic default, not part of replay. (M)
+- ✅ **Slice 5 — deep-spill the per-entry metadata (lossless, measured-first).** A
+  measurement (`docs/MEASUREMENT_cold_ram.md`, `examples/cold_ram.rs`) first showed
+  the COLD tier's dominant *resident* cost is per-entry **metadata** — ~2.8× the
+  spilled content, ~60% of it edges — and that lossy edge-contraction is the *wrong*
+  lever (it inflates that edge cost on hubs). So `set_cold_resident_budget(Some(b))`
+  drives resident COLD metadata toward `b` by deep-spilling the coldest entries to
+  the same content-addressed store, keeping only the neighbour **ids** resident for
+  `cold_neighbours`/region paging. Lossless (faults back, hash-verified, on
+  `page_in`), deterministic, off by default (byte-identical default snapshot/replay).
+  Shrinks edges to ids — never adds bridge edges — so hubs get *cheaper*, not the
+  O(degree²) blow-up contraction would cause. (M)
+- ✅ **Slice 5b — compact husk → drop the per-entry struct floor.** Slice 5 kept a
+  full `ColdNode` husk and stalled at ~11% on the fixture against the
+  `size_of::<ColdNode>()` floor. A deep-spilled entry is now archived *whole* to one
+  blob and represented in RAM by a compact `DeepHusk` (body-blob stub + neighbour
+  ids) in its own `cold_deep` map, so *every* entry shrinks and the budget is
+  actually reached: resident COLD metadata **halves (−50%)** on the same fixture
+  (~108K/120K entries archived). Deep husks are terminal (excluded from further
+  spill/compaction); still lossless, deterministic, and off by default
+  (`cold_deep` serde-elided when empty ⇒ byte-identical default path). This bounds
+  the per-entry resident *size*; bounding the entry *count* (an on-disk husk index)
+  remains the next lever. (M)
 
 ## 🎯 Direction — better retrieval
 - ✅ **Slice A — hybrid entry fusion.** A new `Recall::Hybrid` resolves a
