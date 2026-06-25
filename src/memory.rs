@@ -632,6 +632,28 @@ impl MemoryGraph {
         }
     }
 
+    /// Record an access to a node that is **already resident** — refresh its
+    /// recency to full and bump its access count, exactly as
+    /// [`page_in`](Self::page_in) does when it faults a *cold* node back. This
+    /// models a **resident hit**: the agent re-reads a node already in working
+    /// memory, so a frequently-used resident node ages like a paged-in one
+    /// rather than only ever decaying via [`tick`](Self::tick). Returns `true`
+    /// if the node was resident (and thus touched); `false` if it is cold or
+    /// absent — `touch` never resurrects a demoted node (that is
+    /// [`page_in`](Self::page_in)'s job), so the COLD tier and the
+    /// `replay == live` path are untouched. Deterministic: `&mut self` only
+    /// updates the node's recency/access bookkeeping.
+    pub fn touch(&mut self, id: &NodeId) -> bool {
+        if let Some(node) = self.nodes.get_mut(id) {
+            node.recency = 1.0;
+            node.last_accessed = self.clock;
+            node.access_count = node.access_count.saturating_add(1);
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn compute_node_score(&self, node: &GraphNode) -> f64 {
         let w = &self.scoring_weights;
         let base = node.base_importance * w.w_base;
@@ -649,9 +671,12 @@ impl MemoryGraph {
         (base + failure + recency + access + centrality).clamp(0.0, 1.0)
     }
 
-    /// In-degree of `id` (count of incoming causal edges), via a cache keyed on
-    /// `edges.len()`. Only built when the centrality term is enabled; deterministic.
-    fn node_in_degree(&self, id: &NodeId) -> u32 {
+    /// In-degree of `id` among the **resident** graph — the count of incoming
+    /// causal edges whose target is `id`. Only edges between two resident nodes
+    /// are in `self.edges` (paging archives incident edges on demote), so this is
+    /// the *resident* structural signal the centrality term ([`compute_node_score`](Self::compute_node_score))
+    /// scores on, not the global in-degree. Cached on `edges.len()`; deterministic.
+    pub fn node_in_degree(&self, id: &NodeId) -> u32 {
         let mut cache = self.indegree_cache.borrow_mut();
         if cache.as_ref().map(|(v, _)| *v) != Some(self.edges.len()) {
             let mut m: HashMap<NodeId, u32> = HashMap::new();
@@ -2293,6 +2318,39 @@ mod tests {
             high > low,
             "raising w_failure must raise a failing node's score"
         );
+    }
+
+    #[test]
+    fn touch_refreshes_resident_score_and_never_resurrects_cold() {
+        let mut g = MemoryGraph::new(0.2, usize::MAX);
+        g.upsert_node("a".into(), "a".into(), "x".into(), NodeType::Module);
+        // Let recency decay, then touch must restore it (recency → 1.0, access++).
+        for _ in 0..5 {
+            g.tick();
+        }
+        let before = g.compute_node_score(g.node(&"a".into()).unwrap());
+        assert!(g.touch(&"a".into()), "a resident node is touchable");
+        let after = g.compute_node_score(g.node(&"a".into()).unwrap());
+        assert!(
+            after > before,
+            "touch must raise the score via recency/access refresh: {before} -> {after}"
+        );
+        // access_count: 1 at ingest, +1 from the single touch (tick does not bump it).
+        assert_eq!(g.node(&"a".into()).unwrap().access_count, 2);
+        // A cold (demoted) node is never paged back in by touch.
+        g.max_in_memory_nodes = 0;
+        g.enforce_paging();
+        assert!(g.is_cold(&"a".into()));
+        assert!(
+            !g.touch(&"a".into()),
+            "touch must not resurrect a cold node"
+        );
+        assert!(
+            g.is_cold(&"a".into()),
+            "touch must leave the COLD tier untouched"
+        );
+        // An absent id is simply a miss.
+        assert!(!g.touch(&"missing".into()));
     }
 
     #[test]
