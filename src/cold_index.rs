@@ -163,6 +163,41 @@ impl Segment {
         Ok(out)
     }
 
+    /// Every `(key, value)` whose key starts with `prefix`, in key order — a binary
+    /// search to the prefix then a forward scan (`O(matches + STRIDE)`), not a full
+    /// segment read.
+    pub fn scan_prefix(&self, prefix: &str) -> io::Result<Vec<(String, Vec<u8>)>> {
+        if self.sparse.is_empty() {
+            return Ok(Vec::new());
+        }
+        let start = match self
+            .sparse
+            .binary_search_by(|(k, _)| k.as_str().cmp(prefix))
+        {
+            Ok(i) => self.sparse[i].1,
+            Err(0) => 0,
+            Err(i) => self.sparse[i - 1].1,
+        };
+        let mut f = std::fs::File::open(&self.path)?;
+        f.seek(SeekFrom::Start(start))?;
+        let mut pos = start;
+        let mut out = Vec::new();
+        while pos < self.records_end {
+            let k = read_string(&mut f)?;
+            let v = read_bytes(&mut f)?;
+            pos += 8 + k.len() as u64 + v.len() as u64;
+            if k.as_str() < prefix {
+                continue; // still before the prefix range
+            }
+            if k.starts_with(prefix) {
+                out.push((k, v));
+            } else {
+                break; // sorted: past the prefix range
+            }
+        }
+        Ok(out)
+    }
+
     /// The segment's on-disk path (used by compaction to delete a merged-away file).
     pub fn path(&self) -> &Path {
         &self.path
@@ -493,6 +528,31 @@ impl HuskStore {
             .collect())
     }
 
+    /// Every live `(key, value)` whose key starts with `prefix`, in key order. Unlike
+    /// [`live_entries`](Self::live_entries) this only touches the prefix range of each
+    /// segment (binary search + bounded scan), so a keyed lookup is `O(matches)`, not
+    /// `O(total)` — the basis for an on-disk adjacency index.
+    pub fn scan_prefix(&self, prefix: &str) -> io::Result<Vec<(String, Vec<u8>)>> {
+        let mut merged: std::collections::BTreeMap<String, Option<Vec<u8>>> = Default::default();
+        for seg in &self.segments {
+            for (k, raw) in seg.scan_prefix(prefix)? {
+                if let Some(inner) = decode_value(&raw) {
+                    merged.insert(k, inner);
+                }
+            }
+        }
+        for (k, slot) in self.buffer.range(prefix.to_string()..) {
+            if !k.starts_with(prefix) {
+                break;
+            }
+            merged.insert(k.clone(), slot.clone());
+        }
+        Ok(merged
+            .into_iter()
+            .filter_map(|(k, v)| v.map(|val| (k, val)))
+            .collect())
+    }
+
     /// Rough resident-byte estimate: the memtable values + the sparse indices + the
     /// read cache. Bounded by `buffer_limit`, `cache_cap`, and `O(total / STRIDE)` —
     /// the whole point of the tier. Used by the COLD budget loop, where a heuristic
@@ -627,6 +687,17 @@ mod tests {
             let model_vec: Vec<(String, Vec<u8>)> =
                 model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
             prop_assert_eq!(&live, &model_vec, "live_entries mismatch");
+            // scan_prefix() matches the model's prefix range, for every letter prefix.
+            for c in 'a'..='z' {
+                let p = c.to_string();
+                let got = store.scan_prefix(&p).unwrap();
+                let want: Vec<(String, Vec<u8>)> = model
+                    .range(p.clone()..)
+                    .take_while(|(k, _)| k.starts_with(&p))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                prop_assert_eq!(&got, &want, "scan_prefix({}) mismatch", p);
+            }
             // Survives compaction + re-open (segments reloaded from disk).
             store.compact().unwrap();
             let reopened = HuskStore::open(&dir, 8, 4).unwrap();
