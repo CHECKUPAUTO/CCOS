@@ -115,7 +115,33 @@ fn main() {
         gib / per.max(1)
     );
     println!(
-        "Disk holds the content; RAM still holds ids+labels+edges+hash-stub per entry — the O(N) slice 5 must bound."
+        "Disk holds the content; RAM still holds ids+labels+edges+hash-stub per entry — the O(N) slice 5 bounds."
+    );
+    drop(g);
+    std::fs::remove_dir_all(&dir).ok();
+
+    // ── slice 5 payoff: deep-spill bounds that resident metadata ──────────────
+    // Archive each cold entry's label + full edges to the same on-disk store,
+    // keeping only the neighbour ids resident (lossless — it all faults back on
+    // page-in). The measured-dominant edge cost shrinks to ids, not dropped.
+    let dir = std::env::temp_dir().join(format!("ccos_coldram_deep_{}", std::process::id()));
+    let mut g = build_cold(30000, &dir);
+    let before = g.cold_resident_bytes();
+    g.set_cold_resident_budget(Some(before / 2)); // ask to halve the resident metadata
+    let after = g.cold_resident_bytes();
+    println!(
+        "\nslice 5 — deep-spill: resident metadata {} B → {} B (−{}%), {} of {} entries archived \
+         (label+edges → disk, neighbour ids kept, lossless).",
+        before,
+        after,
+        (before - after) * 100 / before.max(1),
+        g.cold_deep_spilled_count(),
+        g.cold_count(),
+    );
+    println!(
+        "Honest: the guard skips entries it can't shrink (here the symbols, whose one edge is \
+         archived under their file), and the remainder is the irreducible per-entry floor — \
+         struct + id + content-hash — that deep-spill leaves resident by design."
     );
     drop(g);
     std::fs::remove_dir_all(&dir).ok();
