@@ -22,6 +22,8 @@
 //! ```
 
 use crate::util::write_durable;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
@@ -207,6 +209,58 @@ pub struct HuskStore {
     buffer_limit: usize,
     segments: Vec<Segment>, // oldest → newest
     next_seq: u64,
+    /// Bounded read cache for values fetched from segments, so a hot key isn't
+    /// re-read from disk. `RefCell` so `get` stays `&self`; invalidated on the only
+    /// thing that changes a value — `put`/`delete` of that key.
+    cache: RefCell<Lru>,
+}
+
+/// A tiny bounded LRU: a `HashMap` of `key → (value, last-access clock)`; when full,
+/// the entry with the smallest clock is evicted (an `O(cap)` scan, fine for a small
+/// cap). Holds only present values — never tombstones or misses — so a hit is always
+/// a real value.
+struct Lru {
+    cap: usize,
+    clock: u64,
+    map: HashMap<String, (Vec<u8>, u64)>,
+}
+
+impl Lru {
+    fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            clock: 0,
+            map: HashMap::new(),
+        }
+    }
+    fn get(&mut self, key: &str) -> Option<Vec<u8>> {
+        self.clock += 1;
+        let now = self.clock;
+        self.map.get_mut(key).map(|(v, ts)| {
+            *ts = now;
+            v.clone()
+        })
+    }
+    fn insert(&mut self, key: String, value: Vec<u8>) {
+        if self.cap == 0 {
+            return;
+        }
+        self.clock += 1;
+        if !self.map.contains_key(&key) && self.map.len() >= self.cap {
+            if let Some(victim) = self
+                .map
+                .iter()
+                .min_by_key(|(_, (_, ts))| *ts)
+                .map(|(k, _)| k.clone())
+            {
+                self.map.remove(&victim);
+            }
+        }
+        self.map.insert(key, (value, self.clock));
+    }
+    fn remove(&mut self, key: &str) {
+        self.map.remove(key);
+    }
 }
 
 /// A stored value is tagged so a delete can shadow an older value across segments:
@@ -238,8 +292,13 @@ fn decode_value(raw: &[u8]) -> Option<Option<Vec<u8>>> {
 
 impl HuskStore {
     /// Open (creating if needed) a store under `dir`, reloading any segments left by
-    /// a previous run. `buffer_limit` is the memtable size that triggers a flush.
-    pub fn open(dir: impl Into<PathBuf>, buffer_limit: usize) -> io::Result<Self> {
+    /// a previous run. `buffer_limit` is the memtable size that triggers a flush;
+    /// `cache_cap` bounds the resident read cache (0 disables it).
+    pub fn open(
+        dir: impl Into<PathBuf>,
+        buffer_limit: usize,
+        cache_cap: usize,
+    ) -> io::Result<Self> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir)?;
         let mut found: Vec<(u64, PathBuf)> = Vec::new();
@@ -266,18 +325,21 @@ impl HuskStore {
             buffer_limit: buffer_limit.max(1),
             segments,
             next_seq,
+            cache: RefCell::new(Lru::new(cache_cap)),
         })
     }
 
     /// Insert/update `key`, flushing the memtable to a segment if it is now full.
     pub fn put(&mut self, key: &str, value: Vec<u8>) -> io::Result<()> {
         self.buffer.insert(key.to_string(), Some(value));
+        self.cache.get_mut().remove(key); // the only thing that can stale the cache
         self.maybe_flush()
     }
 
     /// Delete `key` — a tombstone shadows any older value until [`compact`](Self::compact).
     pub fn delete(&mut self, key: &str) -> io::Result<()> {
         self.buffer.insert(key.to_string(), None);
+        self.cache.get_mut().remove(key);
         self.maybe_flush()
     }
 
@@ -296,9 +358,16 @@ impl HuskStore {
         if let Some(slot) = self.buffer.get(key) {
             return Ok(slot.clone()); // Some(v) = live, None = tombstone ⇒ deleted
         }
+        if let Some(v) = self.cache.borrow_mut().get(key) {
+            return Ok(Some(v)); // cached segment value (never stale: put/delete evict)
+        }
         for seg in self.segments.iter().rev() {
             if let Some(raw) = seg.get(key)? {
-                return Ok(decode_value(&raw).flatten()); // first segment wins (newest)
+                let result = decode_value(&raw).flatten(); // first segment wins (newest)
+                if let Some(v) = &result {
+                    self.cache.borrow_mut().insert(key.to_string(), v.clone());
+                }
+                return Ok(result);
             }
         }
         Ok(None)
@@ -483,7 +552,8 @@ mod tests {
             )
         ) {
             let dir = store_dir();
-            let mut store = HuskStore::open(&dir, 8).unwrap(); // tiny buffer ⇒ frequent flushes
+            // tiny buffer ⇒ frequent flushes; tiny cache ⇒ frequent evictions
+            let mut store = HuskStore::open(&dir, 8, 4).unwrap();
             let mut model: std::collections::BTreeMap<String, Vec<u8>> = Default::default();
             for (op, k, v) in &ops {
                 match op % 5 {
@@ -507,7 +577,7 @@ mod tests {
             }
             // Survives compaction + re-open (segments reloaded from disk).
             store.compact().unwrap();
-            let reopened = HuskStore::open(&dir, 8).unwrap();
+            let reopened = HuskStore::open(&dir, 8, 4).unwrap();
             for (k, v) in &model {
                 let got = reopened.get(k).unwrap();
                 prop_assert_eq!(got.as_ref(), Some(v), "post-compact-reopen get {}", k);
