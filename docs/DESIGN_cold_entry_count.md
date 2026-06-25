@@ -72,18 +72,22 @@ hold `u32` handles). That cuts both the per-id `String` allocations *and* the by
 (4-byte handle vs a ~35-byte id), but it touches `NodeId` across the kernel and is a
 much wider change.
 
-**Lever 2 — bound the count with an on-disk husk+adjacency index (database-grade).**
-The full fix above. Bounds resident COLD to `O(working set)` regardless of `N`, at the
-cost of the embedded-index machinery and disk-backed `cold_neighbours`.
+**Lever 2 — bound the count with an on-disk husk+adjacency index (database-grade). ✅ Built.**
+Bounds resident COLD to ≈`O(N / stride)` regardless of `N`. A dependency-free,
+hand-rolled LSM-lite (`src/cold_index.rs`): immutable sorted **segments** with a sparse
+resident index, a memtable + flush, tombstone deletes + compaction, and a bounded LRU
+read cache — each verified standalone by a model-check property test before wiring. The
+deep tier (`MemoryGraph`) now lives in it (the resident `cold_deep` map is gone), with a
+keyed **reverse-adjacency** index (`<dir>.radj`) so `cold_neighbours` is `O(degree)`
+(one prefix scan), and `flush_cold_tier` for crash-consistency. Measured: **≈2 B/husk**
+resident (vs 146 B fully resident), 1 GiB at **~537 M husks**.
 
 ## Verdict
 
-The husk **count** is a real `O(N)`, but — once the build-peak measurement error is
-corrected — a comfortably slow one: ~150–174 B/husk reaches 1 GiB only at ~6–7 M cold
-nodes, tens of MB for a typical project. **Lever 1 (pack the adjacency) is built**: it
-shrinks the bytes ~16 % and, more importantly, drops the per-husk allocation count to
-one, the steady-state and fragmentation win. **Lever 2 (the on-disk index) remains the
-eventual `O(1)`-resident end state**, to be built only when a deployment's scale
-genuinely justifies the database-grade complexity (disk I/O, cache eviction, symmetric
-adjacency, crash-consistency for `replay == live`). This document pins that design so
-the build is a decision, not a discovery.
+The husk **count** is a real `O(N)` — ~150–174 B/husk reaches 1 GiB at ~6–7 M cold nodes
+when fully resident. **Both levers are built.** Lever 1 packs the adjacency (one
+allocation per husk). Lever 2 moves the whole deep tier to a hand-rolled on-disk index,
+dropping resident to ≈2 B/husk (a ~73× cut, 1 GiB at ~537 M husks) — the `O(1)`-resident
+COLD tier, dependency-free and verified end-to-end (lossless round-trip, no-leak GC,
+`cold_neighbours` equivalence, and crash recovery). `replay == live` is unaffected: the
+event log is the source of truth and the cold tier is a rebuildable cache.
