@@ -573,6 +573,10 @@ impl AgentSession {
             return best;
         };
         const FACTORS: [f64; 6] = [0.25, 0.5, 0.75, 1.5, 2.0, 4.0];
+        // Absolute candidates for the centrality weight: it starts at 0, which a
+        // multiplicative move can never escape, so it is tried as a set of fixed
+        // values (relative to the base weight scale).
+        const CENTRALITY: [f64; 4] = [0.05, 0.15, 0.3, 0.5];
         for _pass in 0..2 {
             for dim in 0..4 {
                 for &f in &FACTORS {
@@ -588,6 +592,17 @@ impl AgentSession {
                             best = cand;
                             best_reward = r;
                         }
+                    }
+                }
+            }
+            // Structural centrality (absolute candidates, plus 0 = off).
+            for &c in CENTRALITY.iter().chain(std::iter::once(&0.0)) {
+                let mut cand = best;
+                cand.w_centrality = c;
+                if let Some(r) = self.retrieval_reward(&cand) {
+                    if r > best_reward {
+                        best = cand;
+                        best_reward = r;
                     }
                 }
             }

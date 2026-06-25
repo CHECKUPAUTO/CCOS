@@ -5,6 +5,7 @@ use crate::eviction_policy::{
 };
 use crate::util::sha256_hex;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
 use std::path::PathBuf;
@@ -90,6 +91,16 @@ pub struct ScoringWeights {
     pub w_recency: f64,
     /// Weight on `ln(access_count)`.
     pub w_access: f64,
+    /// Weight on **structural centrality** — `ln(1 + in_degree)`, the number of
+    /// incoming causal edges. A hub (a shared module / interface that many nodes
+    /// depend on) is structurally more important than a leaf, independent of how
+    /// recently it was touched. **Default `0.0`** (off): the score is then
+    /// byte-identical to before this term existed, so snapshots/replay are
+    /// unchanged. Set it (or let [`crate::agent_session::AgentSession::tune_recall_weights`]
+    /// learn it) to retain hubs more strongly. `skip_serializing_if` elides it when
+    /// `0.0` so the default serialized form is unchanged.
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
+    pub w_centrality: f64,
     /// Geometric attenuation of failure pressure per propagation hop.
     pub failure_decay: f64,
     /// Out-degree at which a node starts **distributing** (rather than
@@ -108,6 +119,12 @@ fn default_failure_fanout() -> f64 {
     6.0
 }
 
+/// `skip_serializing_if` predicate: elide an `f64` weight when it is exactly `0.0`
+/// (an off-by-default term), keeping the serialized form unchanged.
+fn is_zero_f64(x: &f64) -> bool {
+    *x == 0.0
+}
+
 impl Default for ScoringWeights {
     fn default() -> Self {
         Self {
@@ -115,6 +132,7 @@ impl Default for ScoringWeights {
             w_failure: 0.50,
             w_recency: 0.30,
             w_access: 0.05,
+            w_centrality: 0.0,
             failure_decay: 0.8,
             failure_fanout: default_failure_fanout(),
         }
@@ -140,6 +158,7 @@ impl ScoringWeights {
             w_failure: get("CCOS_W_FAILURE", d.w_failure),
             w_recency: get("CCOS_W_RECENCY", d.w_recency),
             w_access: get("CCOS_W_ACCESS", d.w_access),
+            w_centrality: get("CCOS_W_CENTRALITY", d.w_centrality),
             failure_decay: get("CCOS_FAILURE_DECAY", d.failure_decay),
             failure_fanout: get("CCOS_FAILURE_FANOUT", d.failure_fanout),
         }
@@ -198,6 +217,12 @@ pub struct MemoryGraph {
     /// [`is_compacted`](Self::is_compacted)), never silently drops.
     #[serde(skip)]
     cold_content_budget: Option<usize>,
+    /// Cached in-degree map for the structural-centrality score term, keyed on
+    /// `edges.len()` (edges are only ever appended or `retain`-pruned, so the
+    /// length changes whenever the edge set does). Runtime-only; rebuilt lazily,
+    /// and only ever consulted when `scoring_weights.w_centrality != 0`.
+    #[serde(skip)]
+    indegree_cache: RefCell<Option<(usize, HashMap<NodeId, u32>)>>,
 }
 
 /// A bound spill store plus the resident-content budget that triggers a flush.
@@ -323,6 +348,7 @@ impl MemoryGraph {
             cold: BTreeMap::new(),
             spill: None,
             cold_content_budget: None,
+            indegree_cache: RefCell::new(None),
         }
     }
 
@@ -455,7 +481,29 @@ impl MemoryGraph {
         let failure = node.failure_relevance * w.w_failure;
         let recency = node.recency * w.w_recency;
         let access = (node.access_count.max(1) as f64).ln() * w.w_access;
-        (base + failure + recency + access).clamp(0.0, 1.0)
+        // Structural-centrality term — `ln(1 + in_degree)`. Off by default
+        // (`w_centrality == 0`), in which case this is byte-identical to the
+        // previous score and no in-degree map is ever built.
+        let centrality = if w.w_centrality != 0.0 {
+            (1.0 + self.node_in_degree(&node.id) as f64).ln() * w.w_centrality
+        } else {
+            0.0
+        };
+        (base + failure + recency + access + centrality).clamp(0.0, 1.0)
+    }
+
+    /// In-degree of `id` (count of incoming causal edges), via a cache keyed on
+    /// `edges.len()`. Only built when the centrality term is enabled; deterministic.
+    fn node_in_degree(&self, id: &NodeId) -> u32 {
+        let mut cache = self.indegree_cache.borrow_mut();
+        if cache.as_ref().map(|(v, _)| *v) != Some(self.edges.len()) {
+            let mut m: HashMap<NodeId, u32> = HashMap::new();
+            for e in &self.edges {
+                *m.entry(e.target.clone()).or_default() += 1;
+            }
+            *cache = Some((self.edges.len(), m));
+        }
+        cache.as_ref().unwrap().1.get(id).copied().unwrap_or(0)
     }
 
     pub fn select_context_window(&self, max_tokens: usize) -> Vec<&GraphNode> {
@@ -2257,6 +2305,59 @@ mod tests {
         assert_eq!(g.cold_compacted_count(), 0);
         g.set_cold_content_budget(Some(1));
         assert_eq!(g.cold_ids().filter(|id| g.is_at_floor(id)).count(), parked);
+    }
+
+    // ── structural-centrality scoring term (the Gemini-reflection idea) ───────
+
+    #[test]
+    fn centrality_is_off_by_default_and_elided() {
+        let mut g = MemoryGraph::new(0.2, 100);
+        for id in ["hub", "a", "b"] {
+            g.upsert_node(id.into(), id.into(), "x".into(), NodeType::Symbol);
+        }
+        g.add_edge("a".into(), "hub".into(), 1.0, EdgeType::DependsOn);
+        g.add_edge("b".into(), "hub".into(), 1.0, EdgeType::DependsOn);
+        // With centrality off (the default), the hub (in-degree 2) scores exactly
+        // like a leaf (in-degree 0) — the term contributes nothing.
+        let hub = g.compute_node_score(g.node(&NodeId("hub".into())).unwrap());
+        let a = g.compute_node_score(g.node(&NodeId("a".into())).unwrap());
+        assert_eq!(hub, a, "centrality off ⇒ in-degree does not move the score");
+        // And the default weights serialize without the new field.
+        let json = serde_json::to_string(&g.scoring_weights).unwrap();
+        assert!(
+            !json.contains("w_centrality"),
+            "an off (0.0) centrality weight is elided: {json}"
+        );
+    }
+
+    #[test]
+    fn centrality_boosts_a_hub_over_a_leaf_when_enabled() {
+        let mut g = MemoryGraph::new(0.2, 100);
+        for id in ["hub", "a", "b", "leaf"] {
+            g.upsert_node(id.into(), id.into(), "x".into(), NodeType::Symbol);
+        }
+        g.add_edge("a".into(), "hub".into(), 1.0, EdgeType::DependsOn);
+        g.add_edge("b".into(), "hub".into(), 1.0, EdgeType::DependsOn);
+        g.set_scoring_weights(ScoringWeights {
+            w_centrality: 0.3,
+            ..ScoringWeights::default()
+        });
+        let hub = g.compute_node_score(g.node(&NodeId("hub".into())).unwrap());
+        let leaf = g.compute_node_score(g.node(&NodeId("leaf".into())).unwrap());
+        assert!(
+            hub > leaf,
+            "a hub (in-degree 2) outscores a leaf (in-degree 0): {hub} vs {leaf}"
+        );
+        // The in-degree cache must track edge changes (keyed on edges.len()): a new
+        // incoming edge raises the hub's score further.
+        let before = hub;
+        g.upsert_node("c".into(), "c".into(), "x".into(), NodeType::Symbol);
+        g.add_edge("c".into(), "hub".into(), 1.0, EdgeType::DependsOn);
+        let after = g.compute_node_score(g.node(&NodeId("hub".into())).unwrap());
+        assert!(
+            after > before,
+            "a new dependant raises centrality: {after} > {before}"
+        );
     }
 
     #[test]
