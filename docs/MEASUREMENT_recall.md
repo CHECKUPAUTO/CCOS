@@ -79,7 +79,42 @@ Opt-in — **LSA (`learned-embed`)**:
   match than the target — a real difficulty of testing latent links in an
   entry-selection (not ranking) recall. Treat the synonym column as inconclusive for LSA.
 
+## Follow-up: is LSA a better *dense ranker*? (its home turf)
+
+The entry-selection result above is not LSA's natural use — LSA's strength is ranking
+*many* candidates, not picking one entry. `examples/embed_ranking.rs` isolates that:
+fit TF-IDF and LSA on the same corpus, and for each query with a known target measure
+**recall@k** (is the target in the top-k by cosine?). Both embedders in one run; no
+feature flag.
+
+**synonym queries** (the target file never contains the query term):
+
+| embedder    | recall@1 | recall@3 | recall@5 | recall@10 |
+|-------------|---------:|---------:|---------:|----------:|
+| tfidf       |    0%    |    0%    |   10%    |    10%    |
+| lsa-rank16  |    0%    |    0%    | **50%**  | **80%**   |
+| lsa-rank48  |    0%    |    0%    |   10%    |    10%    |
+
+(plain queries: all embedders ~90–100% at every k — they tie.)
+
+Two clean conclusions:
+1. **LSA *is* a better dense ranker for synonymy — but only at a low rank.** rank 16
+   recovered synonyms (recall@10 80% vs TF-IDF 10%); **rank 48 gave no benefit** (a
+   high rank means almost no truncation, so no latent smoothing). The default
+   `build_embeddings` LSA rank was therefore changed **48 → 16**.
+2. **LSA never helps the top-1** (recall@1 stays 0% even at rank 16). So it is useless
+   for *entry selection* (which needs the single best node) and useful only for
+   *ranking* a candidate set (recall@k≥5). This exactly explains why wiring it into
+   entry selection hurt: doubly mis-applied (rank too high *and* wrong stage).
+
+**Disposition:** LSA stays opt-in. The capability is now *validated for dense ranking
+at low rank*; the honest next step to make it earn the default path is to wire it into
+a **re-ranking** stage (rank the region/window candidates) rather than entry selection.
+Until then it is correct but mis-placed, and off by default.
+
 ## Bottom line
 
-Hybrid fusion earns its place on the default path; the learned LSA embedder has **not**
-earned a recommendation and stays opt-in — measured, not assumed.
+Hybrid fusion earns its place on the default path. The learned LSA embedder is now
+*measured*, not assumed: a genuine synonym-ranking win at rank 16, but useless for the
+entry selection it is currently wired into — so it stays opt-in, with a clear,
+data-backed path (re-ranking) to validate it later.
