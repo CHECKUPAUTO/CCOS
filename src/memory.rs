@@ -108,6 +108,15 @@ pub struct ScoringWeights {
     /// `0.0` so the default serialized form is unchanged.
     #[serde(default, skip_serializing_if = "is_zero_f64")]
     pub w_centrality: f64,
+    /// How the centrality term measures structural importance (only consulted when
+    /// `w_centrality != 0`). [`CentralityMode::InDegree`] (default) is the raw incoming-
+    /// edge count `ln(1 + in_degree)` — cheap and local. [`CentralityMode::Eigenvector`]
+    /// is a *global*, recursive importance (damped power iteration, see
+    /// [`eigencentrality`](MemoryGraph::eigencentrality)): a node is important if
+    /// *important* nodes depend on it. Elided from the serialized form when default, so
+    /// existing snapshots are byte-identical.
+    #[serde(default, skip_serializing_if = "CentralityMode::is_default")]
+    pub centrality_mode: CentralityMode,
     /// Geometric attenuation of failure pressure per propagation hop.
     pub failure_decay: f64,
     /// Out-degree at which a node starts **distributing** (rather than
@@ -118,6 +127,30 @@ pub struct ScoringWeights {
     /// flood the graph. See `docs/FIELD_CAMPAIGN_H.md` (root cause #2).
     #[serde(default = "default_failure_fanout")]
     pub failure_fanout: f64,
+}
+
+/// How [`ScoringWeights::centrality_mode`] turns graph structure into a node's
+/// centrality score.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum CentralityMode {
+    /// `ln(1 + in_degree)` — importance = the raw count of incoming causal edges.
+    /// Local and O(1) per node (one cached in-degree pass); the shipped behaviour.
+    #[default]
+    InDegree,
+    /// **Eigenvector centrality** — importance propagates recursively: a node is
+    /// important if *important* nodes depend on it, so a hub that many *other hubs*
+    /// rely on outranks a hub that only leaves rely on (which in-degree cannot tell
+    /// apart). Computed by deterministic **damped power iteration** — see
+    /// [`MemoryGraph::eigencentrality`] for why the damping (Katz/PageRank form) is
+    /// the correct realization of `A x = λ x` on a code graph, which is largely a DAG.
+    Eigenvector,
+}
+
+impl CentralityMode {
+    /// `serde` skip predicate: elide the default so existing snapshots are unchanged.
+    fn is_default(&self) -> bool {
+        matches!(self, CentralityMode::InDegree)
+    }
 }
 
 /// Default [`ScoringWeights::failure_fanout`]; also fills the field when an older
@@ -140,6 +173,7 @@ impl Default for ScoringWeights {
             w_recency: 0.30,
             w_access: 0.05,
             w_centrality: 0.0,
+            centrality_mode: CentralityMode::InDegree,
             failure_decay: 0.8,
             failure_fanout: default_failure_fanout(),
         }
@@ -166,6 +200,20 @@ impl ScoringWeights {
             w_recency: get("CCOS_W_RECENCY", d.w_recency),
             w_access: get("CCOS_W_ACCESS", d.w_access),
             w_centrality: get("CCOS_W_CENTRALITY", d.w_centrality),
+            // `CCOS_CENTRALITY_MODE=eigenvector` switches to the global recursive
+            // centrality; anything else (or unset) keeps the in-degree default.
+            centrality_mode: match std::env::var("CCOS_CENTRALITY_MODE")
+                .ok()
+                .as_deref()
+                .map(str::trim)
+                .map(str::to_ascii_lowercase)
+                .as_deref()
+            {
+                Some("eigenvector") | Some("eigen") | Some("pagerank") => {
+                    CentralityMode::Eigenvector
+                }
+                _ => d.centrality_mode,
+            },
             failure_decay: get("CCOS_FAILURE_DECAY", d.failure_decay),
             failure_fanout: get("CCOS_FAILURE_FANOUT", d.failure_fanout),
         }
@@ -286,7 +334,19 @@ pub struct MemoryGraph {
     /// and only ever consulted when `scoring_weights.w_centrality != 0`.
     #[serde(skip)]
     indegree_cache: RefCell<Option<(usize, HashMap<NodeId, u32>)>>,
+    /// Cached eigenvector-centrality vector for the structural-centrality score term,
+    /// keyed on `(nodes.len(), edges.len())` (a cheap proxy for "the graph changed",
+    /// matching [`indegree_cache`](Self::indegree_cache)). Runtime-only; rebuilt lazily
+    /// by deterministic power iteration, and only ever consulted when
+    /// `w_centrality != 0` *and* `centrality_mode == Eigenvector`.
+    #[serde(skip)]
+    eigencentrality_cache: RefCell<EigenCentralityCache>,
 }
+
+/// Cache value behind [`MemoryGraph::node_eigencentrality`]: the centrality vector keyed
+/// by `(nodes.len(), edges.len())` — a cheap "did the graph change" stamp. Aliased to keep
+/// the field type readable (and clippy's `type_complexity` happy).
+type EigenCentralityCache = Option<((usize, usize), HashMap<NodeId, f64>)>;
 
 /// A bound spill store plus the resident-content budget that triggers a flush.
 /// Not serialised — held only while a [`MemoryGraph`] is live.
@@ -513,6 +573,7 @@ impl MemoryGraph {
             cold_content_budget: None,
             cold_resident_budget: None,
             indegree_cache: RefCell::new(None),
+            eigencentrality_cache: RefCell::new(None),
         }
     }
 
@@ -660,11 +721,16 @@ impl MemoryGraph {
         let failure = node.failure_relevance * w.w_failure;
         let recency = node.recency * w.w_recency;
         let access = (node.access_count.max(1) as f64).ln() * w.w_access;
-        // Structural-centrality term — `ln(1 + in_degree)`. Off by default
-        // (`w_centrality == 0`), in which case this is byte-identical to the
-        // previous score and no in-degree map is ever built.
+        // Structural-centrality term. Off by default (`w_centrality == 0`), in which case
+        // this is byte-identical to the previous score and neither the in-degree map nor
+        // the eigenvector vector is ever built. When on, the mode picks the signal:
+        // local `ln(1 + in_degree)` (default) or global recursive eigenvector centrality.
         let centrality = if w.w_centrality != 0.0 {
-            (1.0 + self.node_in_degree(&node.id) as f64).ln() * w.w_centrality
+            let signal = match w.centrality_mode {
+                CentralityMode::InDegree => (1.0 + self.node_in_degree(&node.id) as f64).ln(),
+                CentralityMode::Eigenvector => self.node_eigencentrality(&node.id),
+            };
+            signal * w.w_centrality
         } else {
             0.0
         };
@@ -686,6 +752,78 @@ impl MemoryGraph {
             *cache = Some((self.edges.len(), m));
         }
         cache.as_ref().unwrap().1.get(id).copied().unwrap_or(0)
+    }
+
+    /// **Eigenvector centrality** of the resident graph, by deterministic damped power
+    /// iteration. Importance flows along causal edges into their target, so a node is
+    /// central when *central* nodes depend on it — distinguishing a hub that other hubs
+    /// rely on from a hub that only leaves rely on, which [`node_in_degree`](Self::node_in_degree)
+    /// cannot. Returns a `NodeId → score` map normalized to `[0, 1]` (most-central = 1.0).
+    ///
+    /// **Why damped.** Pure eigenvector centrality solves `A x = λ x` for the principal
+    /// eigenvalue, but a code dependency graph is largely a **DAG** (imports / contains
+    /// flow one way); its adjacency is nilpotent (`λ_max = 0`), so the pure vector
+    /// collapses onto the sinks and is ill-defined. The damped iteration
+    /// `x ← (1−d)/N + d·(Aᵀ x with out-degree split)` (the Katz / PageRank form) is the
+    /// eigenvector of the *damped* operator and stays well-defined and strictly positive
+    /// on any directed graph — the standard, correct realization on real code.
+    ///
+    /// **Deterministic:** a fixed iteration count accumulating over **sorted** node ids,
+    /// so it is a pure function of the graph (no `HashMap`-order or float-summation-order
+    /// dependence). Like all scoring it is a read-only ranking signal and never enters the
+    /// snapshot/replay hash, so its `f64`s are safe.
+    pub fn eigencentrality(&self) -> HashMap<NodeId, f64> {
+        let n = self.nodes.len();
+        if n == 0 {
+            return HashMap::new();
+        }
+        // Stable ordering ⇒ deterministic accumulation order.
+        let mut ids: Vec<&NodeId> = self.nodes.keys().collect();
+        ids.sort();
+        let index: HashMap<&NodeId, usize> =
+            ids.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+        // Resident edges as (source_idx, target_idx); out-degree splits each node's mass
+        // over its out-edges (PageRank) so one over-connected node cannot flood the rest.
+        let mut outdeg = vec![0u32; n];
+        let mut edges: Vec<(usize, usize)> = Vec::with_capacity(self.edges.len());
+        for e in &self.edges {
+            if let (Some(&s), Some(&t)) = (index.get(&e.source), index.get(&e.target)) {
+                edges.push((s, t));
+                outdeg[s] += 1;
+            }
+        }
+        const ITERS: usize = 64;
+        const DAMP: f64 = 0.85;
+        let base = (1.0 - DAMP) / n as f64;
+        let mut x = vec![1.0 / n as f64; n];
+        for _ in 0..ITERS {
+            let mut next = vec![base; n];
+            for &(s, t) in &edges {
+                // `s` is a source ⇒ outdeg[s] ≥ 1, so this never divides by zero.
+                next[t] += DAMP * x[s] / outdeg[s] as f64;
+            }
+            x = next;
+        }
+        // Normalize to [0,1] by the max so the term sits on the same scale as the rest of
+        // the (clamped [0,1]) score. No edges anywhere ⇒ all equal ⇒ all 1.0.
+        let max = x.iter().copied().fold(0.0_f64, f64::max);
+        let inv = if max > 0.0 { 1.0 / max } else { 1.0 };
+        ids.into_iter()
+            .enumerate()
+            .map(|(i, id)| (id.clone(), x[i] * inv))
+            .collect()
+    }
+
+    /// Cached per-node eigenvector centrality for the scoring hot path (mirrors
+    /// [`node_in_degree`](Self::node_in_degree)): the whole vector is recomputed only when
+    /// `(nodes.len(), edges.len())` changes, then looked up per node.
+    fn node_eigencentrality(&self, id: &NodeId) -> f64 {
+        let key = (self.nodes.len(), self.edges.len());
+        let mut cache = self.eigencentrality_cache.borrow_mut();
+        if cache.as_ref().map(|(k, _)| *k) != Some(key) {
+            *cache = Some((key, self.eigencentrality()));
+        }
+        cache.as_ref().unwrap().1.get(id).copied().unwrap_or(0.0)
     }
 
     pub fn select_context_window(&self, max_tokens: usize) -> Vec<&GraphNode> {
@@ -2351,6 +2489,128 @@ mod tests {
         );
         // An absent id is simply a miss.
         assert!(!g.touch(&"missing".into()));
+    }
+
+    /// Eigenvector centrality is a pure function of the graph and handles the trivial
+    /// shapes (empty, edgeless, single hub).
+    #[test]
+    fn eigencentrality_is_deterministic_and_handles_edge_cases() {
+        // Empty graph → empty vector.
+        assert!(MemoryGraph::new(0.2, usize::MAX)
+            .eigencentrality()
+            .is_empty());
+
+        // Edgeless graph → every node equal (normalized to 1.0).
+        let mut g = MemoryGraph::new(0.2, usize::MAX);
+        for n in ["a", "b", "c"] {
+            g.upsert_node(n.into(), n.into(), "".into(), NodeType::Module);
+        }
+        let iso = g.eigencentrality();
+        assert_eq!(iso.len(), 3);
+        assert!(iso.values().all(|v| (v - 1.0).abs() < 1e-9));
+
+        // A hub depended-upon by three leaves: deterministic, and the hub leads.
+        let build = || {
+            let mut g = MemoryGraph::new(0.2, usize::MAX);
+            for n in ["hub", "x", "y", "z"] {
+                g.upsert_node(n.into(), n.into(), "".into(), NodeType::Module);
+            }
+            for s in ["x", "y", "z"] {
+                g.add_edge(s.into(), "hub".into(), 1.0, EdgeType::DependsOn);
+            }
+            g.eigencentrality()
+        };
+        assert_eq!(
+            build(),
+            build(),
+            "eigencentrality is a pure function of the graph"
+        );
+        let ec = build();
+        let hub = ec.get(&"hub".into()).copied().unwrap();
+        for leaf in ["x", "y", "z"] {
+            assert!(
+                hub > ec.get(&leaf.into()).copied().unwrap(),
+                "hub outranks its leaves"
+            );
+        }
+    }
+
+    /// The point of eigenvector centrality: it ranks a *recursively* central node above
+    /// one with higher *raw* in-degree — exactly the case in-degree gets wrong.
+    #[test]
+    fn eigenvector_centrality_captures_recursive_importance_indegree_misses() {
+        // 3 mid-hubs, each depended-upon by 5 leaves; all 3 mids depend on `top`.
+        //   in-degree:  each mid = 5, top = 3  → ranks a mid ABOVE top
+        //   eigenvector: top inherits the mids' mass → ranks top ABOVE a mid
+        let mut g = MemoryGraph::new(0.2, usize::MAX);
+        g.upsert_node("top".into(), "top".into(), "".into(), NodeType::Module);
+        for m in 0..3 {
+            let mid = format!("mid{m}");
+            g.upsert_node(mid.clone().into(), mid.clone(), "".into(), NodeType::Module);
+            g.add_edge(mid.clone().into(), "top".into(), 1.0, EdgeType::DependsOn);
+            for l in 0..5 {
+                let leaf = format!("leaf{m}_{l}");
+                g.upsert_node(
+                    leaf.clone().into(),
+                    leaf.clone(),
+                    "".into(),
+                    NodeType::Module,
+                );
+                g.add_edge(leaf.into(), mid.clone().into(), 1.0, EdgeType::DependsOn);
+            }
+        }
+        assert!(
+            g.node_in_degree(&"mid0".into()) > g.node_in_degree(&"top".into()),
+            "in-degree ranks a mid (5) above top (3)"
+        );
+        let ec = g.eigencentrality();
+        let top = ec.get(&"top".into()).copied().unwrap();
+        let mid = ec.get(&"mid0".into()).copied().unwrap();
+        assert!(
+            top > mid,
+            "eigenvector ranks top above a mid: top={top} mid={mid}"
+        );
+
+        // And the mode actually drives the score: with the eigenvector mode the
+        // recursively-central node scores highest; with in-degree the raw-count mid does.
+        let score = |g: &MemoryGraph, id: &str| g.compute_node_score(g.node(&id.into()).unwrap());
+        g.set_scoring_weights(ScoringWeights {
+            w_centrality: 0.5,
+            centrality_mode: CentralityMode::Eigenvector,
+            ..Default::default()
+        });
+        assert!(
+            score(&g, "top") > score(&g, "mid0"),
+            "eigenvector mode lifts top"
+        );
+        g.set_scoring_weights(ScoringWeights {
+            w_centrality: 0.5,
+            centrality_mode: CentralityMode::InDegree,
+            ..Default::default()
+        });
+        assert!(
+            score(&g, "mid0") >= score(&g, "top"),
+            "in-degree mode favors the raw count"
+        );
+    }
+
+    /// The default mode is elided from the snapshot (byte-identical) and round-trips when set.
+    #[test]
+    fn centrality_mode_serde_elides_default_and_round_trips() {
+        let w = ScoringWeights::default();
+        assert_eq!(w.centrality_mode, CentralityMode::InDegree);
+        let json = serde_json::to_string(&w).unwrap();
+        assert!(
+            !json.contains("centrality_mode"),
+            "default mode is elided: {json}"
+        );
+        let eigen = ScoringWeights {
+            centrality_mode: CentralityMode::Eigenvector,
+            ..Default::default()
+        };
+        let back: ScoringWeights =
+            serde_json::from_str(&serde_json::to_string(&eigen).unwrap()).unwrap();
+        assert_eq!(back.centrality_mode, CentralityMode::Eigenvector);
     }
 
     #[test]
