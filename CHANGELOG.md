@@ -33,9 +33,43 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   persist, rebuilt on the replay re-ingest → `replay == live` holds). Off on the heuristic path.
   A **scope guard** excludes locally-bound names (parameters, `let`s, fn-local `const`/`static`)
   from capture, so a local never mislinks to a same-named global — closing the cardinal false-edge
-  an adversarial review found. Slice 1 covers bare references resolved global-unique; qualified
-  `m::CONST`, same-module disambiguation, write/read direction, and the rare residual (a bare
-  `SCREAMING`-cased `use`-imported enum variant coinciding with a global const) are later slices.
+  an adversarial review found. Slice 1 covers bare references resolved global-unique; **Slice 2**
+  (below) adds qualified `m::CONST`. Same-module disambiguation, write/read direction, and the rare
+  residual (a bare `SCREAMING`-cased `use`-imported enum variant coinciding with a global const)
+  remain later slices.
+
+- **Data-flow Slice 2 — qualified `m::CONST` references.** In-body value paths whose *last* segment
+  is `SCREAMING_SNAKE` (`config::MAX_RETRIES`, `crate::limits::MAX`, `self::FOO`) are now captured
+  with their full `::`-path and resolved through a shared `resolve_qualified` helper — the *same*
+  machinery qualified calls use, but against a **data-symbol-only** index, so a qualified ref can
+  only ever land on a `static`/`const`, never a fn. **Resolve-uniquely-or-skip**: the module prefix
+  is pinned to a defining file (crate-rooted, or an alias expanded through the file's imports), with
+  no fallback to the bare global index — an unresolvable/ambiguous qualified ref adds no edge. The
+  local-binding scope guard extends to qualified paths (a locally-bound head segment is skipped).
+
+- **`data_flow_crux` measurement** (`examples/data_flow_crux.rs`, `docs/MEASUREMENT_data_flow_crux.md`).
+  The data-flow analogue of the call/import crux: a reader names the const it reads (partial lexical
+  signal), but two **co-readers** of the same global share only that one concept — swamped by their
+  disjoint domain vocabulary, a true co-reader typically ranks below an unrelated decoy (lexical
+  recall@1 ≈25 %, MRR ≈0.49). The data-flow graph recovers the shared-state link by construction —
+  the cross-vocabulary channel a vector retriever cannot see.
+
+- **Call-graph polish — renamed-import aliases & cross-impl-block self-calls.** Two precision gains,
+  both resolve-uniquely-or-skip and deterministic: (1) `use a::b as c` now binds the local alias `c`
+  to target `a::b` (top-level, in groups, nested groups), so a call `c()` / `c::X` rewrites onto the
+  real target and never mislinks to a same-named sibling; (2) `self.method()` / `Self::method` now
+  resolves across **all** impl blocks of a type — a `BTreeMap<type, methods>` unions every inherent
+  and trait impl, so a self-call reaches a method defined in a *different* block of the same type,
+  while a blanket `impl<T> .. for T` (type-variable Self) and two distinct types sharing a method
+  name are strictly kept from cross-linking.
+
+- **Spectral primitive — deterministic eigenvector centrality (`src/spectral.rs`, #13 first slice).**
+  `eigenvector_centrality` computes the textbook `A x = λ x` ranking by power iteration on the
+  **symmetrized**, `A + I`-shifted adjacency (the shift defeats the bipartite oscillation a DAG-like
+  code graph would otherwise cause), L2-normalized, processed in sorted node order for byte-identical
+  runs. Dependency-free and pure (read-only, not wired into scoring/CLI) — a clean brick complementary
+  to the damped `MemoryGraph::eigencentrality`. Spectral regions, the temporal tensor, and any
+  `scirust` fusion are deliberately deferred to a later design pass.
 
 - **Call-graph semantic edges — `EdgeType::Calls` (ROADMAP P1.3, Slice 1).** The `syn` AST
   now extracts in-body function-call sites; a deterministic whole-graph pass
