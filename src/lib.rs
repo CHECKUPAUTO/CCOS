@@ -123,6 +123,7 @@ pub mod persist;
 pub mod postmortem;
 pub mod query;
 pub mod sanitizer;
+pub mod spectral;
 pub mod trace;
 pub mod util;
 

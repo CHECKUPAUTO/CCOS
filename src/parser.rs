@@ -18,6 +18,13 @@ pub struct ParseResult {
     /// skip-if-empty serde contract — empty on the heuristic path and for call-free bodies.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub data_refs: Vec<DataRef>,
+    /// Renamed-import bindings — one per `use a::b as c` (including inside groups). Records the
+    /// LOCAL name (`c`) and the ORIGINAL target path (`a::b`) so a later call to the alias (`c()`
+    /// or qualified `c::X`) resolves to the real definition. Only the `syn` (real-AST) path can
+    /// see a rename; the heuristic fallback leaves this empty (same skip-if-empty serde contract as
+    /// `call_sites`/`data_refs`, so the common no-alias case serializes unchanged).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub import_aliases: Vec<ImportAlias>,
     pub generated_nodes: usize,
     pub generated_edges: usize,
 }
@@ -58,9 +65,11 @@ pub struct CallSite {
     pub line: usize,
 }
 
-/// A **data-reference**: `reader`'s body mentions `name`, an identifier in `SCREAMING_SNAKE_CASE`
-/// (the Rust convention for a `static`/`const`). Resolved to a `static`/`const` definition symbol
-/// by [`crate::memory::MemoryGraph::resolve_data_flow`], which adds a `reader → item`
+/// A **data-reference**: `reader`'s body mentions `name`, a value path whose last segment is in
+/// `SCREAMING_SNAKE_CASE` (the Rust convention for a `static`/`const`). `name` is the full
+/// `::`-joined path — a bare `FOO` (Slice 1) or a qualified `m::CONST` / `crate::limits::MAX`
+/// (Slice 2). Resolved to a `static`/`const` definition symbol by
+/// [`crate::memory::MemoryGraph::resolve_data_flow`], which adds a `reader → item`
 /// [`EdgeType::DataFlow`](crate::memory::EdgeType) edge — the shared-global-state channel that call
 /// and import edges miss. Only emitted on the `syn` (real-AST) path; empty on the heuristic fallback.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,6 +77,18 @@ pub struct DataRef {
     pub reader: String,
     pub name: String,
     pub line: usize,
+}
+
+/// A **renamed import**: `use a::b as c` binds the LOCAL name `local` (`c`) to the ORIGINAL target
+/// path `target` (`a::b`). A later call to the alias — bare `c()` or qualified `c::X` — is resolved
+/// by [`crate::memory::MemoryGraph::resolve_symbol_calls`] by rewriting the alias's leading segment
+/// through `target`, so the edge lands on `a::b`'s real definition (never on a same-named sibling
+/// module/symbol). The plain (non-renamed) `use a::b` keeps the local name `b`, so it needs no
+/// entry here. Only emitted on the `syn` (real-AST) path; empty on the heuristic fallback.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportAlias {
+    pub local: String,
+    pub target: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -94,7 +115,7 @@ impl ASTParser {
 
     pub fn parse_source(&self, file_path: &str, source_code: &str) -> ParseResult {
         let hash = Self::compute_hash(source_code);
-        let (modules, use_statements, symbols, call_sites, data_refs) =
+        let (modules, use_statements, symbols, call_sites, data_refs, import_aliases) =
             Self::extract_all(source_code);
 
         ParseResult {
@@ -107,6 +128,7 @@ impl ASTParser {
             symbols,
             call_sites,
             data_refs,
+            import_aliases,
         }
     }
 
@@ -125,6 +147,7 @@ impl ASTParser {
         Vec<Symbol>,
         Vec<CallSite>,
         Vec<DataRef>,
+        Vec<ImportAlias>,
     ) {
         #[cfg(feature = "syn-parser")]
         {
@@ -132,13 +155,14 @@ impl ASTParser {
                 return parsed;
             }
         }
-        // Heuristic fallback emits no call-sites or data-refs (it does not parse expression
-        // trees), so the call/data-flow graphs simply stay empty on that path — a build can only
-        // ever *omit* those edges.
+        // Heuristic fallback emits no call-sites, data-refs, or import aliases (it does not parse
+        // expression trees or `use`-tree renames), so the call/data-flow graphs simply stay empty
+        // on that path — a build can only ever *omit* those edges.
         (
             Self::extract_modules(source),
             Self::extract_uses(source),
             Self::extract_symbols(source),
+            Vec::new(),
             Vec::new(),
             Vec::new(),
         )
@@ -275,6 +299,16 @@ impl ASTParser {
                 .data_refs
                 .iter()
                 .map(|d| (d.reader.clone(), d.name.clone(), d.line))
+                .collect(),
+        );
+        // And this file's renamed-import bindings (`use a::b as c` → local `c` ↦ target `a::b`),
+        // consulted by `resolve_symbol_calls` so a call to the alias resolves to the real target.
+        graph.set_pending_aliases(
+            &result.file_path,
+            result
+                .import_aliases
+                .iter()
+                .map(|a| (a.local.clone(), a.target.clone()))
                 .collect(),
         );
     }
@@ -744,7 +778,7 @@ fn symbol_span(lines: &[&str], start_line: usize) -> (usize, usize) {
 /// natively. Returns `None` on a syntax error so the caller can fall back.
 #[cfg(feature = "syn-parser")]
 mod syn_ast {
-    use super::{CallSite, DataRef, ModuleDecl, Symbol, SymbolKind, UseStatement};
+    use super::{CallSite, DataRef, ImportAlias, ModuleDecl, Symbol, SymbolKind, UseStatement};
     use proc_macro2::Span;
     use std::collections::HashSet;
     use syn::spanned::Spanned;
@@ -759,11 +793,19 @@ mod syn_ast {
         Vec<Symbol>,
         Vec<CallSite>,
         Vec<DataRef>,
+        Vec<ImportAlias>,
     )> {
         let file = syn::parse_file(source).ok()?;
         let mut out = Collected::default();
         walk(&file.items, &mut out);
-        Some((out.modules, out.uses, out.symbols, out.calls, out.data_refs))
+        Some((
+            out.modules,
+            out.uses,
+            out.symbols,
+            out.calls,
+            out.data_refs,
+            out.aliases,
+        ))
     }
 
     #[derive(Default)]
@@ -773,6 +815,7 @@ mod syn_ast {
         symbols: Vec<Symbol>,
         calls: Vec<CallSite>,
         data_refs: Vec<DataRef>,
+        aliases: Vec<ImportAlias>,
     }
 
     /// Collects single-segment free-function call-sites from a function body, in source
@@ -841,25 +884,41 @@ mod syn_ast {
             syn::visit::visit_expr_method_call(self, node);
         }
         fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
-            // Data-flow Slice 1 — a bare `SCREAMING_SNAKE` value reference is, by Rust convention, a
-            // `static`/`const` use; capture it UNLESS the name is locally bound (a param / `let` /
-            // fn-local `const` — `local_bound`), which would denote the local, not a same-named
-            // global (the false edge the scope guard closes). Casing excludes PascalCase
-            // types/variants and snake_case fns/locals; qualified `m::CONST` is a later slice.
+            // Data-flow — a value path whose LAST segment is `SCREAMING_SNAKE` is, by Rust
+            // convention, a `static`/`const` use. Capture it carrying its FULL `::`-joined path:
+            //   * bare `FOO` (Slice 1), and
+            //   * qualified `m::CONST` / `crate::limits::MAX` / `self::FOO` (Slice 2),
+            // resolved later by [`crate::memory::MemoryGraph::resolve_data_flow`] using the same
+            // import/module machinery as qualified calls. The casing test on the LAST segment
+            // excludes PascalCase types/variants and snake_case fns/locals. `<T>::X` (qself) and a
+            // leading `::X` are skipped, matching qualified-CALL capture.
+            //
+            // Scope guard: skip when the HEAD segment is locally bound (a param / `let` / fn-local
+            // `const` — `local_bound`). For a bare ref the head IS the name, so a local `FOO`
+            // shadows the same-named global (the false edge the guard closes); for a qualified ref a
+            // locally-bound head (`m::CONST` where `m` is a local) likewise must not be captured.
             // (Known residual: a bare SCREAMING-cased enum variant brought in by `use` can still
             // coincide with a global const — rare, since variants are conventionally PascalCase.)
-            if node.qself.is_none()
-                && node.path.leading_colon.is_none()
-                && node.path.segments.len() == 1
-            {
-                let seg = &node.path.segments[0];
-                let name = seg.ident.to_string();
-                if is_screaming_snake(&name) && !self.local_bound.contains(&name) {
-                    self.data_refs.push(DataRef {
-                        reader: self.caller.clone(),
-                        name,
-                        line: line_of(seg.ident.span()),
-                    });
+            if node.qself.is_none() && node.path.leading_colon.is_none() {
+                if let (Some(first), Some(last)) =
+                    (node.path.segments.first(), node.path.segments.last())
+                {
+                    let head = first.ident.to_string();
+                    let last_name = last.ident.to_string();
+                    if is_screaming_snake(&last_name) && !self.local_bound.contains(&head) {
+                        let full = node
+                            .path
+                            .segments
+                            .iter()
+                            .map(|s| s.ident.to_string())
+                            .collect::<Vec<_>>()
+                            .join("::");
+                        self.data_refs.push(DataRef {
+                            reader: self.caller.clone(),
+                            name: full,
+                            line: line_of(last.ident.span()),
+                        });
+                    }
                 }
             }
             syn::visit::visit_expr_path(self, node);
@@ -872,6 +931,73 @@ mod syn_ast {
         s.chars().any(|c| c.is_ascii_uppercase())
             && s.chars()
                 .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+    }
+
+    /// The **concrete Self type name** an `impl` block is for — the final path segment of its
+    /// `self_ty` (`impl a::b::Bar` and `impl Bar<T>` both key under `Bar`) — used to gate and union
+    /// per-type method sets so a `self.foo()` resolves to *this type's* `foo` even when `foo` is
+    /// defined in a different impl block of the same type.
+    ///
+    /// Returns `None` for any shape where a concrete type name cannot be determined, so the caller
+    /// falls back to same-block gating rather than guessing: a reference/tuple/slice/`dyn`/`impl
+    /// Trait`/qself receiver (`impl Trait for &Bar`, `for [T]`, …), or a `self_ty` that is itself one
+    /// of the impl's **generic parameters** (`impl<T> Trait for T` — a blanket impl, where keying
+    /// under `T` would wrongly union two unrelated blanket impls). The generic-parameter guard is the
+    /// key no-cross-link safeguard for blanket impls.
+    fn impl_self_type_name(imp: &syn::ItemImpl) -> Option<String> {
+        let syn::Type::Path(tp) = &*imp.self_ty else {
+            return None; // &Bar / (A, B) / [T] / dyn X / impl Trait / fn(..) — not a named type
+        };
+        if tp.qself.is_some() {
+            return None; // <T as Trait>::Assoc — no single concrete owning type
+        }
+        let last = tp.path.segments.last()?.ident.to_string();
+        // A bare self_ty that names one of the impl's own generic type params is a type *variable*
+        // (`impl<T> .. for T`), not a concrete type — refuse it so blanket impls never cross-link.
+        if tp.path.segments.len() == 1 && impl_generic_type_params(imp).contains(&last) {
+            return None;
+        }
+        Some(last)
+    }
+
+    /// The names of an `impl`'s generic **type** parameters (`impl<T, U>` → {`T`, `U`}). Lifetimes
+    /// and const generics are irrelevant to the type-variable check in [`impl_self_type_name`].
+    fn impl_generic_type_params(imp: &syn::ItemImpl) -> HashSet<String> {
+        imp.generics
+            .params
+            .iter()
+            .filter_map(|p| match p {
+                syn::GenericParam::Type(t) => Some(t.ident.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Union, per concrete Self type, of every method/associated-fn name across **all** impl blocks
+    /// of that type at one scope (inherent `impl Bar` *and* trait impls `impl Trait for Bar`), keyed
+    /// by the type's final-segment name (see [`impl_self_type_name`]). A method body's `self.m()` /
+    /// `Self::m` is then captured when `m` is in its enclosing type's *full* set, so a call resolves
+    /// across impl blocks of the same type — while two **different** types each owning a same-named
+    /// method stay in separate sets and never cross-link. Impls whose Self type is not a concrete
+    /// name are skipped here (their methods fall back to same-block gating). `BTree*` ⇒ deterministic.
+    fn build_type_method_sets(
+        items: &[syn::Item],
+    ) -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
+        let mut map: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+            std::collections::BTreeMap::new();
+        for item in items {
+            if let syn::Item::Impl(imp) = item {
+                if let Some(ty) = impl_self_type_name(imp) {
+                    let set = map.entry(ty).or_default();
+                    for ii in &imp.items {
+                        if let syn::ImplItem::Fn(m) = ii {
+                            set.insert(m.sig.ident.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        map
     }
 
     /// Names bound *locally* in a function — its parameters plus every `let`, fn-local
@@ -951,6 +1077,10 @@ mod syn_ast {
     /// their parent; symbols and `use`s from nested scopes are surfaced into the
     /// flat lists (matching the line parser, which sees every line).
     fn walk(items: &[syn::Item], out: &mut Collected) {
+        // Per-type method sets, unioned across every impl block of each concrete type at THIS scope
+        // (inherent + trait impls). Used below to gate `self.m()` / `Self::m` capture on the type's
+        // FULL method set, so a self-call resolves across sibling impl blocks of the same type.
+        let type_methods = build_type_method_sets(items);
         for item in items {
             match item {
                 syn::Item::Mod(m) => {
@@ -960,6 +1090,7 @@ mod syn_ast {
                     }
                     out.uses.append(&mut child.uses);
                     out.symbols.append(&mut child.symbols);
+                    out.aliases.append(&mut child.aliases);
                     out.modules.push(ModuleDecl {
                         name: m.ident.to_string(),
                         line: line_of(m.ident.span()),
@@ -968,7 +1099,13 @@ mod syn_ast {
                     });
                 }
                 syn::Item::Use(u) => {
-                    flatten_use(&u.tree, String::new(), line_of(u.span()), &mut out.uses);
+                    flatten_use(
+                        &u.tree,
+                        String::new(),
+                        line_of(u.span()),
+                        &mut out.uses,
+                        &mut out.aliases,
+                    );
                 }
                 syn::Item::Fn(f) => {
                     push_sym(out, &f.sig.ident, SymbolKind::Function);
@@ -1019,7 +1156,12 @@ mod syn_ast {
                     }
                 }
                 syn::Item::Impl(i) => {
-                    let methods: HashSet<String> = i
+                    // Gate `self.m()` / `Self::m` on the enclosing type's FULL (unioned) method set
+                    // when the Self type is a concrete name — so a self-call resolves to a method
+                    // defined in a *different* impl block (inherent or trait) of the same type. If
+                    // the Self type is not a concrete name (generic param / reference / tuple / …),
+                    // fall back to THIS block's own methods only — never guess a cross-block link.
+                    let own_block: HashSet<String> = i
                         .items
                         .iter()
                         .filter_map(|ii| match ii {
@@ -1027,6 +1169,13 @@ mod syn_ast {
                             _ => None,
                         })
                         .collect();
+                    let methods: HashSet<String> = match impl_self_type_name(i) {
+                        Some(ty) => type_methods
+                            .get(&ty)
+                            .map(|s| s.iter().cloned().collect())
+                            .unwrap_or(own_block),
+                        None => own_block,
+                    };
                     for ii in &i.items {
                         if let syn::ImplItem::Fn(method) = ii {
                             push_sym(out, &method.sig.ident, SymbolKind::Function);
@@ -1047,8 +1196,16 @@ mod syn_ast {
     }
 
     /// Expand a (possibly grouped) `use` tree into one `UseStatement` per leaf
-    /// path, e.g. `use a::{b, c::d}` → `a::b` and `a::c::d`.
-    fn flatten_use(tree: &syn::UseTree, prefix: String, line: usize, out: &mut Vec<UseStatement>) {
+    /// path, e.g. `use a::{b, c::d}` → `a::b` and `a::c::d`. A renamed leaf
+    /// (`use a::b as c`, including inside a group) additionally records an
+    /// [`ImportAlias`] binding `c ↦ a::b` in `aliases`.
+    fn flatten_use(
+        tree: &syn::UseTree,
+        prefix: String,
+        line: usize,
+        out: &mut Vec<UseStatement>,
+        aliases: &mut Vec<ImportAlias>,
+    ) {
         let join = |p: &str, s: &str| {
             if p.is_empty() {
                 s.to_string()
@@ -1057,20 +1214,31 @@ mod syn_ast {
             }
         };
         match tree {
-            syn::UseTree::Path(p) => {
-                flatten_use(&p.tree, join(&prefix, &p.ident.to_string()), line, out)
-            }
+            syn::UseTree::Path(p) => flatten_use(
+                &p.tree,
+                join(&prefix, &p.ident.to_string()),
+                line,
+                out,
+                aliases,
+            ),
             syn::UseTree::Name(n) => push_use(join(&prefix, &n.ident.to_string()), line, out),
-            // A renamed import `use a::b as c` binds `b` under the name `c`. We record the ORIGINAL
-            // path (`a::b`) so import-linking resolves the real module. Call-resolution by the alias
-            // `c` is deferred: a single path string cannot carry alias→real-module, and recording
-            // the alias instead (`a::c`) would mislink a call `c::foo()` to a real sibling module
-            // `c` if one exists (a wrong-existing-target edge). Proper alias support is future work.
-            syn::UseTree::Rename(r) => push_use(join(&prefix, &r.ident.to_string()), line, out),
+            // A renamed import `use a::b as c` binds the target `a::b` under the LOCAL name `c`.
+            // Record the ORIGINAL path (`a::b`) as the `UseStatement` so import-linking still
+            // resolves the real module (identical to a plain `use a::b`), AND record the alias
+            // binding `c ↦ a::b` so `resolve_symbol_calls` can rewrite a call to `c` onto the real
+            // target — never onto a same-named sibling module/symbol `c`.
+            syn::UseTree::Rename(r) => {
+                let target = join(&prefix, &r.ident.to_string());
+                aliases.push(ImportAlias {
+                    local: r.rename.to_string(),
+                    target: target.clone(),
+                });
+                push_use(target, line, out);
+            }
             syn::UseTree::Glob(_) => push_use(join(&prefix, "*"), line, out),
             syn::UseTree::Group(g) => {
                 for t in &g.items {
-                    flatten_use(t, prefix.clone(), line, out);
+                    flatten_use(t, prefix.clone(), line, out, aliases);
                 }
             }
         }
@@ -1446,6 +1614,66 @@ mod syn_tests {
     }
 
     #[test]
+    fn data_flow_qualified_end_to_end_cross_file() {
+        // End-to-end through the real parser: cfg.rs defines `const MAX_RETRIES`; api.rs's `reader`
+        // references it QUALIFIED as `crate::cfg::MAX_RETRIES`. The parser captures the full path,
+        // and resolve_data_flow pins the prefix to cfg.rs and links to the marked const (Slice 2).
+        let p = ASTParser::new();
+        let mut g = MemoryGraph::new(0.0, usize::MAX);
+        for (path, src) in [
+            ("src/cfg.rs", "pub const MAX_RETRIES: usize = 3;"),
+            (
+                "src/api.rs",
+                "fn reader() -> usize { crate::cfg::MAX_RETRIES + 1 }",
+            ),
+        ] {
+            let r = p.parse_source(path, src);
+            p.update_memory_graph(&r, src, &mut g);
+        }
+        g.resolve_data_flow();
+        let edges: Vec<(String, String)> = g
+            .edges()
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::DataFlow)
+            .map(|e| (e.source.0.clone(), e.target.0.clone()))
+            .collect();
+        assert_eq!(
+            edges,
+            vec![(
+                "sym:src/api.rs:reader".to_string(),
+                "sym:src/cfg.rs:MAX_RETRIES".to_string()
+            )],
+            "qualified crate::cfg::MAX_RETRIES → cfg.rs const, end to end (Slice 2)"
+        );
+    }
+
+    #[test]
+    fn data_flow_qualified_unresolvable_end_to_end_skips() {
+        // A qualified ref whose module prefix pins to NO file must skip end-to-end — never a false
+        // edge. `crate::missing::MAX_RETRIES` (module `missing` has no file) is dropped even though a
+        // unique `MAX_RETRIES` exists in cfg.rs (proving no fall-back to the bare global index).
+        let p = ASTParser::new();
+        let mut g = MemoryGraph::new(0.0, usize::MAX);
+        for (path, src) in [
+            ("src/cfg.rs", "pub const MAX_RETRIES: usize = 3;"),
+            (
+                "src/api.rs",
+                "fn reader() -> usize { crate::missing::MAX_RETRIES + 1 }",
+            ),
+        ] {
+            let r = p.parse_source(path, src);
+            p.update_memory_graph(&r, src, &mut g);
+        }
+        g.resolve_data_flow();
+        assert!(
+            !g.edges()
+                .iter()
+                .any(|e| e.edge_type == EdgeType::DataFlow),
+            "unresolvable qualified ref emits no DataFlow edge (no fallback to the global MAX_RETRIES)"
+        );
+    }
+
+    #[test]
     fn syn_data_refs_skip_locally_bound_names() {
         // A `SCREAMING_SNAKE` name bound locally — a parameter, a fn-local `const`, or a `let` — is
         // NOT a data-ref: it denotes the local, so resolving it global-unique to a same-named global
@@ -1461,6 +1689,53 @@ mod syn_tests {
             assert!(
                 !names.iter().any(|n| n == bound),
                 "{bound} is locally bound — it must not be a data-ref (got {names:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn syn_captures_qualified_screaming_snake_data_ref_full_path() {
+        // A qualified value path whose LAST segment is SCREAMING_SNAKE is captured as a data-ref
+        // carrying its FULL `::`-joined path (Slice 2) — `config::MAX_RETRIES`,
+        // `crate::limits::MAX`, `self::FOO`. A qualified path whose last segment is NOT screaming
+        // (`config::helper`, a fn call) is not a data-ref.
+        let src = "fn reader() -> usize {\n  config::MAX_RETRIES + crate::limits::MAX + self::FOO + config::helper()\n}";
+        let r = ASTParser::new().parse_source("t.rs", src);
+        let names: Vec<String> = r
+            .data_refs
+            .iter()
+            .filter(|d| d.reader == "reader")
+            .map(|d| d.name.clone())
+            .collect();
+        for want in ["config::MAX_RETRIES", "crate::limits::MAX", "self::FOO"] {
+            assert!(
+                names.iter().any(|n| n == want),
+                "qualified ref {want} captured with full path, got {names:?}"
+            );
+        }
+        assert!(
+            !names.iter().any(|n| n == "config::helper" || n == "helper"),
+            "a qualified call (non-screaming last segment) is not a data-ref, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn syn_qualified_data_ref_skips_locally_bound_head() {
+        // The scope guard extends to qualified paths: when the HEAD segment is locally bound, the
+        // path denotes the local (e.g. a `let m = …; m::FOO` field/assoc access), not a module —
+        // so it must NOT be captured even though it looks qualified. Only the free `cfg::LIMIT`
+        // (head `cfg` is not a local) is captured.
+        let src = "fn r(m: u8) -> u8 {\n  let mod_x = 1u8;\n  m::FOO + mod_x::BAR + cfg::LIMIT\n}";
+        let r = ASTParser::new().parse_source("t.rs", src);
+        let names: Vec<String> = r.data_refs.iter().map(|d| d.name.clone()).collect();
+        assert!(
+            names.iter().any(|n| n == "cfg::LIMIT"),
+            "the free qualified ref is captured, got {names:?}"
+        );
+        for bound_head in ["m::FOO", "mod_x::BAR"] {
+            assert!(
+                !names.iter().any(|n| n == bound_head),
+                "{bound_head} has a locally-bound head — it must not be a data-ref (got {names:?})"
             );
         }
     }
@@ -1503,5 +1778,365 @@ mod syn_tests {
         assert!(r.symbols.iter().any(|s| s.name == "real"));
         assert!(!r.symbols.iter().any(|s| s.name == "commented"));
         assert!(!r.symbols.iter().any(|s| s.name == "blocked"));
+    }
+
+    // ── Renamed-import alias support (`use a::b as c`) ────────────────────────────────────────
+
+    #[test]
+    fn syn_records_top_level_rename_alias() {
+        // `use a::b as c` records the LOCAL name `c` bound to the ORIGINAL target path `a::b`. The
+        // `UseStatement` keeps the original path (so import-linking is unchanged from `use a::b`).
+        let r = ASTParser::new().parse_source("t.rs", "use a::b as c;");
+        assert_eq!(r.import_aliases.len(), 1);
+        assert_eq!(r.import_aliases[0].local, "c");
+        assert_eq!(r.import_aliases[0].target, "a::b");
+        assert!(
+            r.use_statements.iter().any(|u| u.full_path == "a::b"),
+            "the original path is still recorded as a use statement, got {:?}",
+            r.use_statements
+                .iter()
+                .map(|u| &u.full_path)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn syn_records_alias_inside_group_and_nested_group() {
+        // Aliases inside a group — `use a::{b, c as d}` — and inside a NESTED group —
+        // `use a::{e::{f as g}}` — must both be captured, each with the full target path.
+        let r = ASTParser::new().parse_source("t.rs", "use a::{b, c as d, e::{f as g}};");
+        let mut got: Vec<(String, String)> = r
+            .import_aliases
+            .iter()
+            .map(|a| (a.local.clone(), a.target.clone()))
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("d".to_string(), "a::c".to_string()),
+                ("g".to_string(), "a::e::f".to_string()),
+            ],
+            "group + nested-group aliases captured with full target paths"
+        );
+        // The non-renamed member `b` is a plain import, not an alias.
+        assert!(r.use_statements.iter().any(|u| u.full_path == "a::b"));
+    }
+
+    #[test]
+    fn syn_glob_import_still_works_and_is_not_an_alias() {
+        // `use a::*` must keep producing an `a::*` use statement and record NO alias.
+        let r = ASTParser::new().parse_source("t.rs", "use a::*;");
+        assert!(
+            r.use_statements.iter().any(|u| u.full_path == "a::*"),
+            "glob import is preserved, got {:?}",
+            r.use_statements
+                .iter()
+                .map(|u| &u.full_path)
+                .collect::<Vec<_>>()
+        );
+        assert!(r.import_aliases.is_empty(), "a glob is not a rename");
+    }
+
+    /// Build a graph from `(path, src)` files through the real parser, then run the
+    /// import/call resolution passes. Returns the resolved `Calls` edges as `(src_id, dst_id)`
+    /// pairs (sorted), i.e. the exact fn→fn structure the call graph encodes.
+    fn calls_edges_of(files: &[(&str, &str)]) -> Vec<(String, String)> {
+        let p = ASTParser::new();
+        let mut g = MemoryGraph::new(0.0, usize::MAX);
+        for (path, src) in files {
+            let r = p.parse_source(path, src);
+            p.update_memory_graph(&r, src, &mut g);
+        }
+        g.link_module_imports();
+        g.resolve_symbol_calls();
+        let mut edges: Vec<(String, String)> = g
+            .edges()
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::Calls)
+            .map(|e| (e.source.0.clone(), e.target.0.clone()))
+            .collect();
+        edges.sort();
+        edges
+    }
+
+    #[test]
+    fn syn_alias_call_resolves_to_original_target() {
+        // `use crate::a::b as c; ... c()` — the alias call resolves to `a::b`'s symbol, end to end.
+        let edges = calls_edges_of(&[
+            ("src/a.rs", "pub fn b() {}"),
+            ("src/api.rs", "use crate::a::b as c;\nfn caller() { c(); }"),
+        ]);
+        assert!(
+            edges.contains(&(
+                "sym:src/api.rs:caller".to_string(),
+                "sym:src/a.rs:b".to_string()
+            )),
+            "aliased call c() resolves to a::b, got {edges:?}"
+        );
+    }
+
+    #[test]
+    fn syn_alias_call_inside_group_resolves() {
+        // The alias is declared inside a group — `use crate::a::{x as y}` — and `y()` resolves to x.
+        let edges = calls_edges_of(&[
+            ("src/a.rs", "pub fn x() {}"),
+            (
+                "src/api.rs",
+                "use crate::a::{x as y};\nfn caller() { y(); }",
+            ),
+        ]);
+        assert!(
+            edges.contains(&(
+                "sym:src/api.rs:caller".to_string(),
+                "sym:src/a.rs:x".to_string()
+            )),
+            "grouped alias call y() resolves to a::x, got {edges:?}"
+        );
+    }
+
+    #[test]
+    fn syn_qualified_alias_call_resolves() {
+        // A qualified call through the alias — `use crate::a::b as c; ... c::CONST` (rewritten to
+        // `crate::a::b::CONST`) resolves to the symbol in module `a::b`.
+        let edges = calls_edges_of(&[
+            ("src/a/b.rs", "pub fn deep() {}"),
+            (
+                "src/api.rs",
+                "use crate::a::b as c;\nfn caller() { c::deep(); }",
+            ),
+        ]);
+        assert!(
+            edges.contains(&(
+                "sym:src/api.rs:caller".to_string(),
+                "sym:src/a/b.rs:deep".to_string()
+            )),
+            "qualified alias call c::deep() resolves to a::b::deep, got {edges:?}"
+        );
+    }
+
+    #[test]
+    fn syn_alias_with_missing_target_is_skipped() {
+        // The alias target `crate::a::nope` has NO resident symbol → resolve-uniquely-or-skip yields
+        // NO edge (a false edge would be the bug). `a.rs` defines only an unrelated `other`.
+        let edges = calls_edges_of(&[
+            ("src/a.rs", "pub fn other() {}"),
+            (
+                "src/api.rs",
+                "use crate::a::nope as c;\nfn caller() { c(); }",
+            ),
+        ]);
+        assert!(
+            !edges.iter().any(|(s, _)| s == "sym:src/api.rs:caller"),
+            "alias to a non-existent target must add no Calls edge, got {edges:?}"
+        );
+    }
+
+    #[test]
+    fn syn_alias_does_not_collide_with_same_named_real_symbol() {
+        // There is a REAL `fn c` in another module (`z`). `api.rs` aliases `crate::a::b as c` and
+        // calls `c()`. The alias must win — the call resolves to `a::b`, NEVER cross-linking to the
+        // unrelated real `z::c` (which is what bare global-unique resolution would have done).
+        let edges = calls_edges_of(&[
+            ("src/a.rs", "pub fn b() {}"),
+            ("src/z.rs", "pub fn c() {}"),
+            ("src/api.rs", "use crate::a::b as c;\nfn caller() { c(); }"),
+        ]);
+        assert!(
+            edges.contains(&(
+                "sym:src/api.rs:caller".to_string(),
+                "sym:src/a.rs:b".to_string()
+            )),
+            "aliased c() resolves to a::b, got {edges:?}"
+        );
+        assert!(
+            !edges.contains(&(
+                "sym:src/api.rs:caller".to_string(),
+                "sym:src/z.rs:c".to_string()
+            )),
+            "the alias must NOT cross-link to the same-named real z::c, got {edges:?}"
+        );
+    }
+
+    #[test]
+    fn syn_alias_resolution_is_deterministic() {
+        // The same source must yield byte-for-byte identical Calls edges across runs (the replay
+        // invariant): indices over sorted ids, sorted+deduped candidate edges.
+        let files: &[(&str, &str)] = &[
+            ("src/a.rs", "pub fn b() {}"),
+            ("src/z.rs", "pub fn c() {}"),
+            (
+                "src/api.rs",
+                "use crate::a::{b as c, b as e};\nfn caller() { c(); e(); }",
+            ),
+        ];
+        let first = calls_edges_of(files);
+        for _ in 0..5 {
+            assert_eq!(first, calls_edges_of(files), "alias edges must be stable");
+        }
+        // Both aliases (`b as c`, `b as e`) point at the same target, so exactly one caller→b edge.
+        assert_eq!(
+            first,
+            vec![(
+                "sym:src/api.rs:caller".to_string(),
+                "sym:src/a.rs:b".to_string()
+            )],
+            "two aliases to one target dedupe to a single edge, got {first:?}"
+        );
+    }
+
+    #[test]
+    fn syn_self_call_resolves_method_in_other_inherent_impl_block() {
+        // `self.foo()` in one `impl Bar` block must resolve to `Bar::foo` even though `foo` is
+        // defined in a SEPARATE `impl Bar` block — per-type method sets union across all blocks.
+        let src =
+            "struct Bar;\nimpl Bar { fn a(&self) { self.foo(); } }\nimpl Bar { fn foo(&self) {} }";
+        let r = ASTParser::new().parse_source("t.rs", src);
+        assert!(
+            r.call_sites
+                .iter()
+                .any(|c| c.caller == "a" && c.callee == "Self::foo"),
+            "self.foo() must be captured via Bar's unioned method set across impl blocks, got {:?}",
+            r.call_sites
+                .iter()
+                .map(|c| (&c.caller, &c.callee))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn syn_self_call_resolves_method_from_trait_impl_for_type() {
+        // `foo` is provided by a TRAIT impl `impl SomeTrait for Bar`; a `self.foo()` in Bar's
+        // inherent impl must still be captured — trait-impl methods are unioned into Bar's set.
+        let src = "struct Bar;\ntrait SomeTrait { fn foo(&self); }\nimpl SomeTrait for Bar { fn foo(&self) {} }\nimpl Bar { fn a(&self) { self.foo(); } }";
+        let r = ASTParser::new().parse_source("t.rs", src);
+        assert!(
+            r.call_sites
+                .iter()
+                .any(|c| c.caller == "a" && c.callee == "Self::foo"),
+            "self.foo() from a trait impl for Bar must be captured, got {:?}",
+            r.call_sites
+                .iter()
+                .map(|c| (&c.caller, &c.callee))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn syn_self_call_two_types_same_method_name_do_not_cross_link() {
+        // Bar has `foo`; Baz does NOT. `self.foo()` inside Baz must NOT be captured — gating is
+        // STRICTLY by the enclosing impl's Self type, so two types' same-named methods never cross.
+        let src = "struct Bar;\nstruct Baz;\nimpl Bar { fn foo(&self) {} }\nimpl Baz { fn a(&self) { self.foo(); } }";
+        let r = ASTParser::new().parse_source("t.rs", src);
+        assert!(
+            !r.call_sites
+                .iter()
+                .any(|c| c.caller == "a" && c.callee == "Self::foo"),
+            "Baz has no foo — self.foo() inside Baz must not cross-link to Bar::foo, got {:?}",
+            r.call_sites
+                .iter()
+                .map(|c| (&c.caller, &c.callee))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn syn_self_path_resolves_same_as_self_method_call_across_blocks() {
+        // A `Self::foo` PATH (associated-fn form) must gate identically to `self.foo()` — captured
+        // when `foo` is in the type's unioned set even if defined in another impl block.
+        let src = "struct Bar;\nimpl Bar { fn a() { Self::foo(); } }\nimpl Bar { fn foo() {} }";
+        let r = ASTParser::new().parse_source("t.rs", src);
+        assert!(
+            r.call_sites
+                .iter()
+                .any(|c| c.caller == "a" && c.callee == "Self::foo"),
+            "Self::foo path must resolve across impl blocks like self.foo(), got {:?}",
+            r.call_sites
+                .iter()
+                .map(|c| (&c.caller, &c.callee))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn syn_self_call_blanket_impl_generic_self_falls_back_no_cross_link() {
+        // `impl<T> Marker for T` has a type-VARIABLE Self (`T`), not a concrete type. It must fall
+        // back to same-block gating: `self.foo()` (foo not in this block) is NOT captured, and a
+        // generic blanket impl never unions a same-named method from an unrelated concrete type.
+        let src = "trait Marker { fn a(&self); }\nstruct Bar;\nimpl Bar { fn foo(&self) {} }\nimpl<T> Marker for T { fn a(&self) { self.foo(); } }";
+        let r = ASTParser::new().parse_source("t.rs", src);
+        assert!(
+            !r.call_sites
+                .iter()
+                .any(|c| c.caller == "a" && c.callee == "Self::foo"),
+            "blanket impl<T> for T must fall back (no concrete type) and not cross-link, got {:?}",
+            r.call_sites
+                .iter()
+                .map(|c| (&c.caller, &c.callee))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn syn_self_call_cross_impl_is_deterministic() {
+        // Same source ⇒ identical captured edges (per-type sets are BTree-ordered; capture is a
+        // pure function of the AST).
+        let src = "struct Bar;\nimpl Bar { fn a(&self) { self.foo(); self.bar(); } }\nimpl Bar { fn foo(&self) {} }\nimpl SomeTrait for Bar { fn bar(&self) {} }\ntrait SomeTrait { fn bar(&self); }";
+        let first = ASTParser::new().parse_source("t.rs", src);
+        let second = ASTParser::new().parse_source("t.rs", src);
+        let edges = |r: &ParseResult| -> Vec<(String, String, usize)> {
+            r.call_sites
+                .iter()
+                .map(|c| (c.caller.clone(), c.callee.clone(), c.line))
+                .collect()
+        };
+        assert_eq!(
+            edges(&first),
+            edges(&second),
+            "cross-impl self-call capture must be deterministic"
+        );
+        assert!(
+            first
+                .call_sites
+                .iter()
+                .any(|c| c.caller == "a" && c.callee == "Self::foo")
+                && first
+                    .call_sites
+                    .iter()
+                    .any(|c| c.caller == "a" && c.callee == "Self::bar"),
+            "both inherent (foo) and trait-impl (bar) methods resolve from Bar's union, got {:?}",
+            first
+                .call_sites
+                .iter()
+                .map(|c| (&c.caller, &c.callee))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn syn_self_call_cross_impl_end_to_end_resolves_edge() {
+        // Full wiring: a self-call to a method in a DIFFERENT impl block of the same type resolves
+        // to a real `Calls` edge through resolve_symbol_calls (Self::foo → same-module foo symbol).
+        let p = ASTParser::new();
+        let mut g = MemoryGraph::new(0.0, usize::MAX);
+        let src =
+            "struct Bar;\nimpl Bar { fn a(&self) { self.foo(); } }\nimpl Bar { fn foo(&self) {} }";
+        let r = p.parse_source("src/lib.rs", src);
+        p.update_memory_graph(&r, src, &mut g);
+        g.resolve_symbol_calls();
+        let edges: Vec<(String, String)> = g
+            .edges()
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::Calls)
+            .map(|e| (e.source.0.clone(), e.target.0.clone()))
+            .collect();
+        assert_eq!(
+            edges,
+            vec![(
+                "sym:src/lib.rs:a".to_string(),
+                "sym:src/lib.rs:foo".to_string()
+            )],
+            "self.foo() across impl blocks resolves to Bar::foo, end to end"
+        );
     }
 }
