@@ -2242,38 +2242,83 @@ impl MemoryGraph {
     /// Resolve recorded `static`/`const` references into `reader → item` [`EdgeType::DataFlow`]
     /// edges — the shared-global-state channel call and import edges miss (a function reads a
     /// global defined in a file it never imports by name). A **whole-graph** pass, run after
-    /// [`resolve_symbol_calls`](Self::resolve_symbol_calls). Resolution is **global-unique,
-    /// resolve-uniquely-or-skip**: a reference to `X` links only when exactly one resident
-    /// `static`/`const` named `X` exists graph-wide, so a wrong edge is never invented. Self-edges
-    /// dropped. Deterministic: indices over the **sorted** `data_symbols`/`pending_data_refs`,
-    /// candidate edges sorted+deduped before insertion. Returns the number of `DataFlow` edges added.
+    /// [`resolve_symbol_calls`](Self::resolve_symbol_calls). Always **resolve-uniquely-or-skip**, so
+    /// a wrong edge is never invented. A **bare** ref `X` (Slice 1) links only when exactly one
+    /// resident `static`/`const` named `X` exists graph-wide. A **qualified** ref `m::…::X` (Slice 2)
+    /// pins its module prefix to a defining file via the SAME machinery as qualified calls
+    /// (`resolve_qualified`) — crate-rooted, or an `alias::X` expanded through the file's imports —
+    /// then links to that file's `sym:<file>:X` *only if it is a marked data symbol*;
+    /// unresolvable/ambiguous qualified refs skip (and never fall back to the bare global index).
+    /// Self-edges dropped. Deterministic: indices over the **sorted** `data_symbols`/node ids and
+    /// `pending_data_refs`, candidate edges sorted+deduped before insertion. Returns the number of
+    /// `DataFlow` edges added.
     pub fn resolve_data_flow(&mut self) -> usize {
-        // Build the global-unique index from resident data symbols, then collect candidate edges —
-        // in an inner scope so its borrows of `self` end before the mutating `add_edge` below.
+        // Build the resolution indices, then collect candidate edges — in an inner scope so its
+        // borrows of `self` end before the mutating `add_edge` below.
         let mut to_add: Vec<(NodeId, NodeId)> = {
+            // Bare-name index: global-unique count over resident data symbols.
             let mut name_count: HashMap<&str, u32> = HashMap::new();
             let mut name_first: HashMap<&str, &NodeId> = HashMap::new();
+            // Qualified-path index: (crate, module, name) → data-symbol node, restricted to data
+            // symbols so a qualified ref can only ever resolve to a `static`/`const` (never a fn).
+            let mut defs: HashMap<(String, String, String), NodeId> = HashMap::new();
             for id in &self.data_symbols {
                 if !self.nodes.contains_key(id) {
                     continue; // evicted since it was marked — skip the stale entry
+                }
+                if let Some((file, name)) =
+                    id.0.strip_prefix("sym:").and_then(|r| r.rsplit_once(':'))
+                {
+                    if let Some((c, m)) = crate_and_module(file) {
+                        defs.insert((c, m, name.to_string()), id.clone());
+                    }
                 }
                 if let Some((_, name)) = id.0.rsplit_once(':') {
                     *name_count.entry(name).or_insert(0) += 1;
                     name_first.entry(name).or_insert(id);
                 }
             }
+            // `file:`/`use:` indices for qualified-prefix resolution (mirrors `resolve_symbol_calls`).
+            let mut file_index: HashMap<(String, String), NodeId> = HashMap::new();
+            let mut scope: HashMap<String, Vec<String>> = HashMap::new();
+            let mut sorted: Vec<&NodeId> = self.nodes.keys().collect();
+            sorted.sort();
+            for id in &sorted {
+                let s = id.0.as_str();
+                if let Some(path) = s.strip_prefix("file:") {
+                    if let Some(km) = crate_and_module(path) {
+                        file_index.insert(km, (*id).clone());
+                    }
+                } else if let Some(rest) = s.strip_prefix("use:") {
+                    if let Some((f, usepath)) = rest.split_once(':') {
+                        scope
+                            .entry(f.to_string())
+                            .or_default()
+                            .push(usepath.to_string());
+                    }
+                }
+            }
+
             let mut acc: Vec<(NodeId, NodeId)> = Vec::new();
             for (file, refs) in &self.pending_data_refs {
+                let (fcrate, _) = crate_and_module(file).unwrap_or_default();
                 for (reader, name, _line) in refs {
                     let reader_sym = NodeId(format!("sym:{file}:{reader}"));
                     if !self.nodes.contains_key(&reader_sym) {
                         continue;
                     }
-                    if name_count.get(name.as_str()).copied() == Some(1) {
-                        if let Some(target) = name_first.get(name.as_str()) {
-                            if **target != reader_sym {
-                                acc.push((reader_sym.clone(), (*target).clone()));
-                            }
+                    let target: Option<NodeId> = if name.contains("::") {
+                        // Qualified `m::…::X` — resolve exactly like a qualified call, against the
+                        // data-symbol-only `defs` so the result is guaranteed a `static`/`const`.
+                        resolve_qualified(file, name, &fcrate, &scope, &file_index, &defs)
+                    } else if name_count.get(name.as_str()).copied() == Some(1) {
+                        name_first.get(name.as_str()).map(|t| (*t).clone())
+                    } else {
+                        None
+                    };
+                    if let Some(t) = target {
+                        if t != reader_sym {
+                            acc.push((reader_sym.clone(), t));
                         }
                     }
                 }
@@ -2715,6 +2760,44 @@ fn resolve_module_exact(
     index.get(&(target_crate, segs.join("::"))).cloned()
 }
 
+/// Resolve a **qualified** path `mod::…::name` to its definition symbol — the shared machinery
+/// behind both qualified CALLS (`m::func()`) and qualified DATA references (`m::CONST`). Pins the
+/// module prefix to its defining file (crate-rooted directly, else by expanding the leading segment
+/// through `file`'s imports), then takes that file's `sym:<file>:name`. **resolve-uniquely-or-skip**:
+/// an alias matching no import — or more than one — skips, the module is resolved EXACTLY (no
+/// ancestor shortening, so `crate::a::b::name` with no `a::b` file never falls back to `a`'s
+/// symbols), and a qualified path never falls through to a bare same-module/global guess. `self`/
+/// `super`/`Self`/a type prefix and external roots (`std::…`) match no import here → skipped.
+fn resolve_qualified(
+    file: &str,
+    path: &str,
+    fcrate: &str,
+    scope: &HashMap<String, Vec<String>>,
+    file_index: &HashMap<(String, String), NodeId>,
+    defs: &HashMap<(String, String, String), NodeId>,
+) -> Option<NodeId> {
+    let (prefix, name) = path.rsplit_once("::")?;
+    let abs: Option<String> = if prefix == "crate" || prefix.starts_with("crate::") {
+        Some(prefix.to_string())
+    } else {
+        let first = prefix.split("::").next().unwrap_or(prefix);
+        let rest = prefix.strip_prefix(first).unwrap_or(""); // "" or "::b::c"
+        let mut hits = scope
+            .get(file)
+            .into_iter()
+            .flatten()
+            .filter(|u| u.rsplit("::").next() == Some(first));
+        match (hits.next(), hits.next()) {
+            (Some(use_path), None) => Some(format!("{use_path}{rest}")),
+            _ => None,
+        }
+    };
+    abs.and_then(|a| resolve_module_exact(fcrate, &a, file_index))
+        .and_then(|df| df.0.strip_prefix("file:").map(str::to_string))
+        .and_then(|f| crate_and_module(&f))
+        .and_then(|(c, m)| defs.get(&(c, m, name.to_string())).cloned())
+}
+
 /// The Slice-1 call→def resolution ladder used by
 /// [`MemoryGraph::resolve_symbol_calls`](MemoryGraph::resolve_symbol_calls): Tier A (import-scoped),
 /// then B (same-module), then C (global-unique), each **resolve-uniquely-or-skip**. Returns the
@@ -2769,33 +2852,8 @@ fn resolve_call(
     // Slice 2 — qualified path `mod::…::name`: pin the module prefix to its defining file, then take
     // the unique `sym:<file>:name`. resolve-uniquely-or-skip, so anything unresolvable or ambiguous →
     // no edge (and a qualified path never falls through to the bare same-module/global ladder below).
-    if let Some((prefix, name)) = callee.rsplit_once("::") {
-        // Build the prefix's absolute module path: crate-rooted directly, else expand the leading
-        // segment through the file's imports (`use …::alias`). Skip if the alias matches no import,
-        // or more than one (ambiguous). `self`/`super`/`Self`/`Type` and external roots (`std::…`)
-        // match no import here → skipped (Slice 3 / by design).
-        let abs: Option<String> = if prefix == "crate" || prefix.starts_with("crate::") {
-            Some(prefix.to_string())
-        } else {
-            let first = prefix.split("::").next().unwrap_or(prefix);
-            let rest = prefix.strip_prefix(first).unwrap_or(""); // "" or "::b::c"
-            let mut hits = scope
-                .get(file)
-                .into_iter()
-                .flatten()
-                .filter(|u| u.rsplit("::").next() == Some(first));
-            match (hits.next(), hits.next()) {
-                (Some(use_path), None) => Some(format!("{use_path}{rest}")),
-                _ => None,
-            }
-        };
-        // Resolve the module EXACTLY (no ancestor shortening — see `resolve_module_exact`): a
-        // `crate::a::b` whose `a::b` module has no file must skip, not fall back to `a`'s symbols.
-        return abs
-            .and_then(|a| resolve_module_exact(fcrate, &a, file_index))
-            .and_then(|df| df.0.strip_prefix("file:").map(str::to_string))
-            .and_then(|f| crate_and_module(&f))
-            .and_then(|(c, m)| defs.get(&(c, m, name.to_string())).cloned());
+    if callee.contains("::") {
+        return resolve_qualified(file, callee, fcrate, scope, file_index, defs);
     }
     // Tier A — import-scoped: an import `use <module>::callee` pins the defining module; resolve it
     // to a file and require exactly one unique `sym:<file>:callee`. (Rust-name-resolution-correct:
@@ -3316,6 +3374,148 @@ mod tests {
         assert!(
             data_flow_of(&g).is_empty(),
             "a reference resolving to a non-static/const symbol is not a data-flow edge"
+        );
+    }
+
+    /// Add an `m::name`-style import to a file (a `use:<file>:<usepath>` node + its DependsOn edge),
+    /// so a qualified data-ref `alias::X` can be expanded through it — mirrors the call tests' setup.
+    fn add_import(g: &mut MemoryGraph, file: &str, usepath: &str) {
+        let uid = NodeId(format!("use:{file}:{usepath}"));
+        g.upsert_node(uid.clone(), "use".into(), "".into(), NodeType::Module);
+        g.add_edge(
+            NodeId(format!("file:{file}")),
+            uid,
+            0.5,
+            EdgeType::DependsOn,
+        );
+    }
+
+    #[test]
+    fn resolve_data_flow_qualified_crate_rooted_links_to_module_const() {
+        // `crate::cfg::MAX_RETRIES` resolves absolutely via its module prefix (no import needed) to
+        // cfg.rs's `MAX_RETRIES`, marked as a data symbol — exactly one DataFlow edge (Slice 2).
+        let mut g = graph_with_defs(&[("src/cfg.rs", "MAX_RETRIES"), ("src/api.rs", "reader")]);
+        g.mark_data_symbol(NodeId("sym:src/cfg.rs:MAX_RETRIES".into()));
+        g.set_pending_data_refs(
+            "src/api.rs",
+            vec![("reader".into(), "crate::cfg::MAX_RETRIES".into(), 1)],
+        );
+        g.resolve_data_flow();
+        assert_eq!(
+            data_flow_of(&g),
+            vec![(
+                "sym:src/api.rs:reader".to_string(),
+                "sym:src/cfg.rs:MAX_RETRIES".to_string()
+            )],
+            "crate-rooted qualified data-ref resolves to the module's const (Slice 2)"
+        );
+    }
+
+    #[test]
+    fn resolve_data_flow_qualified_via_import_alias_links() {
+        // `use crate::cfg;` then `cfg::MAX` — the leading segment is expanded via the import, the
+        // same machinery qualified CALLS use. The const must be marked to link.
+        let mut g = graph_with_defs(&[("src/cfg.rs", "MAX"), ("src/api.rs", "reader")]);
+        g.mark_data_symbol(NodeId("sym:src/cfg.rs:MAX".into()));
+        add_import(&mut g, "src/api.rs", "crate::cfg");
+        g.set_pending_data_refs("src/api.rs", vec![("reader".into(), "cfg::MAX".into(), 1)]);
+        g.resolve_data_flow();
+        assert_eq!(
+            data_flow_of(&g),
+            vec![(
+                "sym:src/api.rs:reader".to_string(),
+                "sym:src/cfg.rs:MAX".to_string()
+            )],
+            "module-alias qualified data-ref resolves by expanding the import (Slice 2)"
+        );
+    }
+
+    #[test]
+    fn resolve_data_flow_qualified_to_non_data_symbol_skips() {
+        // `crate::cfg::MAX` resolves to a real symbol in cfg.rs, but it was NEVER marked as a
+        // static/const (e.g. a SCREAMING-named fn). A qualified ref must resolve only to a data
+        // symbol — so no edge, no false DataFlow to a function.
+        let mut g = graph_with_defs(&[("src/cfg.rs", "MAX"), ("src/api.rs", "reader")]);
+        // deliberately do NOT mark MAX
+        g.set_pending_data_refs(
+            "src/api.rs",
+            vec![("reader".into(), "crate::cfg::MAX".into(), 1)],
+        );
+        g.resolve_data_flow();
+        assert!(
+            data_flow_of(&g).is_empty(),
+            "a qualified ref to a non-static/const symbol is not a data-flow edge"
+        );
+    }
+
+    #[test]
+    fn resolve_data_flow_qualified_unresolvable_skips_and_no_fallback() {
+        // Three unresolvable qualified refs, each a distinct skip case — NONE may emit, and in
+        // particular none may fall back to the bare-name global index (which WOULD match a unique
+        // `MAX`/`LIMIT`):
+        //   * `other::MAX`  — alias `other` matches no import → skip (no fallback to the global MAX);
+        //   * `crate::ghost::MAX` — module `ghost` has no file → skip (no ancestor/global fallback);
+        //   * `std::cfg::LIMIT` — external root, no import expands it → skip.
+        let mut g = graph_with_defs(&[
+            ("src/cfg.rs", "MAX"),
+            ("src/cfg.rs", "LIMIT"),
+            ("src/api.rs", "reader"),
+        ]);
+        g.mark_data_symbol(NodeId("sym:src/cfg.rs:MAX".into()));
+        g.mark_data_symbol(NodeId("sym:src/cfg.rs:LIMIT".into()));
+        g.set_pending_data_refs(
+            "src/api.rs",
+            vec![
+                ("reader".into(), "other::MAX".into(), 1),
+                ("reader".into(), "crate::ghost::MAX".into(), 2),
+                ("reader".into(), "std::cfg::LIMIT".into(), 3),
+            ],
+        );
+        g.resolve_data_flow();
+        assert!(
+            data_flow_of(&g).is_empty(),
+            "unresolvable qualified data-refs skip — never falling back to the bare global index"
+        );
+    }
+
+    #[test]
+    fn resolve_data_flow_qualified_is_deterministic() {
+        // Same source → identical edge set across two independent builds (qualified + bare mixed).
+        let build = || {
+            let mut g = graph_with_defs(&[
+                ("src/cfg.rs", "MAX_RETRIES"),
+                ("src/lim.rs", "CEILING"),
+                ("src/api.rs", "reader"),
+            ]);
+            g.mark_data_symbol(NodeId("sym:src/cfg.rs:MAX_RETRIES".into()));
+            g.mark_data_symbol(NodeId("sym:src/lim.rs:CEILING".into()));
+            add_import(&mut g, "src/api.rs", "crate::cfg");
+            g.set_pending_data_refs(
+                "src/api.rs",
+                vec![
+                    ("reader".into(), "cfg::MAX_RETRIES".into(), 1),
+                    ("reader".into(), "crate::lim::CEILING".into(), 2),
+                ],
+            );
+            g.resolve_data_flow();
+            data_flow_of(&g)
+        };
+        let a = build();
+        let b = build();
+        assert_eq!(a, b, "same source yields an identical DataFlow edge set");
+        assert_eq!(
+            a,
+            vec![
+                (
+                    "sym:src/api.rs:reader".to_string(),
+                    "sym:src/cfg.rs:MAX_RETRIES".to_string()
+                ),
+                (
+                    "sym:src/api.rs:reader".to_string(),
+                    "sym:src/lim.rs:CEILING".to_string()
+                ),
+            ],
+            "both qualified refs resolve to their module consts"
         );
     }
 

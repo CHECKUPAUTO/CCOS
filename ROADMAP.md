@@ -357,11 +357,20 @@ honesty code↔docs↔paper, tests/API). **Fixed in this pass:**
   `id`/`timestamp` so the chain stays reproducible). `EventLog::verify_integrity`
   detects any payload tamper, reorder, insertion or deletion, and `ccos verify` /
   `ccos replay` check it on every run. See `src/event_log.rs`.
-3. **Semantic edges.** (L) — *both halves now underway.* Call-graph (fn→fn `Calls`: bare,
-   qualified, `self`/`Self` methods — #74/#75/#76/#77) **and data-flow** (`fn → static/const`
-   `DataFlow` edges, Slice 1: `src/memory.rs::resolve_data_flow`, global-unique resolve-or-skip).
-   Remaining: data-flow qualified `m::CONST` + write/read direction; call-graph polish
-   (`x.bar()` receiver-type inference, renamed-import alias calls, cross-impl-block self-calls).
+3. **Semantic edges.** (L) — *both halves landed; deep polish underway.* Call-graph (fn→fn `Calls`:
+   bare, qualified, `self`/`Self` methods — #74/#75/#76/#77; plus **renamed-import alias calls**
+   `use a::b as c` and **cross-impl-block self-calls** via per-type unioned method sets) **and
+   data-flow** (`fn → static/const` `DataFlow` edges — Slice 1 bare `SCREAMING_SNAKE`, **Slice 2
+   qualified `m::CONST`** through the shared `resolve_qualified` machinery; `src/memory.rs`,
+   resolve-uniquely-or-skip throughout — never a wrong edge). The data-flow blind spot lexical
+   retrieval misses (the cross-vocabulary co-reader link) is measured in
+   `docs/MEASUREMENT_data_flow_crux.md`. Remaining: `x.bar()` receiver-type inference (held for
+   careful manual work); data-flow write/read direction.
+
+   - ✅ **Spectral primitive (#13, first slice).** `src/spectral.rs::eigenvector_centrality` — a
+     deterministic, dependency-free power-iteration eigenvector centrality over the (symmetrized,
+     `A + I`-shifted) adjacency, complementary to the damped `MemoryGraph::eigencentrality`. A clean
+     `A x = λ x` brick for the deferred spectral-regions / temporal-tensor / `scirust` work.
 
 ### P2 — Ergonomics
 
@@ -393,5 +402,7 @@ honesty code↔docs↔paper, tests/API). **Fixed in this pass:**
 
 ~~`P0.1 (syn)`~~ ✅ → ~~`P1.2 (canonical log)`~~ ✅ → ~~`P1.3 (call graph, Slices 1–3a)`~~ ✅ →
 ~~`P2.5 (benches)`~~ ✅ → ~~`P2.6 (analyze extras)`~~ ✅ → ~~`P3.8 (property tests)`~~ ✅ →
-~~`P2.4 (config)`~~ ✅ → ~~`P3.9 (Result CLI)`~~ ✅ → **`P1.3 data-flow edges`**
-(the next depth jump) → call-graph polish. **All P2/P3 quick wins are now done.**
+~~`P2.4 (config)`~~ ✅ → ~~`P3.9 (Result CLI)`~~ ✅ → ~~`P1.3 data-flow edges (Slices 1–2)`~~ ✅ →
+~~`call-graph polish (renamed imports, cross-impl self-calls)`~~ ✅ → **`#13 spectral`**
+(eigenvector-centrality first slice ✅; spectral regions + temporal tensor deferred to a design pass).
+Remaining call-graph: `x.bar()` receiver-type inference. **All P2/P3 quick wins are done.**
