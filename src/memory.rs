@@ -106,6 +106,11 @@ pub enum EdgeType {
     References,
     Causes,
     RelatedTo,
+    /// A `caller → callee` function-call edge, resolved from in-body call-sites by
+    /// [`MemoryGraph::resolve_symbol_calls`]. Captures fn→fn structure that import edges miss
+    /// (a call crosses files even when the two functions share no vocabulary). Appended last so
+    /// the enum's serialized form is strictly additive — old snapshots never contain `Calls`.
+    Calls,
 }
 
 /// Tunable coefficients of the causal score and failure-propagation decay.
@@ -369,6 +374,14 @@ pub struct MemoryGraph {
     /// `w_centrality != 0` *and* `centrality_mode == Eigenvector`.
     #[serde(skip)]
     eigencentrality_cache: RefCell<EigenCentralityCache>,
+    /// In-body call-sites awaiting resolution into `Calls` edges, keyed by source file →
+    /// `(caller, callee, line)` in source order. Populated by the parser at ingest, consumed by
+    /// [`resolve_symbol_calls`](Self::resolve_symbol_calls). **Runtime-only** (`serde(skip)`): the
+    /// resolved `Calls` *edges* are the durable state; this raw input is rebuilt on the replay
+    /// re-ingest, so the snapshot is unchanged and `replay == live` holds. `BTreeMap` ⇒ sorted,
+    /// deterministic iteration.
+    #[serde(skip)]
+    pending_calls: BTreeMap<String, Vec<(String, String, usize)>>,
 }
 
 /// Cache value behind [`MemoryGraph::node_eigencentrality`]: the centrality vector keyed
@@ -602,6 +615,7 @@ impl MemoryGraph {
             cold_resident_budget: None,
             indegree_cache: RefCell::new(None),
             eigencentrality_cache: RefCell::new(None),
+            pending_calls: BTreeMap::new(),
         }
     }
 
@@ -2136,6 +2150,99 @@ impl MemoryGraph {
         added
     }
 
+    /// Record (replacing) this file's in-body call-sites, the input to
+    /// [`resolve_symbol_calls`](Self::resolve_symbol_calls). Empty ⇒ drop the entry, so a
+    /// re-ingest that removed every call leaves nothing stale. Each tuple is `(caller, callee,
+    /// line)` in source order.
+    pub fn set_pending_calls(&mut self, file: &str, calls: Vec<(String, String, usize)>) {
+        if calls.is_empty() {
+            self.pending_calls.remove(file);
+        } else {
+            self.pending_calls.insert(file.to_string(), calls);
+        }
+    }
+
+    /// Resolve recorded call-sites into `caller → callee` [`EdgeType::Calls`] edges — the fn→fn
+    /// structure import edges miss (a call crosses files even when the two functions share no
+    /// vocabulary). A **whole-graph** pass (a call may target a symbol in a file ingested later);
+    /// run right after [`link_module_imports`](Self::link_module_imports). Resolution is a strict
+    /// precision ladder, **resolve-uniquely-or-skip** at every tier, so a wrong edge is never
+    /// invented: (A) import-scoped — `foo()` where the file does `use …::foo`, the import's module
+    /// resolving (as in `link_module_imports`) to the defining file with a real `sym:<file>:foo`;
+    /// (B) same-module — `foo` defined in the caller's own file/module; (C) global-unique — exactly
+    /// one `sym:*:foo` exists graph-wide. Self-edges are dropped. Deterministic: indices built over
+    /// **sorted** node ids, calls iterated in sorted (file, source) order, candidate edges
+    /// sorted+deduped before insertion. Returns the number of Calls edges added.
+    pub fn resolve_symbol_calls(&mut self) -> usize {
+        let mut sorted: Vec<&NodeId> = self.nodes.keys().collect();
+        sorted.sort();
+        let mut file_index: HashMap<(String, String), NodeId> = HashMap::new(); // (crate,module)->file
+        let mut defs: HashMap<(String, String, String), NodeId> = HashMap::new(); // (crate,module,name)->sym
+        let mut name_count: HashMap<String, u32> = HashMap::new();
+        let mut name_first: HashMap<String, NodeId> = HashMap::new();
+        let mut scope: HashMap<String, Vec<String>> = HashMap::new(); // file -> use paths
+        for id in &sorted {
+            let s = id.0.as_str();
+            if let Some(path) = s.strip_prefix("file:") {
+                if let Some(km) = crate_and_module(path) {
+                    file_index.insert(km, (*id).clone());
+                }
+            } else if let Some(rest) = s.strip_prefix("sym:") {
+                if let Some((file, name)) = rest.rsplit_once(':') {
+                    if let Some((c, m)) = crate_and_module(file) {
+                        defs.insert((c, m, name.to_string()), (*id).clone());
+                    }
+                    *name_count.entry(name.to_string()).or_default() += 1;
+                    name_first
+                        .entry(name.to_string())
+                        .or_insert_with(|| (*id).clone());
+                }
+            } else if let Some(rest) = s.strip_prefix("use:") {
+                if let Some((file, usepath)) = rest.split_once(':') {
+                    scope
+                        .entry(file.to_string())
+                        .or_default()
+                        .push(usepath.to_string());
+                }
+            }
+        }
+
+        let mut to_add: Vec<(NodeId, NodeId)> = Vec::new();
+        for (file, calls) in &self.pending_calls {
+            let (fcrate, fmodule) = crate_and_module(file).unwrap_or_default();
+            for (caller, callee, _line) in calls {
+                let caller_sym = NodeId(format!("sym:{file}:{caller}"));
+                if !self.nodes.contains_key(&caller_sym) {
+                    continue;
+                }
+                if let Some(t) = resolve_call(
+                    file,
+                    callee,
+                    &fcrate,
+                    &fmodule,
+                    &scope,
+                    &file_index,
+                    &defs,
+                    &name_count,
+                    &name_first,
+                ) {
+                    if t != caller_sym {
+                        to_add.push((caller_sym, t));
+                    }
+                }
+            }
+        }
+        to_add.sort();
+        to_add.dedup();
+        let mut added = 0;
+        for (s, t) in to_add {
+            if self.add_edge(s, t, 0.75, EdgeType::Calls) {
+                added += 1;
+            }
+        }
+        added
+    }
+
     /// Detect directed dependency cycles via an iterative (stack-safe) DFS.
     /// Each returned vector lists the nodes forming one cycle, in order.
     pub fn find_cycles(&self) -> Vec<Vec<NodeId>> {
@@ -2402,6 +2509,59 @@ fn resolve_use(
         let module = segs[..len].join("::");
         index.get(&(target_crate.clone(), module)).cloned()
     })
+}
+
+/// The Slice-1 call→def resolution ladder used by
+/// [`MemoryGraph::resolve_symbol_calls`](MemoryGraph::resolve_symbol_calls): Tier A (import-scoped),
+/// then B (same-module), then C (global-unique), each **resolve-uniquely-or-skip**. Returns the
+/// definition symbol node for a bare `callee()` call in `file`, or `None` to skip.
+#[allow(clippy::too_many_arguments)]
+fn resolve_call(
+    file: &str,
+    callee: &str,
+    fcrate: &str,
+    fmodule: &str,
+    scope: &HashMap<String, Vec<String>>,
+    file_index: &HashMap<(String, String), NodeId>,
+    defs: &HashMap<(String, String, String), NodeId>,
+    name_count: &HashMap<String, u32>,
+    name_first: &HashMap<String, NodeId>,
+) -> Option<NodeId> {
+    // Tier A — import-scoped: an import `use <module>::callee` pins the defining module; resolve it
+    // to a file and require exactly one unique `sym:<file>:callee`. (Rust-name-resolution-correct:
+    // links the cross-module call without linking same-named fns in unrelated modules.)
+    if let Some(paths) = scope.get(file) {
+        let mut cands: std::collections::BTreeSet<NodeId> = std::collections::BTreeSet::new();
+        for usepath in paths {
+            if usepath.rsplit("::").next() != Some(callee) {
+                continue; // this import does not bring in `callee`
+            }
+            let Some((module_path, _)) = usepath.rsplit_once("::") else {
+                continue; // bare `use callee;` — no module path to resolve in Slice 1
+            };
+            if let Some(deffile_node) = resolve_use(fcrate, module_path, file_index) {
+                if let Some(deffile) = deffile_node.0.strip_prefix("file:") {
+                    if let Some((c, m)) = crate_and_module(deffile) {
+                        if let Some(sym) = defs.get(&(c, m, callee.to_string())) {
+                            cands.insert(sym.clone());
+                        }
+                    }
+                }
+            }
+        }
+        if cands.len() == 1 {
+            return cands.into_iter().next();
+        }
+    }
+    // Tier B — same module as the caller.
+    if let Some(sym) = defs.get(&(fcrate.to_string(), fmodule.to_string(), callee.to_string())) {
+        return Some(sym.clone());
+    }
+    // Tier C — exactly one symbol of this name graph-wide (prelude / sibling re-export).
+    if name_count.get(callee).copied() == Some(1) {
+        return name_first.get(callee).cloned();
+    }
+    None
 }
 
 #[cfg(test)]
@@ -2796,6 +2956,104 @@ mod tests {
         assert!(
             score(&g, "work") > score(&g, "stable"),
             "Working is pinned above a decayed Stable peer"
+        );
+    }
+
+    /// Build a graph of `(file, symbol)` defs (with `file:` + `sym:` nodes), for the call tests.
+    fn graph_with_defs(defs: &[(&str, &str)]) -> MemoryGraph {
+        let mut g = MemoryGraph::new(0.2, usize::MAX);
+        for (file, name) in defs {
+            let fid = NodeId(format!("file:{file}"));
+            g.upsert_node(fid.clone(), (*file).into(), "".into(), NodeType::Module);
+            let sid = NodeId(format!("sym:{file}:{name}"));
+            g.upsert_node(sid.clone(), (*name).into(), "".into(), NodeType::Symbol);
+            g.add_edge(fid, sid, 0.6, EdgeType::Contains);
+        }
+        g
+    }
+    fn calls_of(g: &MemoryGraph) -> Vec<(String, String)> {
+        let mut v: Vec<(String, String)> = g
+            .edges()
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::Calls)
+            .map(|e| (e.source.0.clone(), e.target.0.clone()))
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn resolve_symbol_calls_ladder_global_unique_ambiguous_and_self() {
+        // `connect` unique; `shared` defined twice (ambiguous); `run` is the caller.
+        let mk = || {
+            graph_with_defs(&[
+                ("src/db.rs", "connect"),
+                ("src/db.rs", "shared"),
+                ("src/net.rs", "shared"),
+                ("src/api.rs", "run"),
+            ])
+        };
+        let mut g = mk();
+        g.set_pending_calls(
+            "src/api.rs",
+            vec![
+                ("run".into(), "connect".into(), 1), // unique → Tier C links
+                ("run".into(), "shared".into(), 2),  // ambiguous → skipped
+                ("run".into(), "run".into(), 3),     // self → dropped
+                ("run".into(), "nope".into(), 4),    // unknown → skipped
+            ],
+        );
+        let added = g.resolve_symbol_calls();
+        assert_eq!(added, 1);
+        assert_eq!(
+            calls_of(&g),
+            vec![(
+                "sym:src/api.rs:run".to_string(),
+                "sym:src/db.rs:connect".to_string()
+            )],
+            "only the globally-unique callee links; ambiguous/self/unknown are skipped"
+        );
+        // Determinism: a fresh build + resolve yields the identical edge set.
+        let mut g2 = mk();
+        g2.set_pending_calls(
+            "src/api.rs",
+            vec![
+                ("run".into(), "connect".into(), 1),
+                ("run".into(), "shared".into(), 2),
+                ("run".into(), "run".into(), 3),
+            ],
+        );
+        g2.resolve_symbol_calls();
+        assert_eq!(calls_of(&g), calls_of(&g2));
+    }
+
+    #[test]
+    fn resolve_symbol_calls_tier_a_import_disambiguates() {
+        // `connect` is ambiguous globally (db + net), so Tier C would skip — but an import in
+        // api.rs scopes the call to db::connect, so Tier A resolves it precisely.
+        let mut g = graph_with_defs(&[
+            ("src/db.rs", "connect"),
+            ("src/net.rs", "connect"),
+            ("src/api.rs", "run"),
+        ]);
+        // the `use crate::db::connect;` node the parser would have produced.
+        let uid = NodeId("use:src/api.rs:crate::db::connect".into());
+        g.upsert_node(uid.clone(), "use".into(), "".into(), NodeType::Module);
+        g.add_edge(
+            NodeId("file:src/api.rs".into()),
+            uid,
+            0.5,
+            EdgeType::DependsOn,
+        );
+        g.set_pending_calls("src/api.rs", vec![("run".into(), "connect".into(), 1)]);
+        g.resolve_symbol_calls();
+        assert_eq!(
+            calls_of(&g),
+            vec![(
+                "sym:src/api.rs:run".to_string(),
+                "sym:src/db.rs:connect".to_string()
+            )],
+            "the import scopes the otherwise-ambiguous call to db::connect (Tier A)"
         );
     }
 
