@@ -357,9 +357,10 @@ honesty code↔docs↔paper, tests/API). **Fixed in this pass:**
   `id`/`timestamp` so the chain stays reproducible). `EventLog::verify_integrity`
   detects any payload tamper, reorder, insertion or deletion, and `ccos verify` /
   `ccos replay` check it on every run. See `src/event_log.rs`.
-3. **Semantic edges.** (L) — *call-graph half done* (fn→fn `Calls` edges: bare, qualified, and
-   `self`/`Self` method calls — see #74/#75/#76/#77 and `src/memory.rs::resolve_symbol_calls`).
-   **Remaining: data-flow edges** (who writes/reads which variable) and call-graph polish
+3. **Semantic edges.** (L) — *both halves now underway.* Call-graph (fn→fn `Calls`: bare,
+   qualified, `self`/`Self` methods — #74/#75/#76/#77) **and data-flow** (`fn → static/const`
+   `DataFlow` edges, Slice 1: `src/memory.rs::resolve_data_flow`, global-unique resolve-or-skip).
+   Remaining: data-flow qualified `m::CONST` + write/read direction; call-graph polish
    (`x.bar()` receiver-type inference, renamed-import alias calls, cross-impl-block self-calls).
 
 ### P2 — Ergonomics

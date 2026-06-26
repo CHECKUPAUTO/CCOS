@@ -14,6 +14,10 @@ pub struct ParseResult {
     /// skip-if-empty keeps the serialized form unchanged for the common (heuristic / no-call) case.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub call_sites: Vec<CallSite>,
+    /// In-body references to module-level `static`/`const` items (data-flow Slice 1). Same
+    /// skip-if-empty serde contract — empty on the heuristic path and for call-free bodies.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub data_refs: Vec<DataRef>,
     pub generated_nodes: usize,
     pub generated_edges: usize,
 }
@@ -54,6 +58,18 @@ pub struct CallSite {
     pub line: usize,
 }
 
+/// A **data-reference**: `reader`'s body mentions `name`, an identifier in `SCREAMING_SNAKE_CASE`
+/// (the Rust convention for a `static`/`const`). Resolved to a `static`/`const` definition symbol
+/// by [`crate::memory::MemoryGraph::resolve_data_flow`], which adds a `reader → item`
+/// [`EdgeType::DataFlow`](crate::memory::EdgeType) edge — the shared-global-state channel that call
+/// and import edges miss. Only emitted on the `syn` (real-AST) path; empty on the heuristic fallback.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DataRef {
+    pub reader: String,
+    pub name: String,
+    pub line: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum SymbolKind {
     Function,
@@ -78,7 +94,8 @@ impl ASTParser {
 
     pub fn parse_source(&self, file_path: &str, source_code: &str) -> ParseResult {
         let hash = Self::compute_hash(source_code);
-        let (modules, use_statements, symbols, call_sites) = Self::extract_all(source_code);
+        let (modules, use_statements, symbols, call_sites, data_refs) =
+            Self::extract_all(source_code);
 
         ParseResult {
             file_path: file_path.to_string(),
@@ -89,6 +106,7 @@ impl ASTParser {
             use_statements,
             symbols,
             call_sites,
+            data_refs,
         }
     }
 
@@ -106,6 +124,7 @@ impl ASTParser {
         Vec<UseStatement>,
         Vec<Symbol>,
         Vec<CallSite>,
+        Vec<DataRef>,
     ) {
         #[cfg(feature = "syn-parser")]
         {
@@ -113,12 +132,14 @@ impl ASTParser {
                 return parsed;
             }
         }
-        // Heuristic fallback emits no call-sites (it does not parse expression trees), so the
-        // call graph simply stays empty on that path — a build can only ever *omit* call edges.
+        // Heuristic fallback emits no call-sites or data-refs (it does not parse expression
+        // trees), so the call/data-flow graphs simply stay empty on that path — a build can only
+        // ever *omit* those edges.
         (
             Self::extract_modules(source),
             Self::extract_uses(source),
             Self::extract_symbols(source),
+            Vec::new(),
             Vec::new(),
         )
     }
@@ -227,6 +248,11 @@ impl ASTParser {
             };
             graph.upsert_node(sym_id.clone(), symbol.name.clone(), body, NodeType::Symbol);
             graph.add_edge(file_id.clone(), sym_id.clone(), 0.6, EdgeType::Contains);
+            // A `static`/`const` is the only valid `DataFlow` target; mark it so the resolver can
+            // tell it apart from a function (the graph node stores `NodeType`, not `SymbolKind`).
+            if matches!(symbol.kind, SymbolKind::Static | SymbolKind::Const) {
+                graph.mark_data_symbol(sym_id.clone());
+            }
         }
 
         // Hand this file's in-body call-sites to the graph; they are resolved into `caller →
@@ -239,6 +265,16 @@ impl ASTParser {
                 .call_sites
                 .iter()
                 .map(|c| (c.caller.clone(), c.callee.clone(), c.line))
+                .collect(),
+        );
+        // Likewise hand over this file's `static`/`const` references, resolved into `reader → item`
+        // DataFlow edges by the whole-graph `resolve_data_flow` pass after call resolution.
+        graph.set_pending_data_refs(
+            &result.file_path,
+            result
+                .data_refs
+                .iter()
+                .map(|d| (d.reader.clone(), d.name.clone(), d.line))
                 .collect(),
         );
     }
@@ -708,7 +744,7 @@ fn symbol_span(lines: &[&str], start_line: usize) -> (usize, usize) {
 /// natively. Returns `None` on a syntax error so the caller can fall back.
 #[cfg(feature = "syn-parser")]
 mod syn_ast {
-    use super::{CallSite, ModuleDecl, Symbol, SymbolKind, UseStatement};
+    use super::{CallSite, DataRef, ModuleDecl, Symbol, SymbolKind, UseStatement};
     use proc_macro2::Span;
     use std::collections::HashSet;
     use syn::spanned::Spanned;
@@ -722,11 +758,12 @@ mod syn_ast {
         Vec<UseStatement>,
         Vec<Symbol>,
         Vec<CallSite>,
+        Vec<DataRef>,
     )> {
         let file = syn::parse_file(source).ok()?;
         let mut out = Collected::default();
         walk(&file.items, &mut out);
-        Some((out.modules, out.uses, out.symbols, out.calls))
+        Some((out.modules, out.uses, out.symbols, out.calls, out.data_refs))
     }
 
     #[derive(Default)]
@@ -735,6 +772,7 @@ mod syn_ast {
         uses: Vec<UseStatement>,
         symbols: Vec<Symbol>,
         calls: Vec<CallSite>,
+        data_refs: Vec<DataRef>,
     }
 
     /// Collects single-segment free-function call-sites from a function body, in source
@@ -746,7 +784,13 @@ mod syn_ast {
         /// Deref- or blanket-trait-provided method (not defined here) is never mislinked to a
         /// same-named free function in this module.
         own_methods: &'a std::collections::HashSet<String>,
+        /// Names bound *locally* in this function — parameters, `let`s, and fn-local `const`/`static`
+        /// items. A `SCREAMING_SNAKE` data-reference whose name is locally bound is skipped: it
+        /// denotes the local (invisible as a graph symbol), not a same-named module-level
+        /// `static`/`const`, so resolving it global-unique would be a false edge.
+        local_bound: &'a std::collections::HashSet<String>,
         calls: Vec<CallSite>,
+        data_refs: Vec<DataRef>,
     }
     impl<'a, 'ast> Visit<'ast> for CallVisitor<'a> {
         fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
@@ -796,21 +840,94 @@ mod syn_ast {
             }
             syn::visit::visit_expr_method_call(self, node);
         }
+        fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
+            // Data-flow Slice 1 — a bare `SCREAMING_SNAKE` value reference is, by Rust convention, a
+            // `static`/`const` use; capture it UNLESS the name is locally bound (a param / `let` /
+            // fn-local `const` — `local_bound`), which would denote the local, not a same-named
+            // global (the false edge the scope guard closes). Casing excludes PascalCase
+            // types/variants and snake_case fns/locals; qualified `m::CONST` is a later slice.
+            // (Known residual: a bare SCREAMING-cased enum variant brought in by `use` can still
+            // coincide with a global const — rare, since variants are conventionally PascalCase.)
+            if node.qself.is_none()
+                && node.path.leading_colon.is_none()
+                && node.path.segments.len() == 1
+            {
+                let seg = &node.path.segments[0];
+                let name = seg.ident.to_string();
+                if is_screaming_snake(&name) && !self.local_bound.contains(&name) {
+                    self.data_refs.push(DataRef {
+                        reader: self.caller.clone(),
+                        name,
+                        line: line_of(seg.ident.span()),
+                    });
+                }
+            }
+            syn::visit::visit_expr_path(self, node);
+        }
+    }
+
+    /// A `static`/`const`-style identifier: at least one ASCII upper-case letter and nothing but
+    /// upper-case letters, digits, and underscores (the Rust `SCREAMING_SNAKE_CASE` convention).
+    fn is_screaming_snake(s: &str) -> bool {
+        s.chars().any(|c| c.is_ascii_uppercase())
+            && s.chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+    }
+
+    /// Names bound *locally* in a function — its parameters plus every `let`, fn-local
+    /// `const`/`static`, closure parameter, and pattern binding in its body. Used to suppress
+    /// data-references that denote a local rather than a module-level `static`/`const`.
+    /// **Conservative**: collects across the whole body regardless of nested scope, so it can only
+    /// ever drop a data-edge, never invent one — exactly the precision-first trade we want.
+    fn local_bound_names(sig: &syn::Signature, block: &syn::Block) -> HashSet<String> {
+        struct BindingCollector {
+            names: HashSet<String>,
+        }
+        impl<'ast> Visit<'ast> for BindingCollector {
+            fn visit_pat_ident(&mut self, p: &'ast syn::PatIdent) {
+                self.names.insert(p.ident.to_string());
+                syn::visit::visit_pat_ident(self, p);
+            }
+            fn visit_item_const(&mut self, c: &'ast syn::ItemConst) {
+                self.names.insert(c.ident.to_string());
+                syn::visit::visit_item_const(self, c);
+            }
+            fn visit_item_static(&mut self, s: &'ast syn::ItemStatic) {
+                self.names.insert(s.ident.to_string());
+                syn::visit::visit_item_static(self, s);
+            }
+        }
+        let mut c = BindingCollector {
+            names: HashSet::new(),
+        };
+        for input in &sig.inputs {
+            if let syn::FnArg::Typed(pt) = input {
+                c.visit_pat(&pt.pat);
+            }
+        }
+        c.visit_block(block);
+        c.names
     }
 
     fn collect_calls(
         caller: &str,
         own_methods: &std::collections::HashSet<String>,
+        sig: &syn::Signature,
         block: &syn::Block,
-        out: &mut Vec<CallSite>,
+        calls_out: &mut Vec<CallSite>,
+        refs_out: &mut Vec<DataRef>,
     ) {
+        let local_bound = local_bound_names(sig, block);
         let mut v = CallVisitor {
             caller: caller.to_string(),
             own_methods,
+            local_bound: &local_bound,
             calls: Vec::new(),
+            data_refs: Vec::new(),
         };
         v.visit_block(block);
-        out.append(&mut v.calls);
+        calls_out.append(&mut v.calls);
+        refs_out.append(&mut v.data_refs);
     }
 
     /// 1-based source line; the `span-locations` feature guarantees real spans.
@@ -859,8 +976,10 @@ mod syn_ast {
                     collect_calls(
                         &f.sig.ident.to_string(),
                         &HashSet::new(),
+                        &f.sig,
                         &f.block,
                         &mut out.calls,
+                        &mut out.data_refs,
                     );
                 }
                 syn::Item::Struct(s) => push_sym(out, &s.ident, SymbolKind::Struct),
@@ -882,8 +1001,10 @@ mod syn_ast {
                                 collect_calls(
                                     &method.sig.ident.to_string(),
                                     &methods,
+                                    &method.sig,
                                     body,
                                     &mut out.calls,
+                                    &mut out.data_refs,
                                 );
                             }
                         }
@@ -912,8 +1033,10 @@ mod syn_ast {
                             collect_calls(
                                 &method.sig.ident.to_string(),
                                 &methods,
+                                &method.sig,
                                 &method.block,
                                 &mut out.calls,
+                                &mut out.data_refs,
                             );
                         }
                     }
@@ -1267,6 +1390,79 @@ mod syn_tests {
             "self.len() (not a method of W) is not captured, got {:?}",
             r.call_sites.iter().map(|c| &c.callee).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn syn_captures_screaming_snake_data_refs_only() {
+        // A `SCREAMING_SNAKE` value reference is captured as a data-ref; snake_case (fn/local) and
+        // PascalCase (type/variant) are not. The const *definition* is an item, not a value path,
+        // so only the *use* inside `reader` is captured.
+        let src = "const MAX_SIZE: usize = 10;\nfn reader() -> usize { let _c = Config; MAX_SIZE + helper() }\nfn helper() -> usize { 0 }\nstruct Config;";
+        let r = ASTParser::new().parse_source("t.rs", src);
+        assert!(
+            r.data_refs
+                .iter()
+                .any(|d| d.reader == "reader" && d.name == "MAX_SIZE"),
+            "SCREAMING_SNAKE reference is captured, got {:?}",
+            r.data_refs.iter().map(|d| &d.name).collect::<Vec<_>>()
+        );
+        assert!(
+            !r.data_refs
+                .iter()
+                .any(|d| d.name == "helper" || d.name == "Config"),
+            "snake_case (fn) and PascalCase (type) references are not data-refs"
+        );
+    }
+
+    #[test]
+    fn data_flow_end_to_end_cross_file() {
+        // The whole wiring through the real parser: config.rs defines `const MAX_LIMIT`, api.rs's
+        // `reader` references it. update_memory_graph marks the const + records the ref, and
+        // resolve_data_flow links them across files — the channel imports/calls never see.
+        let p = ASTParser::new();
+        let mut g = MemoryGraph::new(0.0, usize::MAX);
+        for (path, src) in [
+            ("src/config.rs", "pub const MAX_LIMIT: usize = 10;"),
+            ("src/api.rs", "fn reader() -> usize { MAX_LIMIT + 1 }"),
+        ] {
+            let r = p.parse_source(path, src);
+            p.update_memory_graph(&r, src, &mut g);
+        }
+        g.resolve_data_flow();
+        let edges: Vec<(String, String)> = g
+            .edges()
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::DataFlow)
+            .map(|e| (e.source.0.clone(), e.target.0.clone()))
+            .collect();
+        assert_eq!(
+            edges,
+            vec![(
+                "sym:src/api.rs:reader".to_string(),
+                "sym:src/config.rs:MAX_LIMIT".to_string()
+            )],
+            "reader → MAX_LIMIT cross-file data-flow edge, end to end"
+        );
+    }
+
+    #[test]
+    fn syn_data_refs_skip_locally_bound_names() {
+        // A `SCREAMING_SNAKE` name bound locally — a parameter, a fn-local `const`, or a `let` — is
+        // NOT a data-ref: it denotes the local, so resolving it global-unique to a same-named global
+        // would be a false edge. Only the genuinely-free `MAX_LIMIT` is captured.
+        let src = "fn r(PARAM_X: u8) -> u8 {\n  const LOCAL_C: u8 = 1;\n  let LET_V = 2u8;\n  PARAM_X + LOCAL_C + LET_V + MAX_LIMIT\n}";
+        let r = ASTParser::new().parse_source("t.rs", src);
+        let names: Vec<String> = r.data_refs.iter().map(|d| d.name.clone()).collect();
+        assert!(
+            names.contains(&"MAX_LIMIT".to_string()),
+            "the free global reference is captured, got {names:?}"
+        );
+        for bound in ["PARAM_X", "LOCAL_C", "LET_V"] {
+            assert!(
+                !names.iter().any(|n| n == bound),
+                "{bound} is locally bound — it must not be a data-ref (got {names:?})"
+            );
+        }
     }
 
     #[test]
