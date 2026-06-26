@@ -874,6 +874,73 @@ mod syn_ast {
                 .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
     }
 
+    /// The **concrete Self type name** an `impl` block is for — the final path segment of its
+    /// `self_ty` (`impl a::b::Bar` and `impl Bar<T>` both key under `Bar`) — used to gate and union
+    /// per-type method sets so a `self.foo()` resolves to *this type's* `foo` even when `foo` is
+    /// defined in a different impl block of the same type.
+    ///
+    /// Returns `None` for any shape where a concrete type name cannot be determined, so the caller
+    /// falls back to same-block gating rather than guessing: a reference/tuple/slice/`dyn`/`impl
+    /// Trait`/qself receiver (`impl Trait for &Bar`, `for [T]`, …), or a `self_ty` that is itself one
+    /// of the impl's **generic parameters** (`impl<T> Trait for T` — a blanket impl, where keying
+    /// under `T` would wrongly union two unrelated blanket impls). The generic-parameter guard is the
+    /// key no-cross-link safeguard for blanket impls.
+    fn impl_self_type_name(imp: &syn::ItemImpl) -> Option<String> {
+        let syn::Type::Path(tp) = &*imp.self_ty else {
+            return None; // &Bar / (A, B) / [T] / dyn X / impl Trait / fn(..) — not a named type
+        };
+        if tp.qself.is_some() {
+            return None; // <T as Trait>::Assoc — no single concrete owning type
+        }
+        let last = tp.path.segments.last()?.ident.to_string();
+        // A bare self_ty that names one of the impl's own generic type params is a type *variable*
+        // (`impl<T> .. for T`), not a concrete type — refuse it so blanket impls never cross-link.
+        if tp.path.segments.len() == 1 && impl_generic_type_params(imp).contains(&last) {
+            return None;
+        }
+        Some(last)
+    }
+
+    /// The names of an `impl`'s generic **type** parameters (`impl<T, U>` → {`T`, `U`}). Lifetimes
+    /// and const generics are irrelevant to the type-variable check in [`impl_self_type_name`].
+    fn impl_generic_type_params(imp: &syn::ItemImpl) -> HashSet<String> {
+        imp.generics
+            .params
+            .iter()
+            .filter_map(|p| match p {
+                syn::GenericParam::Type(t) => Some(t.ident.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Union, per concrete Self type, of every method/associated-fn name across **all** impl blocks
+    /// of that type at one scope (inherent `impl Bar` *and* trait impls `impl Trait for Bar`), keyed
+    /// by the type's final-segment name (see [`impl_self_type_name`]). A method body's `self.m()` /
+    /// `Self::m` is then captured when `m` is in its enclosing type's *full* set, so a call resolves
+    /// across impl blocks of the same type — while two **different** types each owning a same-named
+    /// method stay in separate sets and never cross-link. Impls whose Self type is not a concrete
+    /// name are skipped here (their methods fall back to same-block gating). `BTree*` ⇒ deterministic.
+    fn build_type_method_sets(
+        items: &[syn::Item],
+    ) -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
+        let mut map: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+            std::collections::BTreeMap::new();
+        for item in items {
+            if let syn::Item::Impl(imp) = item {
+                if let Some(ty) = impl_self_type_name(imp) {
+                    let set = map.entry(ty).or_default();
+                    for ii in &imp.items {
+                        if let syn::ImplItem::Fn(m) = ii {
+                            set.insert(m.sig.ident.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        map
+    }
+
     /// Names bound *locally* in a function — its parameters plus every `let`, fn-local
     /// `const`/`static`, closure parameter, and pattern binding in its body. Used to suppress
     /// data-references that denote a local rather than a module-level `static`/`const`.
@@ -951,6 +1018,10 @@ mod syn_ast {
     /// their parent; symbols and `use`s from nested scopes are surfaced into the
     /// flat lists (matching the line parser, which sees every line).
     fn walk(items: &[syn::Item], out: &mut Collected) {
+        // Per-type method sets, unioned across every impl block of each concrete type at THIS scope
+        // (inherent + trait impls). Used below to gate `self.m()` / `Self::m` capture on the type's
+        // FULL method set, so a self-call resolves across sibling impl blocks of the same type.
+        let type_methods = build_type_method_sets(items);
         for item in items {
             match item {
                 syn::Item::Mod(m) => {
@@ -1019,7 +1090,12 @@ mod syn_ast {
                     }
                 }
                 syn::Item::Impl(i) => {
-                    let methods: HashSet<String> = i
+                    // Gate `self.m()` / `Self::m` on the enclosing type's FULL (unioned) method set
+                    // when the Self type is a concrete name — so a self-call resolves to a method
+                    // defined in a *different* impl block (inherent or trait) of the same type. If
+                    // the Self type is not a concrete name (generic param / reference / tuple / …),
+                    // fall back to THIS block's own methods only — never guess a cross-block link.
+                    let own_block: HashSet<String> = i
                         .items
                         .iter()
                         .filter_map(|ii| match ii {
@@ -1027,6 +1103,13 @@ mod syn_ast {
                             _ => None,
                         })
                         .collect();
+                    let methods: HashSet<String> = match impl_self_type_name(i) {
+                        Some(ty) => type_methods
+                            .get(&ty)
+                            .map(|s| s.iter().cloned().collect())
+                            .unwrap_or(own_block),
+                        None => own_block,
+                    };
                     for ii in &i.items {
                         if let syn::ImplItem::Fn(method) = ii {
                             push_sym(out, &method.sig.ident, SymbolKind::Function);
@@ -1503,5 +1586,160 @@ mod syn_tests {
         assert!(r.symbols.iter().any(|s| s.name == "real"));
         assert!(!r.symbols.iter().any(|s| s.name == "commented"));
         assert!(!r.symbols.iter().any(|s| s.name == "blocked"));
+    }
+
+    #[test]
+    fn syn_self_call_resolves_method_in_other_inherent_impl_block() {
+        // `self.foo()` in one `impl Bar` block must resolve to `Bar::foo` even though `foo` is
+        // defined in a SEPARATE `impl Bar` block — per-type method sets union across all blocks.
+        let src =
+            "struct Bar;\nimpl Bar { fn a(&self) { self.foo(); } }\nimpl Bar { fn foo(&self) {} }";
+        let r = ASTParser::new().parse_source("t.rs", src);
+        assert!(
+            r.call_sites
+                .iter()
+                .any(|c| c.caller == "a" && c.callee == "Self::foo"),
+            "self.foo() must be captured via Bar's unioned method set across impl blocks, got {:?}",
+            r.call_sites
+                .iter()
+                .map(|c| (&c.caller, &c.callee))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn syn_self_call_resolves_method_from_trait_impl_for_type() {
+        // `foo` is provided by a TRAIT impl `impl SomeTrait for Bar`; a `self.foo()` in Bar's
+        // inherent impl must still be captured — trait-impl methods are unioned into Bar's set.
+        let src = "struct Bar;\ntrait SomeTrait { fn foo(&self); }\nimpl SomeTrait for Bar { fn foo(&self) {} }\nimpl Bar { fn a(&self) { self.foo(); } }";
+        let r = ASTParser::new().parse_source("t.rs", src);
+        assert!(
+            r.call_sites
+                .iter()
+                .any(|c| c.caller == "a" && c.callee == "Self::foo"),
+            "self.foo() from a trait impl for Bar must be captured, got {:?}",
+            r.call_sites
+                .iter()
+                .map(|c| (&c.caller, &c.callee))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn syn_self_call_two_types_same_method_name_do_not_cross_link() {
+        // Bar has `foo`; Baz does NOT. `self.foo()` inside Baz must NOT be captured — gating is
+        // STRICTLY by the enclosing impl's Self type, so two types' same-named methods never cross.
+        let src = "struct Bar;\nstruct Baz;\nimpl Bar { fn foo(&self) {} }\nimpl Baz { fn a(&self) { self.foo(); } }";
+        let r = ASTParser::new().parse_source("t.rs", src);
+        assert!(
+            !r.call_sites
+                .iter()
+                .any(|c| c.caller == "a" && c.callee == "Self::foo"),
+            "Baz has no foo — self.foo() inside Baz must not cross-link to Bar::foo, got {:?}",
+            r.call_sites
+                .iter()
+                .map(|c| (&c.caller, &c.callee))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn syn_self_path_resolves_same_as_self_method_call_across_blocks() {
+        // A `Self::foo` PATH (associated-fn form) must gate identically to `self.foo()` — captured
+        // when `foo` is in the type's unioned set even if defined in another impl block.
+        let src = "struct Bar;\nimpl Bar { fn a() { Self::foo(); } }\nimpl Bar { fn foo() {} }";
+        let r = ASTParser::new().parse_source("t.rs", src);
+        assert!(
+            r.call_sites
+                .iter()
+                .any(|c| c.caller == "a" && c.callee == "Self::foo"),
+            "Self::foo path must resolve across impl blocks like self.foo(), got {:?}",
+            r.call_sites
+                .iter()
+                .map(|c| (&c.caller, &c.callee))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn syn_self_call_blanket_impl_generic_self_falls_back_no_cross_link() {
+        // `impl<T> Marker for T` has a type-VARIABLE Self (`T`), not a concrete type. It must fall
+        // back to same-block gating: `self.foo()` (foo not in this block) is NOT captured, and a
+        // generic blanket impl never unions a same-named method from an unrelated concrete type.
+        let src = "trait Marker { fn a(&self); }\nstruct Bar;\nimpl Bar { fn foo(&self) {} }\nimpl<T> Marker for T { fn a(&self) { self.foo(); } }";
+        let r = ASTParser::new().parse_source("t.rs", src);
+        assert!(
+            !r.call_sites
+                .iter()
+                .any(|c| c.caller == "a" && c.callee == "Self::foo"),
+            "blanket impl<T> for T must fall back (no concrete type) and not cross-link, got {:?}",
+            r.call_sites
+                .iter()
+                .map(|c| (&c.caller, &c.callee))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn syn_self_call_cross_impl_is_deterministic() {
+        // Same source ⇒ identical captured edges (per-type sets are BTree-ordered; capture is a
+        // pure function of the AST).
+        let src = "struct Bar;\nimpl Bar { fn a(&self) { self.foo(); self.bar(); } }\nimpl Bar { fn foo(&self) {} }\nimpl SomeTrait for Bar { fn bar(&self) {} }\ntrait SomeTrait { fn bar(&self); }";
+        let first = ASTParser::new().parse_source("t.rs", src);
+        let second = ASTParser::new().parse_source("t.rs", src);
+        let edges = |r: &ParseResult| -> Vec<(String, String, usize)> {
+            r.call_sites
+                .iter()
+                .map(|c| (c.caller.clone(), c.callee.clone(), c.line))
+                .collect()
+        };
+        assert_eq!(
+            edges(&first),
+            edges(&second),
+            "cross-impl self-call capture must be deterministic"
+        );
+        assert!(
+            first
+                .call_sites
+                .iter()
+                .any(|c| c.caller == "a" && c.callee == "Self::foo")
+                && first
+                    .call_sites
+                    .iter()
+                    .any(|c| c.caller == "a" && c.callee == "Self::bar"),
+            "both inherent (foo) and trait-impl (bar) methods resolve from Bar's union, got {:?}",
+            first
+                .call_sites
+                .iter()
+                .map(|c| (&c.caller, &c.callee))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn syn_self_call_cross_impl_end_to_end_resolves_edge() {
+        // Full wiring: a self-call to a method in a DIFFERENT impl block of the same type resolves
+        // to a real `Calls` edge through resolve_symbol_calls (Self::foo → same-module foo symbol).
+        let p = ASTParser::new();
+        let mut g = MemoryGraph::new(0.0, usize::MAX);
+        let src =
+            "struct Bar;\nimpl Bar { fn a(&self) { self.foo(); } }\nimpl Bar { fn foo(&self) {} }";
+        let r = p.parse_source("src/lib.rs", src);
+        p.update_memory_graph(&r, src, &mut g);
+        g.resolve_symbol_calls();
+        let edges: Vec<(String, String)> = g
+            .edges()
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::Calls)
+            .map(|e| (e.source.0.clone(), e.target.0.clone()))
+            .collect();
+        assert_eq!(
+            edges,
+            vec![(
+                "sym:src/lib.rs:a".to_string(),
+                "sym:src/lib.rs:foo".to_string()
+            )],
+            "self.foo() across impl blocks resolves to Bar::foo, end to end"
+        );
     }
 }
