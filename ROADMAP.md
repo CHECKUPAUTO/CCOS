@@ -371,6 +371,14 @@ honesty code↔docs↔paper, tests/API). **Fixed in this pass:**
      deterministic, dependency-free power-iteration eigenvector centrality over the (symmetrized,
      `A + I`-shifted) adjacency, complementary to the damped `MemoryGraph::eigencentrality`. A clean
      `A x = λ x` brick for the deferred spectral-regions / temporal-tensor / `scirust` work.
+   - ✅ **Q-Page dual-evidence belief layer (slice 1) — *contested knowledge*.** A claim node carries
+     two typed evidence surfaces, `EdgeType::Supports` (`S_A`) and `EdgeType::Contradicts` (`S_¬A`),
+     and `MemoryGraph::qbelief` derives `{belief, conflict}` from them — pure, no stored state,
+     `replay == live`. `conflict` flags a *contested* claim, the state similarity-only retrieval
+     cannot represent (`docs/MEASUREMENT_contradiction_crux.md`: a refutation's cosine sits *inside*
+     the support band, so no threshold separates support from refutation; the typed edge does).
+     Contradictions are explicit, replayable assertions (`CcosMemory::assert_contradiction` /
+     `Op::Assert`). Auto-detection (rules / NLI), resolution propagation, and decay are later slices.
 
 ### P2 — Ergonomics
 

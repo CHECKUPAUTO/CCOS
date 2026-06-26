@@ -312,7 +312,7 @@ impl AgentSession {
 
     /// Record and apply a **support** assertion — `evidence` is evidence *for* `claim` (the
     /// affirmative surface of the claim's [Q-Page](crate::memory::MemoryGraph::qbelief)). Logged as
-    /// an [`Op::Assert`] so it replays identically. Returns whether a new edge was added.
+    /// an `Op::Assert` so it replays identically. Returns whether a new edge was added.
     pub fn assert_support(&mut self, evidence: &str, claim: &str, weight: f64) -> bool {
         self.ops.push(Op::Assert {
             evidence: evidence.to_string(),
@@ -325,7 +325,7 @@ impl AgentSession {
 
     /// Record and apply a **contradiction** assertion — `evidence` is evidence *against* `claim`
     /// (the negative surface). The dual of [`assert_support`](Self::assert_support); logged as an
-    /// [`Op::Assert`] so `replay == live` holds for the contested-knowledge channel too.
+    /// `Op::Assert` so `replay == live` holds for the contested-knowledge channel too.
     pub fn assert_contradiction(&mut self, evidence: &str, claim: &str, weight: f64) -> bool {
         self.ops.push(Op::Assert {
             evidence: evidence.to_string(),
