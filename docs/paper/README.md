@@ -12,14 +12,17 @@ hypothesis, the bug-mining harness, and the measurements against RAG / GraphRAG.
 The canonical paper is English; faithful translations carry the same structure,
 equations, tables and bibliography (only the prose is translated).
 
-| File | Language | Build engine |
-| --- | --- | --- |
-| [`ccos_regions.tex`](ccos_regions.tex)       | English (canonical) | `pdflatex` |
-| [`ccos_regions.fr.tex`](ccos_regions.fr.tex) | Français            | `pdflatex` (babel) |
-| [`ccos_regions.es.tex`](ccos_regions.es.tex) | Español             | `pdflatex` (babel) |
-| [`ccos_regions.zh.tex`](ccos_regions.zh.tex) | 中文 (Chinese)      | `xelatex` (ctex) |
-| [`ccos_regions.ko.tex`](ccos_regions.ko.tex) | 한국어 (Korean)     | `xelatex` (kotex) |
-| [`ccos_regions.ar.tex`](ccos_regions.ar.tex) | العربية (Arabic)    | `xelatex` (polyglossia, RTL) |
+Every variant also ships as **GitHub-flavoured Markdown** (`*.md`), and the English and French
+additionally as **PDF** — see *Markdown and PDF renditions* below.
+
+| LaTeX source | Language | LaTeX engine | Markdown · PDF |
+| --- | --- | --- | --- |
+| [`ccos_regions.tex`](ccos_regions.tex)       | English (canonical) | `pdflatex`           | [`.md`](ccos_regions.md) · [`.en.pdf`](ccos_regions.en.pdf) |
+| [`ccos_regions.fr.tex`](ccos_regions.fr.tex) | Français            | `pdflatex` (babel)   | [`.fr.md`](ccos_regions.fr.md) · [`.fr.pdf`](ccos_regions.fr.pdf) |
+| [`ccos_regions.es.tex`](ccos_regions.es.tex) | Español             | `pdflatex` (babel)   | [`.es.md`](ccos_regions.es.md) |
+| [`ccos_regions.zh.tex`](ccos_regions.zh.tex) | 中文 (Chinese)      | `xelatex` (ctex)     | [`.zh.md`](ccos_regions.zh.md) |
+| [`ccos_regions.ko.tex`](ccos_regions.ko.tex) | 한국어 (Korean)     | `xelatex` (kotex)    | [`.ko.md`](ccos_regions.ko.md) |
+| [`ccos_regions.ar.tex`](ccos_regions.ar.tex) | العربية (Arabic)    | `xelatex` (polyglossia, RTL) | [`.ar.md`](ccos_regions.ar.md) |
 
 ## Build
 
@@ -39,6 +42,23 @@ The CJK and Arabic versions require XeLaTeX with the appropriate fonts (e.g. a C
 such as Noto/Source Han for `zh`/`ko`, and Amiri for `ar`). The translations have not
 been compile-tested in this environment; a build pass may be needed, especially for the
 right-to-left Arabic typesetting.
+
+## Markdown and PDF renditions
+
+The committed `*.md` and the English/French `*.pdf` are generated **without a TeX
+installation** — `pandoc` for Markdown, and LaTeX→HTML→headless-Chromium for PDF:
+
+```bash
+# Markdown (all six languages), GitHub-flavoured, equations as $...$:
+pandoc ccos_regions.fr.tex -f latex -t gfm -o ccos_regions.fr.md
+
+# PDF (English & French): HTML with MathML (renders offline) → Chromium print-to-PDF:
+pandoc ccos_regions.fr.tex -f latex -t html5 --standalone --mathml -o /tmp/p.html
+chromium --headless --no-pdf-header-footer --print-to-pdf=ccos_regions.fr.pdf /tmp/p.html
+```
+
+The `.tex` remains canonical for arXiv and citations: pandoc maps `\ref` to anchors and
+elides the inline `thebibliography` markers, which the Markdown does not reproduce.
 
 ## What it claims (and what it doesn't)
 

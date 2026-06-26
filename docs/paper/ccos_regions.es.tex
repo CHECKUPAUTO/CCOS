@@ -710,6 +710,15 @@ ajustado; en commits de corrección reales los archivos que una corrección toca
 parecen léxicamente, así que la premisa de la simulación de una causa léxicamente
 distinta no se sostiene. Los fuertes números absolutos son una condición
 \emph{necesaria} que una referencia también satisface, no una victoria de CCOS.
+(Una medición complementaria sobre la propia fuente del motor aísla una relación
+distinta, definida estructuralmente: un recuperador léxico TF-IDF recupera solo el
+$49\%$ (exhaustividad@10) de las dependencias de importación resueltas por AST ---
+pares que rutinariamente no comparten vocabulario, coseno de dependencia $0{,}53$
+frente a $0{,}43$ aleatorio --- así que el punto ciego del RAG es real, pero queda
+fuera del eje de cohesión de la corrección que mide la métrica principal, donde los
+archivos de una corrección sí comparten vocabulario. La capa estructural recupera
+esas aristas por construcción; el AST, ahora por defecto, es lo que hace completa esa
+recuperación.)
 \textbf{(2) Necesario $\neq$ suficiente.} Nunca medimos si una región \emph{ayuda a un
 agente a corregir} un error (Fase 4: un parche que pasa las pruebas ocultas) --- solo si
 los archivos relevantes son recuperables.
@@ -720,13 +729,19 @@ a la selección causal.
 \textbf{(4) Escala y estadística.} Tres repositorios de una sola crate,
 $n\!\approx\!20$ cada uno; las diferencias se reportan con su desviación estándar pero no
 se validan de forma cruzada.
-\textbf{(5) Motor.} El analizador es una heurística de línea/AST (vecindarios poco
-profundos); las regiones son de granularidad de archivo y solo se fusionan en aristas
-entre archivos explícitas; los pesos de temperatura/política y de puntuación están
-ajustados a mano, no aprendidos. Nada de esto afecta a las propiedades \emph{probadas}
-(partición, determinismo, reproducción) ni a la localidad medida --- pero el caso
-empírico de un beneficio para el agente aguas abajo está, en este punto, \emph{sin
-probar}.
+\textbf{(5) Motor.} El analizador ahora usa por defecto un AST \code{syn} real ---
+medido un $36{,}5\%$ más preciso que la antigua heurística de línea sobre la propia
+fuente del motor (dos tercios frente a exhaustividad de importación completa), con la
+heurística conservada solo como reserva para entradas que no son Rust --- y la
+ingesta se endureció para reconstruir de forma bit-idéntica entre procesos
+(resolución de importaciones ordenada; centralidad invariante al orden). Las regiones
+siguen siendo de granularidad de archivo y solo se fusionan en aristas entre archivos
+explícitas; los pesos de puntuación están ajustados a mano, aunque ya están
+disponibles refinamientos, desactivados por defecto, de centralidad de autovalor y de
+ciclo de vida de nodo (Stable/Working/Orphan). Nada de esto afecta a las propiedades
+\emph{probadas} (partición, determinismo, reproducción) ni a la localidad medida ---
+pero el caso empírico de un beneficio para el agente aguas abajo está, en este punto,
+\emph{sin probar}.
 
 \section{Conclusión}
 

@@ -718,6 +718,14 @@ sur de vrais commits de correction, les fichiers qu'un correctif touche se resse
 lexicalement, donc la prémisse de la simulation d'une cause lexicalement dissemblable ne
 tient pas. Les chiffres absolus forts sont une condition \emph{nécessaire} qu'une référence
 satisfait aussi, non une victoire de CCOS.
+(Une mesure complémentaire sur le code source du moteur lui-même isole une relation
+différente, définie structurellement : un récupérateur lexical TF-IDF ne retrouve que
+$49\%$ (rappel@$10$) des dépendances d'\emph{import} résolues par l'AST --- des paires
+qui ne partagent souvent aucun vocabulaire, cosinus de dépendance $0{,}53$ contre $0{,}43$
+aléatoire --- de sorte que l'angle mort du RAG est réel, mais il se situe hors de l'axe de
+\emph{cohésion} d'un correctif que mesure la métrique phare, où les fichiers d'un correctif
+partagent bien leur vocabulaire. La couche structurelle retrouve ces arêtes par construction ;
+l'AST désormais par défaut est ce qui rend cette récupération complète.)
 \textbf{(2) Nécessaire $\neq$ suffisant.} Nous ne mesurons jamais si une région \emph{aide
 un agent à corriger} un bogue (Phase 4 : un correctif qui passe les tests cachés) --- seulement
 si les fichiers pertinents sont récupérables.
@@ -727,12 +735,18 @@ où un symptôme est lexicalement loin de sa cause --- le régime le plus favora
 sélection causale.
 \textbf{(4) Échelle et statistiques.} Trois dépôts mono-crate, $n\!\approx\!20$ chacun ; les
 différences sont rapportées avec leur écart-type mais non validées de façon croisée.
-\textbf{(5) Moteur.} Le parseur est une heuristique ligne/AST (voisinages peu profonds) ; les
-régions sont à granularité fichier et ne fusionnent que sur des arêtes inter-fichiers
-explicites ; les poids de température/politique et de score sont réglés à la main, non appris.
-Rien de tout cela n'affecte les propriétés \emph{prouvées} (partition, déterminisme, rejeu)
-ni la localité mesurée --- mais le dossier empirique d'un bénéfice pour l'agent en aval est, à
-ce stade, \emph{non prouvé}.
+\textbf{(5) Moteur.} Le parseur utilise désormais \emph{par défaut} un vrai AST \texttt{syn}
+--- mesuré $36{,}5\%$ plus précis que l'ancienne heuristique ligne sur le code source du moteur
+lui-même (deux tiers contre la totalité du rappel d'imports), l'heuristique n'étant conservée
+que comme repli pour les entrées non-Rust --- et l'ingestion a été durcie pour se reconstruire
+bit à bit à l'identique entre processus (résolution d'imports triée ; centralité invariante à
+l'ordre). Les régions restent à granularité fichier et ne fusionnent que sur des arêtes
+inter-fichiers explicites ; les poids de score sont réglés à la main, bien que des raffinements
+optionnels (désactivés par défaut) de centralité par vecteur propre et d'états de cycle de vie
+des nœuds (\texttt{Stable}/\texttt{Working}/\texttt{Orphan}) soient désormais disponibles. Rien
+de tout cela n'affecte les propriétés \emph{prouvées} (partition, déterminisme, rejeu) ni la
+localité mesurée --- mais le dossier empirique d'un bénéfice pour l'agent en aval est, à ce
+stade, \emph{non prouvé}.
 
 \section{Conclusion}
 
