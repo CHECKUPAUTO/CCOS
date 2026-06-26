@@ -2482,15 +2482,10 @@ fn crate_and_module(file_path: &str) -> Option<(String, String)> {
     Some((krate, module_of(after)?))
 }
 
-/// Resolve an import to the defining file's node id. `crate::`/`self::`/`super::`
-/// stay in the importer's crate (and require a real sub-module match); a leading
-/// crate name (e.g. `grep_matcher::…`) targets that crate and may resolve to its
-/// root (`lib.rs`). External paths like `std::io` match nothing.
-fn resolve_use(
-    importer_crate: &str,
-    usepath: &str,
-    index: &HashMap<(String, String), NodeId>,
-) -> Option<NodeId> {
+/// Parse a `use`/call path into `(target_crate, module_segments_after_the_crate_root)`.
+/// `crate::`/`self::`/`super::` (and bare `crate`/`self`/`super`) stay in the importer's crate; a
+/// leading crate name (e.g. `grep_matcher::…`) targets that crate.
+fn parse_modpath(importer_crate: &str, usepath: &str) -> (String, Vec<String>) {
     let (target_crate, rest): (String, &str) = if let Some(r) = usepath
         .strip_prefix("crate::")
         .or_else(|| usepath.strip_prefix("self::"))
@@ -2505,7 +2500,25 @@ fn resolve_use(
             None => (usepath.to_string(), ""),
         }
     };
-    let segs: Vec<&str> = rest.split("::").filter(|s| !s.is_empty()).collect();
+    let segs = rest
+        .split("::")
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    (target_crate, segs)
+}
+
+/// Resolve an import to the defining file's node id. `crate::`/`self::`/`super::` stay in the
+/// importer's crate (requiring a real sub-module match); a leading crate name targets that crate
+/// and may resolve to its root (`lib.rs`). Tries the full module path then **shortens** to ancestor
+/// modules — correct for a `use`-target re-exported at an ancestor (`use a::Thing`, `Thing` living
+/// in `a`'s file). External paths like `std::io` match nothing.
+fn resolve_use(
+    importer_crate: &str,
+    usepath: &str,
+    index: &HashMap<(String, String), NodeId>,
+) -> Option<NodeId> {
+    let (target_crate, segs) = parse_modpath(importer_crate, usepath);
     // Same-crate imports must hit a real sub-module (len ≥ 1); cross-crate imports
     // may resolve to the crate root (len 0) — depending on the crate as a whole.
     let min_len = usize::from(target_crate == importer_crate);
@@ -2513,6 +2526,19 @@ fn resolve_use(
         let module = segs[..len].join("::");
         index.get(&(target_crate.clone(), module)).cloned()
     })
+}
+
+/// Resolve a path to the file whose module is **exactly** that path — no ancestor shortening.
+/// Used to pin a qualified call's *definition* module: unlike [`resolve_use`], a `crate::a::b` whose
+/// `a::b` module has no file must NOT fall back to an existing `a` (that would attribute the call to
+/// a wrong-existing symbol — the inline-submodule / ancestor-fallback / `Enum::Variant` false edge).
+fn resolve_module_exact(
+    importer_crate: &str,
+    path: &str,
+    index: &HashMap<(String, String), NodeId>,
+) -> Option<NodeId> {
+    let (target_crate, segs) = parse_modpath(importer_crate, path);
+    index.get(&(target_crate, segs.join("::"))).cloned()
 }
 
 /// The Slice-1 call→def resolution ladder used by
@@ -2531,18 +2557,17 @@ fn resolve_call(
     name_count: &HashMap<String, u32>,
     name_first: &HashMap<String, NodeId>,
 ) -> Option<NodeId> {
-    // Slice 2 — qualified path `mod::…::name`: resolve the module prefix to a file, then the final
-    // segment within it. resolve-uniquely-or-skip, so anything unresolvable or ambiguous → no edge
-    // (and a qualified path never falls through to the bare same-module/global ladder below).
+    // Slice 2 — qualified path `mod::…::name`: pin the module prefix to its defining file, then take
+    // the unique `sym:<file>:name`. resolve-uniquely-or-skip, so anything unresolvable or ambiguous →
+    // no edge (and a qualified path never falls through to the bare same-module/global ladder below).
     if let Some((prefix, name)) = callee.rsplit_once("::") {
-        let deffile = if prefix == "crate" || prefix.starts_with("crate::") {
-            // (a) crate-rooted `crate::m::name` — absolute, resolve directly.
-            resolve_use(fcrate, prefix, file_index)
+        // Build the prefix's absolute module path: crate-rooted directly, else expand the leading
+        // segment through the file's imports (`use …::alias`). Skip if the alias matches no import,
+        // or more than one (ambiguous). `self`/`super`/`Self`/`Type` and external roots (`std::…`)
+        // match no import here → skipped (Slice 3 / by design).
+        let abs: Option<String> = if prefix == "crate" || prefix.starts_with("crate::") {
+            Some(prefix.to_string())
         } else {
-            // (b) `alias::…::name` — expand the leading segment via the file's imports
-            //     (`use …::alias`) into an absolute module path, then resolve. Skip if the alias
-            //     matches no import, or more than one (ambiguous). `self`/`super`/`Self`/`Type`
-            //     and external roots (`std::…`) match no import here → skipped (Slice 3 / by design).
             let first = prefix.split("::").next().unwrap_or(prefix);
             let rest = prefix.strip_prefix(first).unwrap_or(""); // "" or "::b::c"
             let mut hits = scope
@@ -2551,20 +2576,17 @@ fn resolve_call(
                 .flatten()
                 .filter(|u| u.rsplit("::").next() == Some(first));
             match (hits.next(), hits.next()) {
-                (Some(use_path), None) => {
-                    resolve_use(fcrate, &format!("{use_path}{rest}"), file_index)
-                }
+                (Some(use_path), None) => Some(format!("{use_path}{rest}")),
                 _ => None,
             }
         };
-        if let Some(df) = deffile {
-            if let Some(deffile_str) = df.0.strip_prefix("file:") {
-                if let Some((c, m)) = crate_and_module(deffile_str) {
-                    return defs.get(&(c, m, name.to_string())).cloned();
-                }
-            }
-        }
-        return None;
+        // Resolve the module EXACTLY (no ancestor shortening — see `resolve_module_exact`): a
+        // `crate::a::b` whose `a::b` module has no file must skip, not fall back to `a`'s symbols.
+        return abs
+            .and_then(|a| resolve_module_exact(fcrate, &a, file_index))
+            .and_then(|df| df.0.strip_prefix("file:").map(str::to_string))
+            .and_then(|f| crate_and_module(&f))
+            .and_then(|(c, m)| defs.get(&(c, m, name.to_string())).cloned());
     }
     // Tier A — import-scoped: an import `use <module>::callee` pins the defining module; resolve it
     // to a file and require exactly one unique `sym:<file>:callee`. (Rust-name-resolution-correct:
@@ -3195,6 +3217,39 @@ mod tests {
         assert!(
             calls_of(&g).is_empty(),
             "qualified external/associated calls skip — no import expands them, no fallback to a local"
+        );
+    }
+
+    #[test]
+    fn resolve_symbol_calls_qualified_no_ancestor_fallback() {
+        // `crate::a::b::connect()` but only module `a` (src/a.rs) exists — no file for `a::b` (an
+        // inline submodule, or not-yet-ingested). Must SKIP, never falling back to `a`'s `connect`
+        // (the inline-submodule / ancestor-fallback false edge the exact-module guard closes).
+        let mut g = graph_with_defs(&[("src/a.rs", "connect"), ("src/api.rs", "run")]);
+        g.set_pending_calls(
+            "src/api.rs",
+            vec![("run".into(), "crate::a::b::connect".into(), 1)],
+        );
+        g.resolve_symbol_calls();
+        assert!(
+            calls_of(&g).is_empty(),
+            "qualified call to a missing submodule skips — no ancestor fallback to a::connect"
+        );
+    }
+
+    #[test]
+    fn resolve_symbol_calls_qualified_variant_or_assoc_collision_skips() {
+        // `crate::db::Conn::open()` — `Conn` is a type, not a module, so there is no `db::Conn`
+        // file. Must SKIP, not drop the `Conn` tail and link to the free fn `open` in module `db`.
+        let mut g = graph_with_defs(&[("src/db.rs", "open"), ("src/api.rs", "run")]);
+        g.set_pending_calls(
+            "src/api.rs",
+            vec![("run".into(), "crate::db::Conn::open".into(), 1)],
+        );
+        g.resolve_symbol_calls();
+        assert!(
+            calls_of(&g).is_empty(),
+            "associated/variant call skips — the type tail is not collapsed to the module's free fn"
         );
     }
 
