@@ -364,9 +364,11 @@ honesty code↔docs↔paper, tests/API). **Fixed in this pass:**
 
 ### P2 — Ergonomics
 
-4. **Configurable scoring/paging/guard** — *scoring done* (`ScoringWeights::from_env`:
-   `CCOS_W_BASE/FAILURE/RECENCY/ACCESS/CENTRALITY`, `CCOS_FAILURE_DECAY`, `CCOS_CENTRALITY_MODE`).
-   Remaining: paging-cap / guard knobs (small). (S)
+4. ✅ **Configurable scoring/paging/guard** — *done.* Scoring (`ScoringWeights::from_env`,
+   `CCOS_W_*`), paging (`MemoryGraph::new_from_env` / `paging_threshold_from_env`:
+   `CCOS_PAGING_THRESHOLD`, `CCOS_MAX_RESIDENT`), and the output guard (`GuardConfig::from_env`:
+   `CCOS_GUARD_MAX_OUTPUT/REQUIRE_JSON/RELIABILITY/SANITIZE/MAX_DEPTH`) are all env-overridable,
+   default-identical. (S)
 5. ✅ **Benchmarks** — *done.* `benches/delta_bench.rs` (criterion) times `process_delta` across
    backgrounds 0→8000, plus a **deterministic CI guard** (`process_delta_footprint_is_background_independent`)
    so the `O(Δ)` claim is asserted, not just measured.
@@ -388,5 +390,5 @@ honesty code↔docs↔paper, tests/API). **Fixed in this pass:**
 
 ~~`P0.1 (syn)`~~ ✅ → ~~`P1.2 (canonical log)`~~ ✅ → ~~`P1.3 (call graph, Slices 1–3a)`~~ ✅ →
 ~~`P2.5 (benches)`~~ ✅ → ~~`P2.6 (analyze extras)`~~ ✅ → ~~`P3.8 (property tests)`~~ ✅ →
-**`P3.9 (Result CLI)`** + **`P2.4 (paging/guard config)`** (quick wins) → **`P1.3 data-flow edges`**
+~~`P2.4 (config)`~~ ✅ → **`P3.9 (Result CLI)`** (last quick win) → **`P1.3 data-flow edges`**
 (the next depth jump) → call-graph polish.

@@ -619,6 +619,29 @@ impl MemoryGraph {
         }
     }
 
+    /// The paging eviction floor, overridable by `CCOS_PAGING_THRESHOLD` (else `default`). The same
+    /// env-override convention as [`ScoringWeights::from_env`] — a non-finite or unparsable value
+    /// falls back to the default, so a misconfigured env never destabilises paging.
+    pub fn paging_threshold_from_env(default: f64) -> f64 {
+        std::env::var("CCOS_PAGING_THRESHOLD")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|x| x.is_finite() && *x >= 0.0)
+            .unwrap_or(default)
+    }
+
+    /// Construct with the paging knobs read from the environment: `CCOS_PAGING_THRESHOLD` (the
+    /// eviction floor) and `CCOS_MAX_RESIDENT` (the resident-node cap), each falling back to the
+    /// given default. Mirrors [`ScoringWeights::from_env`] so the whole frugal-window behaviour is
+    /// env-tunable (the validation harness sweeps these without recompiling), default-identical.
+    pub fn new_from_env(default_threshold: f64, default_max: usize) -> Self {
+        let max = std::env::var("CCOS_MAX_RESIDENT")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(default_max);
+        Self::new(Self::paging_threshold_from_env(default_threshold), max)
+    }
+
     /// Replace the eviction policy consulted by [`enforce_paging`](Self::enforce_paging).
     pub fn set_eviction_policy(&mut self, policy: EvictionPolicy) {
         self.eviction_policy = policy;
@@ -3103,6 +3126,16 @@ mod tests {
             vec![NodeId("sym:src/api.rs:run".into())],
             "only the unreferenced symbol is flagged"
         );
+    }
+
+    #[test]
+    fn paging_from_env_falls_back_to_defaults_when_unset() {
+        // With no CCOS_PAGING_THRESHOLD / CCOS_MAX_RESIDENT set, the env constructor is identical
+        // to `new` with the given defaults (the env-override convention, default-identical).
+        assert_eq!(MemoryGraph::paging_threshold_from_env(0.2), 0.2);
+        let g = MemoryGraph::new_from_env(0.2, 123);
+        assert_eq!(g.paging_threshold, 0.2);
+        assert_eq!(g.max_in_memory_nodes, 123);
     }
 
     #[test]

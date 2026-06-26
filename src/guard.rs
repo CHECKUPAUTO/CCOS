@@ -22,6 +22,47 @@ impl Default for GuardConfig {
     }
 }
 
+impl GuardConfig {
+    /// Read overrides from the environment, falling back to [`Default`] for any unset/unparsable
+    /// variable — the same convention as `ScoringWeights::from_env` and `MemoryGraph::new_from_env`.
+    /// Recognised: `CCOS_GUARD_MAX_OUTPUT`, `CCOS_GUARD_REQUIRE_JSON`, `CCOS_GUARD_RELIABILITY`,
+    /// `CCOS_GUARD_SANITIZE`, `CCOS_GUARD_MAX_DEPTH`. Booleans accept `1/true/yes/on` (else false).
+    pub fn from_env() -> Self {
+        let d = Self::default();
+        let usize_var = |k: &str, f: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(f)
+        };
+        let f64_var = |k: &str, f: f64| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .filter(|x| x.is_finite())
+                .unwrap_or(f)
+        };
+        let bool_var = |k: &str, f: bool| {
+            std::env::var(k)
+                .ok()
+                .map(|v| {
+                    matches!(
+                        v.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                })
+                .unwrap_or(f)
+        };
+        Self {
+            max_output_length: usize_var("CCOS_GUARD_MAX_OUTPUT", d.max_output_length),
+            require_valid_json: bool_var("CCOS_GUARD_REQUIRE_JSON", d.require_valid_json),
+            reliability_threshold: f64_var("CCOS_GUARD_RELIABILITY", d.reliability_threshold),
+            sanitize_control_chars: bool_var("CCOS_GUARD_SANITIZE", d.sanitize_control_chars),
+            max_nesting_depth: usize_var("CCOS_GUARD_MAX_DEPTH", d.max_nesting_depth),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GuardResult {
     pub passed: bool,
@@ -221,6 +262,18 @@ impl GuardLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guard_config_from_env_defaults_when_unset() {
+        // No CCOS_GUARD_* set → identical to Default (env-override convention, default-identical).
+        let c = GuardConfig::from_env();
+        let d = GuardConfig::default();
+        assert_eq!(c.max_output_length, d.max_output_length);
+        assert_eq!(c.require_valid_json, d.require_valid_json);
+        assert_eq!(c.reliability_threshold, d.reliability_threshold);
+        assert_eq!(c.sanitize_control_chars, d.sanitize_control_chars);
+        assert_eq!(c.max_nesting_depth, d.max_nesting_depth);
+    }
 
     fn make_guard() -> GuardLayer {
         GuardLayer::new(GuardConfig::default())

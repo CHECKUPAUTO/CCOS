@@ -28,9 +28,9 @@ pub(crate) async fn run_demo() {
     println!("[INIT] Session ID: {}", session_id);
 
     let mut event_log = EventLog::new(session_id.clone());
-    let mut memory_graph = MemoryGraph::new(0.2, 80);
+    let mut memory_graph = MemoryGraph::new(MemoryGraph::paging_threshold_from_env(0.2), 80);
     let mut incremental_engine = IncrementalGraphEngine::new();
-    let _guard = GuardLayer::new(GuardConfig::default());
+    let _guard = GuardLayer::new(GuardConfig::from_env());
 
     let llm_config = LlmConfig {
         endpoint: std::env::var("OLLAMA_ENDPOINT")

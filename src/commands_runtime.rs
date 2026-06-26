@@ -50,7 +50,7 @@ pub(crate) async fn run_scan(args: &[String]) -> i32 {
     let path = positional(args).unwrap_or(".");
     let mut scanner = WorkspaceScanner::new(path);
     let mut engine = IncrementalGraphEngine::new();
-    let mut graph = MemoryGraph::new(0.2, 100_000);
+    let mut graph = MemoryGraph::new_from_env(0.2, 100_000);
 
     let delta = match scanner.sync(&mut engine, &mut graph).await {
         Ok(d) => d,
@@ -176,7 +176,7 @@ pub(crate) async fn run_runtime(args: &[String]) -> i32 {
     // 1. Scan the real workspace into a causal graph.
     let mut scanner = WorkspaceScanner::new(path);
     let mut engine = IncrementalGraphEngine::new();
-    let mut graph = MemoryGraph::new(0.2, 100_000);
+    let mut graph = MemoryGraph::new_from_env(0.2, 100_000);
     let mut event_log = EventLog::new(Uuid::new_v4().to_string());
     let mut dist_log = DistributedEventLog::new();
 
