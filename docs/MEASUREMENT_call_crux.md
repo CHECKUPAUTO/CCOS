@@ -36,6 +36,11 @@ causally-distant dependency the call graph reaches by traversal. This is the cal
 the import crux: structure recovers the cross-vocabulary links a vector retriever cannot see, and
 the deeper the chain, the larger the gap (a vector retriever has no notion of "two hops away").
 
+As in `rag_crux`, the call graph reaching these is **by construction** — the ground truth *is* the
+edge set — so the measured quantity is **lexical similarity's transitive blind spot** (recall@1 0 %,
+MRR 0.32), not a tautological "structure beats RAG" contest. What the call graph adds is the
+*traversal* a vector index cannot do.
+
 ## Scope (Slice 1)
 
 Bare free-function calls only; qualified paths (Slice 2: `use` longest-prefix + `self`/`Self`) and

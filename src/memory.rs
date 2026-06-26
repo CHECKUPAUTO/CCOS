@@ -2552,6 +2552,12 @@ fn resolve_call(
         if cands.len() == 1 {
             return cands.into_iter().next();
         }
+        if cands.len() > 1 {
+            // The import scope itself is ambiguous for `callee` (only possible in non-compiling
+            // Rust — duplicate imports). Honour resolve-uniquely-or-skip: do NOT fall through to a
+            // same-module local guess, which would link a call the import scope already contradicts.
+            return None;
+        }
     }
     // Tier B — same module as the caller.
     if let Some(sym) = defs.get(&(fcrate.to_string(), fmodule.to_string(), callee.to_string())) {
@@ -3054,6 +3060,35 @@ mod tests {
                 "sym:src/db.rs:connect".to_string()
             )],
             "the import scopes the otherwise-ambiguous call to db::connect (Tier A)"
+        );
+    }
+
+    #[test]
+    fn resolve_symbol_calls_ambiguous_import_scope_skips_never_falls_to_local() {
+        // api.rs imports `connect` from BOTH db and net (ambiguous Tier A) AND defines a local
+        // `connect`. Tier A is populated-but-ambiguous, so we skip — never linking the same-module
+        // local (resolve-uniquely-or-skip). (Only reachable on non-compiling Rust; no guessing.)
+        let mut g = graph_with_defs(&[
+            ("src/db.rs", "connect"),
+            ("src/net.rs", "connect"),
+            ("src/api.rs", "connect"), // the same-module local Tier B would otherwise grab
+            ("src/api.rs", "run"),
+        ]);
+        for p in ["crate::db::connect", "crate::net::connect"] {
+            let uid = NodeId(format!("use:src/api.rs:{p}"));
+            g.upsert_node(uid.clone(), "use".into(), "".into(), NodeType::Module);
+            g.add_edge(
+                NodeId("file:src/api.rs".into()),
+                uid,
+                0.5,
+                EdgeType::DependsOn,
+            );
+        }
+        g.set_pending_calls("src/api.rs", vec![("run".into(), "connect".into(), 1)]);
+        g.resolve_symbol_calls();
+        assert!(
+            calls_of(&g).is_empty(),
+            "ambiguous import scope skips — it does not fall back to the same-module local"
         );
     }
 
