@@ -25,7 +25,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`MemoryGraph::resolve_symbol_calls`) resolves each `caller → callee` via a strict
   import-scoped → same-module → global-unique ladder (**resolve-uniquely-or-skip**, so a wrong
   edge is never invented) and adds a `Calls` edge — the fn→fn structure import edges miss.
-  Slice 1 covers bare free-function calls (`foo()`); qualified paths and methods are Slices 2/3.
+  Slices 1–2 cover bare (`foo()`) **and qualified** (`crate::m::foo()`, and `alias::foo()`
+  expanded through the file's imports) free-function calls; methods (`x.bar()`) are Slice 3.
   Off on the heuristic path; call-sites held in a transient field so only the edges persist
   (snapshots unchanged, `replay == live` holds). Measured (`docs/MEASUREMENT_call_crux.md`,
   adversarially reviewed): a vector retriever recovers **direct** calls (it names the callee,
