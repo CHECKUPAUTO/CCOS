@@ -392,6 +392,13 @@ pub struct MemoryGraph {
     /// source file → `(reader, name, line)`. Same **runtime-only** contract as `pending_calls`.
     #[serde(skip)]
     pending_data_refs: BTreeMap<String, Vec<(String, String, usize)>>,
+    /// Renamed-import bindings for call resolution, keyed by source file → `(local_name,
+    /// target_path)` — one entry per `use a::b as c` (`("c", "a::b")`). Consulted by
+    /// [`resolve_symbol_calls`](Self::resolve_symbol_calls) to rewrite a call to an alias onto its
+    /// real target. Same **runtime-only** (`serde(skip)`, rebuilt on the replay re-ingest) and
+    /// deterministic-`BTreeMap` contract as `pending_calls`.
+    #[serde(skip)]
+    pending_aliases: BTreeMap<String, Vec<(String, String)>>,
     /// Node ids of `static`/`const` symbols (the only valid `DataFlow` targets). The graph node
     /// stores `NodeType`, not the finer `SymbolKind`, so the parser marks these at ingest. Runtime
     /// -only; rebuilt on the replay re-ingest, and filtered to still-resident nodes at resolve time.
@@ -632,6 +639,7 @@ impl MemoryGraph {
             eigencentrality_cache: RefCell::new(None),
             pending_calls: BTreeMap::new(),
             pending_data_refs: BTreeMap::new(),
+            pending_aliases: BTreeMap::new(),
             data_symbols: std::collections::BTreeSet::new(),
         }
     }
@@ -2213,6 +2221,18 @@ impl MemoryGraph {
         }
     }
 
+    /// Record (replacing) this file's renamed-import bindings, the alias input to
+    /// [`resolve_symbol_calls`](Self::resolve_symbol_calls). Each tuple is `(local_name,
+    /// target_path)` — `use a::b as c` ⇒ `("c", "a::b")`. Empty ⇒ drop the entry (a re-ingest that
+    /// removed every rename leaves nothing stale). Mirrors [`set_pending_calls`](Self::set_pending_calls).
+    pub fn set_pending_aliases(&mut self, file: &str, aliases: Vec<(String, String)>) {
+        if aliases.is_empty() {
+            self.pending_aliases.remove(file);
+        } else {
+            self.pending_aliases.insert(file.to_string(), aliases);
+        }
+    }
+
     /// Mark a symbol node as a `static`/`const` — the only valid `DataFlow` target. The parser
     /// calls this at ingest (the graph node itself does not carry `SymbolKind`).
     pub fn mark_data_symbol(&mut self, id: NodeId) {
@@ -2323,9 +2343,25 @@ impl MemoryGraph {
             }
         }
 
+        // Per-file alias lookup: local name → target path (`use a::b as c` ⇒ `c` → `a::b`). Built
+        // from the renamed-import bindings the parser handed over. A later call to a local name in
+        // this map is rewritten onto its target before resolution (see `resolve_call`). An empty
+        // (default) map for a file ⇒ no aliases, the unchanged path.
+        let mut alias_index: HashMap<&str, HashMap<&str, &str>> = HashMap::new();
+        for (file, aliases) in &self.pending_aliases {
+            let m = alias_index.entry(file.as_str()).or_default();
+            for (local, target) in aliases {
+                // First binding wins (deterministic: pending lists are source-order). A duplicate
+                // local name only arises in non-compiling Rust; keeping the first is harmless.
+                m.entry(local.as_str()).or_insert(target.as_str());
+            }
+        }
+        let empty_aliases: HashMap<&str, &str> = HashMap::new();
+
         let mut to_add: Vec<(NodeId, NodeId)> = Vec::new();
         for (file, calls) in &self.pending_calls {
             let (fcrate, fmodule) = crate_and_module(file).unwrap_or_default();
+            let file_aliases = alias_index.get(file.as_str()).unwrap_or(&empty_aliases);
             for (caller, callee, _line) in calls {
                 let caller_sym = NodeId(format!("sym:{file}:{caller}"));
                 if !self.nodes.contains_key(&caller_sym) {
@@ -2341,6 +2377,7 @@ impl MemoryGraph {
                     &defs,
                     &name_count,
                     &name_first,
+                    file_aliases,
                 ) {
                     if t != caller_sym {
                         to_add.push((caller_sym, t));
@@ -2681,7 +2718,10 @@ fn resolve_module_exact(
 /// The Slice-1 call→def resolution ladder used by
 /// [`MemoryGraph::resolve_symbol_calls`](MemoryGraph::resolve_symbol_calls): Tier A (import-scoped),
 /// then B (same-module), then C (global-unique), each **resolve-uniquely-or-skip**. Returns the
-/// definition symbol node for a bare `callee()` call in `file`, or `None` to skip.
+/// definition symbol node for a bare `callee()` call in `file`, or `None` to skip. `aliases` maps a
+/// renamed-import local name to its original target path (`use a::b as c` ⇒ `c` → `a::b`); a call
+/// whose leading segment is such a local name is rewritten onto the target first, so it resolves
+/// exactly as the original path would — never onto a same-named sibling module/symbol.
 #[allow(clippy::too_many_arguments)]
 fn resolve_call(
     file: &str,
@@ -2693,7 +2733,30 @@ fn resolve_call(
     defs: &HashMap<(String, String, String), NodeId>,
     name_count: &HashMap<String, u32>,
     name_first: &HashMap<String, NodeId>,
+    aliases: &HashMap<&str, &str>,
 ) -> Option<NodeId> {
+    // Renamed import — `use a::b as c` binds local `c` to target `a::b`. If the call's LEADING
+    // segment is such a local name, rewrite it onto the target (`c` ⇒ `a::b`, `c::X` ⇒ `a::b::X`)
+    // and re-resolve the rewritten path as if it had been written literally. Re-resolution passes
+    // an EMPTY alias map, so an alias is applied at most once (no re-aliasing, no recursion loop).
+    // This keeps resolution byte-for-byte identical to the original path: a bare alias falls through
+    // the same Tier A/B/C ladder, a multi-segment alias through the qualified-path logic — and the
+    // resolve-uniquely-or-skip guards (exact module match, global-unique) still gate every edge, so
+    // an alias whose target has no resident symbol simply yields no edge.
+    if !aliases.is_empty() {
+        let first = callee.split("::").next().unwrap_or(callee);
+        if let Some(target) = aliases.get(first) {
+            let rewritten = match callee.split_once("::") {
+                Some((_, rest)) => format!("{target}::{rest}"),
+                None => (*target).to_string(),
+            };
+            let empty: HashMap<&str, &str> = HashMap::new();
+            return resolve_call(
+                file, &rewritten, fcrate, fmodule, scope, file_index, defs, name_count, name_first,
+                &empty,
+            );
+        }
+    }
     // Slice 3 — `Self::method` (a captured `self.m()` or `Self::assoc()`): the receiver is the
     // enclosing impl's type, whose methods live in the caller's own file/module. Resolve the method
     // name there ONLY — never via imports (Tier A) or global-unique (Tier C), so a method is never
