@@ -24,7 +24,7 @@ rand = "0.8"
 # zero-dependency line-based heuristic parser is used. `proc-macro2`'s
 # span-locations supplies real line numbers. Both crates are already present in
 # the dependency tree transitively, so enabling this pulls no new download.
-syn = { version = "2", features = ["full"], optional = true }
+syn = { version = "2", features = ["full", "visit"], optional = true }
 proc-macro2 = { version = "1", features = ["span-locations"], optional = true }
 
 # Optional drop-in global allocator for bare-metal benchmarking. CCOS is not

@@ -10,6 +10,10 @@ pub struct ParseResult {
     pub modules: Vec<ModuleDecl>,
     pub use_statements: Vec<UseStatement>,
     pub symbols: Vec<Symbol>,
+    /// In-body call-sites (Slice 1: single-segment free-function calls). `serde(default)` +
+    /// skip-if-empty keeps the serialized form unchanged for the common (heuristic / no-call) case.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub call_sites: Vec<CallSite>,
     pub generated_nodes: usize,
     pub generated_edges: usize,
 }
@@ -37,6 +41,18 @@ pub struct Symbol {
     pub kind: SymbolKind,
 }
 
+/// A **call-site**: a `callee()` invocation found inside `caller`'s body (Slice 1 captures
+/// only single-segment free-function calls — `foo()`, not `a::b::foo()` or `x.bar()`). Resolved
+/// to a definition symbol by [`crate::memory::MemoryGraph::resolve_symbol_calls`], which adds a
+/// `caller → callee` [`EdgeType::Calls`](crate::memory::EdgeType) edge — the fn→fn structure that
+/// imports alone miss. Only emitted on the `syn` (real-AST) path; empty on the heuristic fallback.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CallSite {
+    pub caller: String,
+    pub callee: String,
+    pub line: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum SymbolKind {
     Function,
@@ -61,7 +77,7 @@ impl ASTParser {
 
     pub fn parse_source(&self, file_path: &str, source_code: &str) -> ParseResult {
         let hash = Self::compute_hash(source_code);
-        let (modules, use_statements, symbols) = Self::extract_all(source_code);
+        let (modules, use_statements, symbols, call_sites) = Self::extract_all(source_code);
 
         ParseResult {
             file_path: file_path.to_string(),
@@ -71,6 +87,7 @@ impl ASTParser {
             modules,
             use_statements,
             symbols,
+            call_sites,
         }
     }
 
@@ -80,17 +97,28 @@ impl ASTParser {
     /// captures nested-module bodies, multi-line signatures, grouped `use` and
     /// impl methods). If the feature is off — or the source does not parse as
     /// valid Rust — it falls back to the zero-dependency line-based heuristic.
-    fn extract_all(source: &str) -> (Vec<ModuleDecl>, Vec<UseStatement>, Vec<Symbol>) {
+    #[allow(clippy::type_complexity)]
+    fn extract_all(
+        source: &str,
+    ) -> (
+        Vec<ModuleDecl>,
+        Vec<UseStatement>,
+        Vec<Symbol>,
+        Vec<CallSite>,
+    ) {
         #[cfg(feature = "syn-parser")]
         {
             if let Some(parsed) = syn_ast::parse(source) {
                 return parsed;
             }
         }
+        // Heuristic fallback emits no call-sites (it does not parse expression trees), so the
+        // call graph simply stays empty on that path — a build can only ever *omit* call edges.
         (
             Self::extract_modules(source),
             Self::extract_uses(source),
             Self::extract_symbols(source),
+            Vec::new(),
         )
     }
 
@@ -199,6 +227,19 @@ impl ASTParser {
             graph.upsert_node(sym_id.clone(), symbol.name.clone(), body, NodeType::Symbol);
             graph.add_edge(file_id.clone(), sym_id.clone(), 0.6, EdgeType::Contains);
         }
+
+        // Hand this file's in-body call-sites to the graph; they are resolved into `caller →
+        // callee` Calls edges by the whole-graph `resolve_symbol_calls` pass once every file is
+        // ingested (a call may target a symbol defined in a not-yet-seen file). Replaces any
+        // prior entry for this file, so a re-ingest re-states (never duplicates) its calls.
+        graph.set_pending_calls(
+            &result.file_path,
+            result
+                .call_sites
+                .iter()
+                .map(|c| (c.caller.clone(), c.callee.clone(), c.line))
+                .collect(),
+        );
     }
 
     fn add_module_tree(
@@ -666,15 +707,24 @@ fn symbol_span(lines: &[&str], start_line: usize) -> (usize, usize) {
 /// natively. Returns `None` on a syntax error so the caller can fall back.
 #[cfg(feature = "syn-parser")]
 mod syn_ast {
-    use super::{ModuleDecl, Symbol, SymbolKind, UseStatement};
+    use super::{CallSite, ModuleDecl, Symbol, SymbolKind, UseStatement};
     use proc_macro2::Span;
     use syn::spanned::Spanned;
+    use syn::visit::Visit;
 
-    pub fn parse(source: &str) -> Option<(Vec<ModuleDecl>, Vec<UseStatement>, Vec<Symbol>)> {
+    #[allow(clippy::type_complexity)]
+    pub fn parse(
+        source: &str,
+    ) -> Option<(
+        Vec<ModuleDecl>,
+        Vec<UseStatement>,
+        Vec<Symbol>,
+        Vec<CallSite>,
+    )> {
         let file = syn::parse_file(source).ok()?;
         let mut out = Collected::default();
         walk(&file.items, &mut out);
-        Some((out.modules, out.uses, out.symbols))
+        Some((out.modules, out.uses, out.symbols, out.calls))
     }
 
     #[derive(Default)]
@@ -682,6 +732,42 @@ mod syn_ast {
         modules: Vec<ModuleDecl>,
         uses: Vec<UseStatement>,
         symbols: Vec<Symbol>,
+        calls: Vec<CallSite>,
+    }
+
+    /// Collects single-segment free-function call-sites from a function body, in source
+    /// (document) order — a pure function of the AST, so call extraction is deterministic.
+    struct CallVisitor {
+        caller: String,
+        calls: Vec<CallSite>,
+    }
+    impl<'ast> Visit<'ast> for CallVisitor {
+        fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+            if let syn::Expr::Path(p) = &*node.func {
+                // Slice 1: only bare `foo()` (one path segment, no leading `::`). Qualified
+                // paths (`a::b::foo`) and method calls (`x.bar()`) are Slices 2/3.
+                if p.qself.is_none() && p.path.leading_colon.is_none() && p.path.segments.len() == 1
+                {
+                    let seg = &p.path.segments[0];
+                    self.calls.push(CallSite {
+                        caller: self.caller.clone(),
+                        callee: seg.ident.to_string(),
+                        line: line_of(seg.ident.span()),
+                    });
+                }
+            }
+            // Always recurse so calls nested in args, closures, match arms, blocks are seen.
+            syn::visit::visit_expr_call(self, node);
+        }
+    }
+
+    fn collect_calls(caller: &str, block: &syn::Block, out: &mut Vec<CallSite>) {
+        let mut v = CallVisitor {
+            caller: caller.to_string(),
+            calls: Vec::new(),
+        };
+        v.visit_block(block);
+        out.append(&mut v.calls);
     }
 
     /// 1-based source line; the `span-locations` feature guarantees real spans.
@@ -724,7 +810,10 @@ mod syn_ast {
                 syn::Item::Use(u) => {
                     flatten_use(&u.tree, String::new(), line_of(u.span()), &mut out.uses);
                 }
-                syn::Item::Fn(f) => push_sym(out, &f.sig.ident, SymbolKind::Function),
+                syn::Item::Fn(f) => {
+                    push_sym(out, &f.sig.ident, SymbolKind::Function);
+                    collect_calls(&f.sig.ident.to_string(), &f.block, &mut out.calls);
+                }
                 syn::Item::Struct(s) => push_sym(out, &s.ident, SymbolKind::Struct),
                 syn::Item::Enum(e) => push_sym(out, &e.ident, SymbolKind::Enum),
                 syn::Item::Trait(t) => {
@@ -732,6 +821,9 @@ mod syn_ast {
                     for ti in &t.items {
                         if let syn::TraitItem::Fn(method) = ti {
                             push_sym(out, &method.sig.ident, SymbolKind::Function);
+                            if let Some(body) = &method.default {
+                                collect_calls(&method.sig.ident.to_string(), body, &mut out.calls);
+                            }
                         }
                     }
                 }
@@ -747,6 +839,11 @@ mod syn_ast {
                     for ii in &i.items {
                         if let syn::ImplItem::Fn(method) = ii {
                             push_sym(out, &method.sig.ident, SymbolKind::Function);
+                            collect_calls(
+                                &method.sig.ident.to_string(),
+                                &method.block,
+                                &mut out.calls,
+                            );
                         }
                     }
                 }
@@ -1053,6 +1150,26 @@ mod syn_tests {
             .iter()
             .any(|s| s.name == "a" && s.kind == SymbolKind::Function));
         assert!(r.symbols.iter().any(|s| s.name == "b"));
+    }
+
+    #[test]
+    fn syn_captures_free_function_call_sites() {
+        let src = "fn caller() { helper(); ns::skipped(); recur(); }\nfn helper() {}\nfn recur() { recur(); }";
+        let r = ASTParser::new().parse_source("t.rs", src);
+        // bare free-function calls are captured with their caller; qualified `ns::skipped` (Slice 2)
+        // and method calls are not.
+        assert!(r
+            .call_sites
+            .iter()
+            .any(|c| c.caller == "caller" && c.callee == "helper"));
+        assert!(r
+            .call_sites
+            .iter()
+            .any(|c| c.caller == "recur" && c.callee == "recur"));
+        assert!(
+            !r.call_sites.iter().any(|c| c.callee == "skipped"),
+            "a qualified-path call is not captured in Slice 1"
+        );
     }
 
     #[test]

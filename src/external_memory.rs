@@ -1204,6 +1204,10 @@ impl ExternalMemory for CcosMemory {
         // Resolve intra-crate imports into file→file edges so recall, failure
         // propagation and regions see the real cross-file causal structure.
         let cross_edges = self.graph.link_module_imports();
+        // Resolve in-body call-sites into caller→callee `Calls` edges (fn→fn structure that
+        // import edges miss). Whole-graph pass — a call may target a symbol in another file.
+        let call_edges = self.graph.resolve_symbol_calls();
+        let _ = call_edges;
         let file_hash = sha256_hex(source);
         self.event_log.append(
             EventType::Parsing,
@@ -1448,6 +1452,61 @@ mod tests {
             !files.contains(&"file:src/unrelated.rs"),
             "recall excludes unrelated code: {files:?}"
         );
+    }
+
+    /// End-to-end: a bare cross-file call resolves to a `Calls` edge, and the resolved edge set
+    /// is **independent of ingest order** (the determinism the replay invariant relies on). Only
+    /// the syn AST path extracts call-sites, so this is gated to that feature.
+    #[cfg(feature = "syn-parser")]
+    #[test]
+    fn call_edges_are_resolved_and_ingest_order_independent() {
+        use crate::memory::EdgeType;
+        let chain: &[(&str, &str)] = &[
+            (
+                "src/handler.rs",
+                "pub fn route_request() -> i64 { load_record() }\n",
+            ),
+            (
+                "src/record.rs",
+                "pub fn load_record() -> i64 { open_socket() }\n",
+            ),
+            ("src/socket.rs", "pub fn open_socket() -> i64 { 3 }\n"),
+        ];
+        let run = |order: &[usize]| -> Vec<(String, String)> {
+            let mut mem = CcosMemory::new();
+            for &i in order {
+                mem.ingest_source(chain[i].0, chain[i].1);
+            }
+            let mut v: Vec<(String, String)> = mem
+                .graph()
+                .edges()
+                .iter()
+                .filter(|e| e.edge_type == EdgeType::Calls)
+                .map(|e| (e.source.0.clone(), e.target.0.clone()))
+                .collect();
+            v.sort();
+            v
+        };
+        let forward = run(&[0, 1, 2]);
+        assert!(
+            forward.contains(&(
+                "sym:src/handler.rs:route_request".to_string(),
+                "sym:src/record.rs:load_record".to_string()
+            )),
+            "the cross-file bare call route_request→load_record resolves to a Calls edge: {forward:?}"
+        );
+        assert_eq!(
+            forward.len(),
+            2,
+            "two real call edges (the third callee is a literal)"
+        );
+        // Reverse and shuffled ingest orders must yield the identical resolved Calls edge set.
+        assert_eq!(
+            forward,
+            run(&[2, 1, 0]),
+            "Calls edges are ingest-order independent"
+        );
+        assert_eq!(forward, run(&[1, 2, 0]));
     }
 
     #[test]
