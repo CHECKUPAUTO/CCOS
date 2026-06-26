@@ -71,8 +71,8 @@
 //!   points in the agent's history.
 //! - [`region_engine`] — the **Context Region Engine** (v0.3): clusters the
 //!   graph into spatial [`region_engine::ContextRegionEngine`] regions that are
-//!   hydrated as context windows, with a dynamic [`context_policy`] admission
-//!   policy and deterministic replay. See [`context_region`], [`region_metrics`].
+//!   hydrated as context windows, with a dynamic [`crate::context_policy`] admission
+//!   policy and deterministic replay. See [`crate::context_region`], [`crate::region_metrics`].
 //!
 //! ## Wiring of the recent modules
 //!
