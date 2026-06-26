@@ -876,6 +876,11 @@ mod syn_ast {
                 flatten_use(&p.tree, join(&prefix, &p.ident.to_string()), line, out)
             }
             syn::UseTree::Name(n) => push_use(join(&prefix, &n.ident.to_string()), line, out),
+            // A renamed import `use a::b as c` binds `b` under the name `c`. We record the ORIGINAL
+            // path (`a::b`) so import-linking resolves the real module. Call-resolution by the alias
+            // `c` is deferred: a single path string cannot carry alias→real-module, and recording
+            // the alias instead (`a::c`) would mislink a call `c::foo()` to a real sibling module
+            // `c` if one exists (a wrong-existing-target edge). Proper alias support is future work.
             syn::UseTree::Rename(r) => push_use(join(&prefix, &r.ident.to_string()), line, out),
             syn::UseTree::Glob(_) => push_use(join(&prefix, "*"), line, out),
             syn::UseTree::Group(g) => {
