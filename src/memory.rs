@@ -117,6 +117,51 @@ pub enum EdgeType {
     /// functions through globals — invisible to call and import edges. Appended last so the
     /// serialized form stays strictly additive.
     DataFlow,
+    /// An `evidence → claim` **support** edge: the source node is evidence *for* the target claim —
+    /// the affirmative surface (`S_A`) of a [Q-Page](MemoryGraph::qbelief). Asserted explicitly
+    /// (by an agent/tool, not derived from source), so it is the dual partner of [`Contradicts`].
+    /// Appended last so the serialized form stays strictly additive.
+    ///
+    /// [`Contradicts`]: EdgeType::Contradicts
+    Supports,
+    /// An `evidence → claim` **contradiction** edge: the source node is evidence *against* the
+    /// target claim — the negative surface (`S_¬A`) of a [Q-Page](MemoryGraph::qbelief). The signal
+    /// a contradiction-aware retriever surfaces that similarity-only retrieval is blind to (a
+    /// retriever ranks by *relatedness*, which cannot tell support from refutation). Asserted
+    /// explicitly. Appended last so the serialized form stays strictly additive.
+    Contradicts,
+}
+
+/// Laplace smoothing prior for [`QBelief`]: one pseudo-count on each side, so a claim with no
+/// evidence either way sits at the neutral `belief` of `0.5`.
+const BELIEF_PRIOR: f64 = 1.0;
+
+/// The derived dual-evidence belief state of a claim node — the **Q-Page** primitive.
+///
+/// A claim accumulates two opposing evidence surfaces: incoming [`Supports`](EdgeType::Supports)
+/// edges (the affirmative surface `S_A`) and incoming [`Contradicts`](EdgeType::Contradicts) edges
+/// (the negative surface `S_¬A`). [`MemoryGraph::qbelief`] folds those edges into this summary. It
+/// is **derived, never stored** — recomputed from the edge set, so it adds no snapshot state and is
+/// reconstructed bit-for-bit on replay.
+///
+/// `belief` and `conflict` are deliberately **orthogonal axes** (a claim can be near-certain *and*
+/// contested, or uncertain *and* uncontested):
+/// * `belief` — Laplace-smoothed support fraction `(s + α) / (s + c + 2α)` with `α = BELIEF_PRIOR`,
+///   so no evidence ⇒ `0.5`, all-support ⇒ →`1`, all-contradiction ⇒ →`0`.
+/// * `conflict` — the evidence balance `2·min(s, c) / (s + c)` ∈ `[0, 1]`: `0` when the evidence is
+///   one-sided (consensus, nothing to resolve), `1` when support and contradiction are evenly
+///   matched (genuine tension). High *only* when both surfaces carry weight — the resolution signal
+///   that similarity-only retrieval can never report, because relatedness has no notion of polarity.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct QBelief {
+    /// Summed weight of incoming `Supports` edges (the `S_A` surface).
+    pub support: f64,
+    /// Summed weight of incoming `Contradicts` edges (the `S_¬A` surface).
+    pub contradiction: f64,
+    /// Laplace-smoothed support fraction in `[0, 1]` (`0.5` ⇔ no evidence).
+    pub belief: f64,
+    /// Evidence balance in `[0, 1]`: `0` one-sided, `1` evenly contested.
+    pub conflict: f64,
 }
 
 /// Tunable coefficients of the causal score and failure-propagation decay.
@@ -2107,6 +2152,56 @@ impl MemoryGraph {
         &self.edges
     }
 
+    /// The [`QBelief`] of a claim node — its dual-evidence belief state derived from the incoming
+    /// [`Supports`](EdgeType::Supports) / [`Contradicts`](EdgeType::Contradicts) edges. A pure,
+    /// deterministic fold over the resident edge set (no stored state, so `replay == live` holds and
+    /// it costs nothing in the snapshot). A node with no such edges returns the neutral prior
+    /// (`belief 0.5`, `conflict 0`). See [`QBelief`] for the `belief`/`conflict` formulas.
+    pub fn qbelief(&self, claim: &NodeId) -> QBelief {
+        let mut support = 0.0_f64;
+        let mut contradiction = 0.0_f64;
+        for e in &self.edges {
+            if &e.target != claim {
+                continue;
+            }
+            match e.edge_type {
+                EdgeType::Supports => support += e.weight,
+                EdgeType::Contradicts => contradiction += e.weight,
+                _ => {}
+            }
+        }
+        let belief = (support + BELIEF_PRIOR) / (support + contradiction + 2.0 * BELIEF_PRIOR);
+        let total = support + contradiction;
+        let conflict = if total > 0.0 {
+            2.0 * support.min(contradiction) / total
+        } else {
+            0.0
+        };
+        QBelief {
+            support,
+            contradiction,
+            belief,
+            conflict,
+        }
+    }
+
+    /// The evidence nodes pointing at `claim` with a given **polarity** —
+    /// [`EdgeType::Supports`] for the affirmative surface, [`EdgeType::Contradicts`] for the
+    /// negative one. Returned **sorted and deduped**, so the surface is deterministic. A
+    /// contradiction-aware recall returns *both* surfaces of a claim; similarity-only retrieval
+    /// returns neither *as such*, because it cannot label an item as support vs refutation.
+    pub fn evidence_of(&self, claim: &NodeId, polarity: EdgeType) -> Vec<&NodeId> {
+        let mut v: Vec<&NodeId> = self
+            .edges
+            .iter()
+            .filter(|e| &e.target == claim && e.edge_type == polarity)
+            .map(|e| &e.source)
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    }
+
     /// Count edges that violate `edges ⊆ nodes²` (an endpoint is missing),
     /// **without** modifying the graph — the read-only counterpart of
     /// [`prune_dangling_edges`](Self::prune_dangling_edges), used by integrity
@@ -3535,6 +3630,123 @@ mod tests {
             g.dead_symbols(),
             vec![NodeId("sym:src/api.rs:run".into())],
             "only the unreferenced symbol is flagged"
+        );
+    }
+
+    // ── Q-Page dual-evidence belief layer ───────────────────────────────────────────────────────
+
+    /// A `claim` node with `n_support` + `n_contra` evidence nodes, each linked to the claim at
+    /// weight 1.0 with the matching polarity. Pure graph construction — no parser.
+    fn graph_with_evidence(n_support: usize, n_contra: usize) -> MemoryGraph {
+        let mut g = MemoryGraph::new(0.0, usize::MAX);
+        let claim: NodeId = "claim".into();
+        g.upsert_node(
+            claim.clone(),
+            "claim".into(),
+            "claim".into(),
+            NodeType::ContextBlock,
+        );
+        for i in 0..n_support {
+            let id = NodeId(format!("sup{i}"));
+            g.upsert_node(
+                id.clone(),
+                "s".into(),
+                String::new(),
+                NodeType::ContextBlock,
+            );
+            g.add_edge(id, claim.clone(), 1.0, EdgeType::Supports);
+        }
+        for i in 0..n_contra {
+            let id = NodeId(format!("con{i}"));
+            g.upsert_node(
+                id.clone(),
+                "c".into(),
+                String::new(),
+                NodeType::ContextBlock,
+            );
+            g.add_edge(id, claim.clone(), 1.0, EdgeType::Contradicts);
+        }
+        g
+    }
+
+    #[test]
+    fn qbelief_neutral_prior_without_evidence() {
+        let mut g = MemoryGraph::new(0.0, usize::MAX);
+        let claim: NodeId = "claim".into();
+        g.upsert_node(
+            claim.clone(),
+            "c".into(),
+            String::new(),
+            NodeType::ContextBlock,
+        );
+        let q = g.qbelief(&claim);
+        assert_eq!(q.support, 0.0);
+        assert_eq!(q.contradiction, 0.0);
+        assert_eq!(q.belief, 0.5, "no evidence ⇒ neutral prior 0.5");
+        assert_eq!(q.conflict, 0.0, "no evidence ⇒ no conflict");
+    }
+
+    #[test]
+    fn qbelief_support_and_contradiction_math() {
+        // 3 support, 1 contradiction at weight 1.0: belief = (3+1)/(3+1+2) = 2/3; conflict =
+        // 2·min(3,1)/4 = 0.5.
+        let q = graph_with_evidence(3, 1).qbelief(&"claim".into());
+        assert_eq!(q.support, 3.0);
+        assert_eq!(q.contradiction, 1.0);
+        assert!((q.belief - 2.0 / 3.0).abs() < 1e-12);
+        assert!((q.conflict - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn qbelief_conflict_zero_when_one_sided_and_one_when_balanced() {
+        // All-support: no conflict, belief above the prior toward 1.
+        let one_sided = graph_with_evidence(4, 0).qbelief(&"claim".into());
+        assert_eq!(one_sided.conflict, 0.0);
+        assert!(one_sided.belief > 0.5);
+        // Evenly matched: maximal conflict, and smoothing holds belief back at the neutral 0.5.
+        let balanced = graph_with_evidence(3, 3).qbelief(&"claim".into());
+        assert!(
+            (balanced.conflict - 1.0).abs() < 1e-12,
+            "balanced evidence ⇒ max conflict"
+        );
+        assert!((balanced.belief - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn evidence_of_returns_sorted_deduped_polarity_surfaces() {
+        let g = graph_with_evidence(2, 1);
+        let claim: NodeId = "claim".into();
+        assert_eq!(
+            g.evidence_of(&claim, EdgeType::Supports),
+            vec![&NodeId("sup0".into()), &NodeId("sup1".into())]
+        );
+        assert_eq!(
+            g.evidence_of(&claim, EdgeType::Contradicts),
+            vec![&NodeId("con0".into())]
+        );
+    }
+
+    #[test]
+    fn qbelief_is_deterministic_across_rebuilds() {
+        let a = graph_with_evidence(5, 2).qbelief(&"claim".into());
+        let b = graph_with_evidence(5, 2).qbelief(&"claim".into());
+        assert_eq!(a, b, "same evidence ⇒ identical QBelief");
+    }
+
+    #[test]
+    fn supports_contradicts_edges_survive_serde_round_trip() {
+        // The two appended EdgeType variants serialize by name and deserialize losslessly — a graph
+        // carrying them round-trips, so the belief derived after a snapshot reload is unchanged
+        // (additive enum: old snapshots simply never contain these variants).
+        let g = graph_with_evidence(2, 2);
+        let json = serde_json::to_string(&g).unwrap();
+        assert!(json.contains("Supports") && json.contains("Contradicts"));
+        let back: MemoryGraph = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.edges().len(), g.edges().len());
+        assert_eq!(
+            back.qbelief(&"claim".into()),
+            g.qbelief(&"claim".into()),
+            "belief is identical after a serde round-trip"
         );
     }
 

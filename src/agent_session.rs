@@ -75,6 +75,16 @@ enum Op {
     Retune {
         weights: ScoringWeights,
     },
+    /// An explicit **dual-evidence assertion** (Q-Pages): `evidence` supports (`supports = true`)
+    /// or contradicts (`false`) `claim`, with `weight`. Logged so the agent-asserted belief surface
+    /// is part of the replayable timeline — `replay == live` holds for contradictions too, not just
+    /// for ingested structure. Appended last so old logs (which never contain it) stay readable.
+    Assert {
+        evidence: String,
+        claim: String,
+        supports: bool,
+        weight: f64,
+    },
 }
 
 /// Failure-propagation depth a `page_fault` injects. Configurable via
@@ -300,6 +310,32 @@ impl AgentSession {
         self.live.ingest_source(uri, source)
     }
 
+    /// Record and apply a **support** assertion — `evidence` is evidence *for* `claim` (the
+    /// affirmative surface of the claim's [Q-Page](crate::memory::MemoryGraph::qbelief)). Logged as
+    /// an [`Op::Assert`] so it replays identically. Returns whether a new edge was added.
+    pub fn assert_support(&mut self, evidence: &str, claim: &str, weight: f64) -> bool {
+        self.ops.push(Op::Assert {
+            evidence: evidence.to_string(),
+            claim: claim.to_string(),
+            supports: true,
+            weight,
+        });
+        self.live.assert_support(evidence, claim, weight)
+    }
+
+    /// Record and apply a **contradiction** assertion — `evidence` is evidence *against* `claim`
+    /// (the negative surface). The dual of [`assert_support`](Self::assert_support); logged as an
+    /// [`Op::Assert`] so `replay == live` holds for the contested-knowledge channel too.
+    pub fn assert_contradiction(&mut self, evidence: &str, claim: &str, weight: f64) -> bool {
+        self.ops.push(Op::Assert {
+            evidence: evidence.to_string(),
+            claim: claim.to_string(),
+            supports: false,
+            weight,
+        });
+        self.live.assert_contradiction(evidence, claim, weight)
+    }
+
     /// Bring `uri` up to date against a persisted workspace **without** logging a
     /// redundant op when it is unchanged — for read-side tools (`ccos focus`) that
     /// re-scan a tree each run. Records (and applies) an `Ingest` op only when the
@@ -481,6 +517,20 @@ impl AgentSession {
                     // Reproduce the learned-weights change so replay == live.
                     m.set_scoring_weights(*weights);
                 }
+                Op::Assert {
+                    evidence,
+                    claim,
+                    supports,
+                    weight,
+                } => {
+                    // Re-apply the dual-evidence assertion so the belief surfaces (and the
+                    // QBelief derived from them) reconstruct identically — replay == live.
+                    if *supports {
+                        m.assert_support(evidence, claim, *weight);
+                    } else {
+                        m.assert_contradiction(evidence, claim, *weight);
+                    }
+                }
             }
         }
         m
@@ -549,6 +599,20 @@ impl AgentSession {
                 Op::Retune { .. } => {
                     // Hold `weights` fixed across the whole evaluation; a recorded
                     // retune is what we are *measuring against*, not applying here.
+                }
+                Op::Assert {
+                    evidence,
+                    claim,
+                    supports,
+                    weight,
+                } => {
+                    // Re-apply so the replayed graph matches the timeline; belief edges do not
+                    // affect the recall-hit metric, but the state must stay consistent.
+                    if *supports {
+                        m.assert_support(evidence, claim, *weight);
+                    } else {
+                        m.assert_contradiction(evidence, claim, *weight);
+                    }
                 }
             }
         }
@@ -654,6 +718,15 @@ impl AgentSession {
                     format!("t={t}  PageFault(files={files:?}, depth={depth})")
                 }
                 Op::Retune { .. } => format!("t={t}  Retune(scoring weights from log)"),
+                Op::Assert {
+                    evidence,
+                    claim,
+                    supports,
+                    weight,
+                } => format!(
+                    "t={t}  Assert({evidence} {} {claim}, w={weight})",
+                    if *supports { "supports" } else { "contradicts" }
+                ),
             }
         }));
         out
@@ -786,6 +859,38 @@ mod tests {
         assert_eq!(replayed.stats().edges, s.memory().stats().edges);
         // And replaying twice gives identical node counts (determinism).
         assert_eq!(replayed.stats().nodes, s.replay_to(s.len()).stats().nodes);
+    }
+
+    #[test]
+    fn assertions_replay_identically_belief_and_edges() {
+        // Explicit dual-evidence assertions on a claim must replay byte-for-byte: the same edges
+        // AND the same *derived* QBelief — replay == live for the contested-knowledge surface, not
+        // just for ingested structure.
+        let mut s = AgentSession::new();
+        s.ingest("src/claim.rs", "pub fn claim() {}");
+        s.assert_support("ev:a", "file:src/claim.rs", 1.0);
+        s.assert_support("ev:b", "file:src/claim.rs", 1.0);
+        s.assert_contradiction("ev:x", "file:src/claim.rs", 1.0);
+
+        let claim = crate::memory::NodeId("file:src/claim.rs".to_string());
+        let live_q = s.memory().graph().qbelief(&claim);
+        let replayed = s.replay_to(s.len());
+
+        assert_eq!(
+            replayed.graph().edges().len(),
+            s.memory().graph().edges().len(),
+            "replay reconstructs the same edge set"
+        );
+        assert_eq!(
+            replayed.graph().qbelief(&claim),
+            live_q,
+            "derived belief reconstructs identically on replay (replay == live)"
+        );
+        assert_eq!(
+            (live_q.support, live_q.contradiction),
+            (2.0, 1.0),
+            "two support + one contradiction asserted"
+        );
     }
 
     #[test]
