@@ -65,9 +65,11 @@ pub struct CallSite {
     pub line: usize,
 }
 
-/// A **data-reference**: `reader`'s body mentions `name`, an identifier in `SCREAMING_SNAKE_CASE`
-/// (the Rust convention for a `static`/`const`). Resolved to a `static`/`const` definition symbol
-/// by [`crate::memory::MemoryGraph::resolve_data_flow`], which adds a `reader → item`
+/// A **data-reference**: `reader`'s body mentions `name`, a value path whose last segment is in
+/// `SCREAMING_SNAKE_CASE` (the Rust convention for a `static`/`const`). `name` is the full
+/// `::`-joined path — a bare `FOO` (Slice 1) or a qualified `m::CONST` / `crate::limits::MAX`
+/// (Slice 2). Resolved to a `static`/`const` definition symbol by
+/// [`crate::memory::MemoryGraph::resolve_data_flow`], which adds a `reader → item`
 /// [`EdgeType::DataFlow`](crate::memory::EdgeType) edge — the shared-global-state channel that call
 /// and import edges miss. Only emitted on the `syn` (real-AST) path; empty on the heuristic fallback.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -882,25 +884,41 @@ mod syn_ast {
             syn::visit::visit_expr_method_call(self, node);
         }
         fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
-            // Data-flow Slice 1 — a bare `SCREAMING_SNAKE` value reference is, by Rust convention, a
-            // `static`/`const` use; capture it UNLESS the name is locally bound (a param / `let` /
-            // fn-local `const` — `local_bound`), which would denote the local, not a same-named
-            // global (the false edge the scope guard closes). Casing excludes PascalCase
-            // types/variants and snake_case fns/locals; qualified `m::CONST` is a later slice.
+            // Data-flow — a value path whose LAST segment is `SCREAMING_SNAKE` is, by Rust
+            // convention, a `static`/`const` use. Capture it carrying its FULL `::`-joined path:
+            //   * bare `FOO` (Slice 1), and
+            //   * qualified `m::CONST` / `crate::limits::MAX` / `self::FOO` (Slice 2),
+            // resolved later by [`crate::memory::MemoryGraph::resolve_data_flow`] using the same
+            // import/module machinery as qualified calls. The casing test on the LAST segment
+            // excludes PascalCase types/variants and snake_case fns/locals. `<T>::X` (qself) and a
+            // leading `::X` are skipped, matching qualified-CALL capture.
+            //
+            // Scope guard: skip when the HEAD segment is locally bound (a param / `let` / fn-local
+            // `const` — `local_bound`). For a bare ref the head IS the name, so a local `FOO`
+            // shadows the same-named global (the false edge the guard closes); for a qualified ref a
+            // locally-bound head (`m::CONST` where `m` is a local) likewise must not be captured.
             // (Known residual: a bare SCREAMING-cased enum variant brought in by `use` can still
             // coincide with a global const — rare, since variants are conventionally PascalCase.)
-            if node.qself.is_none()
-                && node.path.leading_colon.is_none()
-                && node.path.segments.len() == 1
-            {
-                let seg = &node.path.segments[0];
-                let name = seg.ident.to_string();
-                if is_screaming_snake(&name) && !self.local_bound.contains(&name) {
-                    self.data_refs.push(DataRef {
-                        reader: self.caller.clone(),
-                        name,
-                        line: line_of(seg.ident.span()),
-                    });
+            if node.qself.is_none() && node.path.leading_colon.is_none() {
+                if let (Some(first), Some(last)) =
+                    (node.path.segments.first(), node.path.segments.last())
+                {
+                    let head = first.ident.to_string();
+                    let last_name = last.ident.to_string();
+                    if is_screaming_snake(&last_name) && !self.local_bound.contains(&head) {
+                        let full = node
+                            .path
+                            .segments
+                            .iter()
+                            .map(|s| s.ident.to_string())
+                            .collect::<Vec<_>>()
+                            .join("::");
+                        self.data_refs.push(DataRef {
+                            reader: self.caller.clone(),
+                            name: full,
+                            line: line_of(last.ident.span()),
+                        });
+                    }
                 }
             }
             syn::visit::visit_expr_path(self, node);
@@ -1513,6 +1531,66 @@ mod syn_tests {
     }
 
     #[test]
+    fn data_flow_qualified_end_to_end_cross_file() {
+        // End-to-end through the real parser: cfg.rs defines `const MAX_RETRIES`; api.rs's `reader`
+        // references it QUALIFIED as `crate::cfg::MAX_RETRIES`. The parser captures the full path,
+        // and resolve_data_flow pins the prefix to cfg.rs and links to the marked const (Slice 2).
+        let p = ASTParser::new();
+        let mut g = MemoryGraph::new(0.0, usize::MAX);
+        for (path, src) in [
+            ("src/cfg.rs", "pub const MAX_RETRIES: usize = 3;"),
+            (
+                "src/api.rs",
+                "fn reader() -> usize { crate::cfg::MAX_RETRIES + 1 }",
+            ),
+        ] {
+            let r = p.parse_source(path, src);
+            p.update_memory_graph(&r, src, &mut g);
+        }
+        g.resolve_data_flow();
+        let edges: Vec<(String, String)> = g
+            .edges()
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::DataFlow)
+            .map(|e| (e.source.0.clone(), e.target.0.clone()))
+            .collect();
+        assert_eq!(
+            edges,
+            vec![(
+                "sym:src/api.rs:reader".to_string(),
+                "sym:src/cfg.rs:MAX_RETRIES".to_string()
+            )],
+            "qualified crate::cfg::MAX_RETRIES → cfg.rs const, end to end (Slice 2)"
+        );
+    }
+
+    #[test]
+    fn data_flow_qualified_unresolvable_end_to_end_skips() {
+        // A qualified ref whose module prefix pins to NO file must skip end-to-end — never a false
+        // edge. `crate::missing::MAX_RETRIES` (module `missing` has no file) is dropped even though a
+        // unique `MAX_RETRIES` exists in cfg.rs (proving no fall-back to the bare global index).
+        let p = ASTParser::new();
+        let mut g = MemoryGraph::new(0.0, usize::MAX);
+        for (path, src) in [
+            ("src/cfg.rs", "pub const MAX_RETRIES: usize = 3;"),
+            (
+                "src/api.rs",
+                "fn reader() -> usize { crate::missing::MAX_RETRIES + 1 }",
+            ),
+        ] {
+            let r = p.parse_source(path, src);
+            p.update_memory_graph(&r, src, &mut g);
+        }
+        g.resolve_data_flow();
+        assert!(
+            !g.edges()
+                .iter()
+                .any(|e| e.edge_type == EdgeType::DataFlow),
+            "unresolvable qualified ref emits no DataFlow edge (no fallback to the global MAX_RETRIES)"
+        );
+    }
+
+    #[test]
     fn syn_data_refs_skip_locally_bound_names() {
         // A `SCREAMING_SNAKE` name bound locally — a parameter, a fn-local `const`, or a `let` — is
         // NOT a data-ref: it denotes the local, so resolving it global-unique to a same-named global
@@ -1528,6 +1606,53 @@ mod syn_tests {
             assert!(
                 !names.iter().any(|n| n == bound),
                 "{bound} is locally bound — it must not be a data-ref (got {names:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn syn_captures_qualified_screaming_snake_data_ref_full_path() {
+        // A qualified value path whose LAST segment is SCREAMING_SNAKE is captured as a data-ref
+        // carrying its FULL `::`-joined path (Slice 2) — `config::MAX_RETRIES`,
+        // `crate::limits::MAX`, `self::FOO`. A qualified path whose last segment is NOT screaming
+        // (`config::helper`, a fn call) is not a data-ref.
+        let src = "fn reader() -> usize {\n  config::MAX_RETRIES + crate::limits::MAX + self::FOO + config::helper()\n}";
+        let r = ASTParser::new().parse_source("t.rs", src);
+        let names: Vec<String> = r
+            .data_refs
+            .iter()
+            .filter(|d| d.reader == "reader")
+            .map(|d| d.name.clone())
+            .collect();
+        for want in ["config::MAX_RETRIES", "crate::limits::MAX", "self::FOO"] {
+            assert!(
+                names.iter().any(|n| n == want),
+                "qualified ref {want} captured with full path, got {names:?}"
+            );
+        }
+        assert!(
+            !names.iter().any(|n| n == "config::helper" || n == "helper"),
+            "a qualified call (non-screaming last segment) is not a data-ref, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn syn_qualified_data_ref_skips_locally_bound_head() {
+        // The scope guard extends to qualified paths: when the HEAD segment is locally bound, the
+        // path denotes the local (e.g. a `let m = …; m::FOO` field/assoc access), not a module —
+        // so it must NOT be captured even though it looks qualified. Only the free `cfg::LIMIT`
+        // (head `cfg` is not a local) is captured.
+        let src = "fn r(m: u8) -> u8 {\n  let mod_x = 1u8;\n  m::FOO + mod_x::BAR + cfg::LIMIT\n}";
+        let r = ASTParser::new().parse_source("t.rs", src);
+        let names: Vec<String> = r.data_refs.iter().map(|d| d.name.clone()).collect();
+        assert!(
+            names.iter().any(|n| n == "cfg::LIMIT"),
+            "the free qualified ref is captured, got {names:?}"
+        );
+        for bound_head in ["m::FOO", "mod_x::BAR"] {
+            assert!(
+                !names.iter().any(|n| n == bound_head),
+                "{bound_head} has a locally-bound head — it must not be a data-ref (got {names:?})"
             );
         }
     }
