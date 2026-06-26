@@ -20,6 +20,18 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Call-graph semantic edges — `EdgeType::Calls` (ROADMAP P1.3, Slice 1).** The `syn` AST
+  now extracts in-body function-call sites; a deterministic whole-graph pass
+  (`MemoryGraph::resolve_symbol_calls`) resolves each `caller → callee` via a strict
+  import-scoped → same-module → global-unique ladder (**resolve-uniquely-or-skip**, so a wrong
+  edge is never invented) and adds a `Calls` edge — the fn→fn structure import edges miss.
+  Slice 1 covers bare free-function calls (`foo()`); qualified paths and methods are Slices 2/3.
+  Off on the heuristic path; call-sites held in a transient field so only the edges persist
+  (snapshots unchanged, `replay == live` holds). Measured (`docs/MEASUREMENT_call_crux.md`,
+  adversarially reviewed): a vector retriever recovers **direct** calls (it names the callee,
+  recall@1 75 %) but collapses on **transitive** 2-hop calls (recall@1 0 %), which the call
+  graph reaches by traversal — the call-level analogue of the import crux.
+
 - **Node lifecycle state (`NodeState`: `Stable` / `Working` / `Orphan`).** Separates a
   node's *health/attention* from graph *topology* so it can't pollute the structural
   signal — a per-node enum field (not a tensor dimension; a node's state is single-valued).

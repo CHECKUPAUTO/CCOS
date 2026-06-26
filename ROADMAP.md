@@ -380,6 +380,6 @@ honesty code↔docs↔paper, tests/API). **Fixed in this pass:**
 
 ### Suggested order
 
-~~`P0.1 (syn)`~~ ✅ → ~~`P1.2 (canonical log)`~~ ✅ → **`P2.5 (benches)`** (next) →
-`P1.3 (semantic edges)` → polish. P2.4 and P3.7 are quick wins
-that can land anytime.
+~~`P0.1 (syn)`~~ ✅ → ~~`P1.2 (canonical log)`~~ ✅ → ~~`P1.3 (semantic edges — call graph
+Slice 1)`~~ ✅ → **`P2.5 (benches)`** (next) → P1.3 Slices 2–3 (qualified paths, methods) →
+polish. P2.4 and P3.7 are quick wins that can land anytime.
