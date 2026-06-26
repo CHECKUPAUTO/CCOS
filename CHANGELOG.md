@@ -20,6 +20,17 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Node lifecycle state (`NodeState`: `Stable` / `Working` / `Orphan`).** Separates a
+  node's *health/attention* from graph *topology* so it can't pollute the structural
+  signal — a per-node enum field (not a tensor dimension; a node's state is single-valued).
+  `Orphan` is excluded from the centrality calc and evicted first regardless of recency;
+  `Working` is pinned resident as the current focus even as recency decays. Off by default
+  (`Stable`) ⇒ centrality, score and snapshot are byte-identical until a state is set;
+  `set_node_state` invalidates the centrality caches. See `docs/MEASUREMENT_node_lifecycle.md`
+  (pillar in-degree 12→6 once dead dependents are excluded; real-work retention 1/6→6/6 when
+  freshly-edited dead code is labeled). Companion to the off-by-default **eigenvector
+  centrality** mode (`CentralityMode::Eigenvector`) added earlier in the series.
+
 - **COLD entry-count bound — an on-disk husk index (slice 5c, "Lever 2"; the
   `O(1)`-resident COLD tier).** Slices 3–5b bounded each COLD entry's *size*; this
   bounds their *count*. The deep-spill tier no longer keeps one `BTreeMap` node per

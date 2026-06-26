@@ -50,6 +50,34 @@ pub struct GraphNode {
     pub access_count: u64,
     pub created_at: u64,
     pub last_accessed: u64,
+    /// Lifecycle state (see [`NodeState`]). Kept **separate from topology** so a node's
+    /// health/attention cannot pollute the structural centrality signal. `serde(default)` +
+    /// skip-if-`Stable` keeps existing snapshots byte-identical on the default path.
+    #[serde(default, skip_serializing_if = "NodeState::is_stable")]
+    pub state: NodeState,
+}
+
+/// Lifecycle state of a node, kept orthogonal to graph topology so a node's *health* /
+/// *attention* does not distort the structural signal centrality reads. Default `Stable`,
+/// so it is off-by-default and snapshot-compatible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum NodeState {
+    /// Verified code, part of the load-bearing structure. The default.
+    #[default]
+    Stable,
+    /// Code under active modification — "hot" (the current focus) but structurally fragile.
+    /// **Pinned** in working memory (a retention boost) even as its recency decays.
+    Working,
+    /// Dead / unreachable code — **excluded** from the structural centrality calc, and
+    /// **evicted first** even when recently touched.
+    Orphan,
+}
+
+impl NodeState {
+    /// `serde` skip predicate: elide the default so snapshots stay byte-identical.
+    fn is_stable(&self) -> bool {
+        matches!(self, NodeState::Stable)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -636,6 +664,7 @@ impl MemoryGraph {
                     access_count: 1,
                     created_at: now,
                     last_accessed: now,
+                    state: NodeState::Stable,
                 };
                 self.nodes.insert(id, node);
             }
@@ -715,6 +744,32 @@ impl MemoryGraph {
         }
     }
 
+    /// Set a node's lifecycle [`NodeState`]. State affects the structural centrality (an
+    /// `Orphan` is excluded) and the eviction score (`Orphan` first, `Working` pinned), so
+    /// this invalidates the centrality caches — which key only on edge/node counts — when the
+    /// state actually changes. No-op if the node is absent. Deterministic.
+    pub fn set_node_state(&mut self, id: &NodeId, state: NodeState) {
+        let changed = match self.nodes.get_mut(id) {
+            Some(node) => {
+                let was = node.state;
+                node.state = state;
+                was != state
+            }
+            None => false,
+        };
+        if changed {
+            self.indegree_cache.borrow_mut().take();
+            self.eigencentrality_cache.borrow_mut().take();
+        }
+    }
+
+    /// Whether `id` is a resident `Orphan` (excluded from the structural centrality signal).
+    fn is_orphan(&self, id: &NodeId) -> bool {
+        self.nodes
+            .get(id)
+            .is_some_and(|n| n.state == NodeState::Orphan)
+    }
+
     pub fn compute_node_score(&self, node: &GraphNode) -> f64 {
         let w = &self.scoring_weights;
         let base = node.base_importance * w.w_base;
@@ -734,7 +789,16 @@ impl MemoryGraph {
         } else {
             0.0
         };
-        (base + failure + recency + access + centrality).clamp(0.0, 1.0)
+        // Lifecycle bias (orthogonal to topology): `Working` is **pinned** (kept resident as
+        // the current focus even as recency decays); `Orphan` is driven to the bottom so it is
+        // **evicted first** regardless of recency. `Stable` (the default) is neutral ⇒ the
+        // score is byte-identical to before this field existed.
+        let state_bias = match node.state {
+            NodeState::Stable => 0.0,
+            NodeState::Working => 0.3,
+            NodeState::Orphan => -1.0,
+        };
+        (base + failure + recency + access + centrality + state_bias).clamp(0.0, 1.0)
     }
 
     /// In-degree of `id` among the **resident** graph — the count of incoming
@@ -747,6 +811,11 @@ impl MemoryGraph {
         if cache.as_ref().map(|(v, _)| *v) != Some(self.edges.len()) {
             let mut m: HashMap<NodeId, u32> = HashMap::new();
             for e in &self.edges {
+                // Edges incident to an Orphan don't count toward the load-bearing structure:
+                // dead code depending on a node should not inflate its centrality.
+                if self.is_orphan(&e.source) || self.is_orphan(&e.target) {
+                    continue;
+                }
                 *m.entry(e.target.clone()).or_default() += 1;
             }
             *cache = Some((self.edges.len(), m));
@@ -773,13 +842,20 @@ impl MemoryGraph {
     /// dependence). Like all scoring it is a read-only ranking signal and never enters the
     /// snapshot/replay hash, so its `f64`s are safe.
     pub fn eigencentrality(&self) -> HashMap<NodeId, f64> {
-        let n = self.nodes.len();
+        // Stable ordering ⇒ deterministic accumulation order. `Orphan` nodes are excluded from
+        // the structural graph (and so get centrality 0), and their edges drop out below because
+        // their endpoints are absent from `index`. `n` is therefore the *non-Orphan* count.
+        let mut ids: Vec<&NodeId> = self
+            .nodes
+            .iter()
+            .filter(|(_, node)| node.state != NodeState::Orphan)
+            .map(|(id, _)| id)
+            .collect();
+        ids.sort();
+        let n = ids.len();
         if n == 0 {
             return HashMap::new();
         }
-        // Stable ordering ⇒ deterministic accumulation order.
-        let mut ids: Vec<&NodeId> = self.nodes.keys().collect();
-        ids.sort();
         let index: HashMap<&NodeId, usize> =
             ids.iter().enumerate().map(|(i, id)| (*id, i)).collect();
         // Resident edges as (source_idx, target_idx); out-degree splits each node's mass
@@ -2662,6 +2738,68 @@ mod tests {
     }
 
     #[test]
+    fn node_state_default_is_elided_and_round_trips() {
+        let mut g = MemoryGraph::new(0.2, usize::MAX);
+        g.upsert_node("a".into(), "a".into(), "x".into(), NodeType::Module);
+        assert_eq!(g.node(&"a".into()).unwrap().state, NodeState::Stable);
+        // Default Stable ⇒ no `state` key ⇒ snapshots stay byte-identical.
+        assert!(!serde_json::to_string(&g).unwrap().contains("\"state\""));
+        g.set_node_state(&"a".into(), NodeState::Working);
+        let json = serde_json::to_string(&g).unwrap();
+        assert!(json.contains("Working"));
+        let back: MemoryGraph = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.node(&"a".into()).unwrap().state, NodeState::Working);
+    }
+
+    #[test]
+    fn orphan_is_excluded_from_centrality_and_set_state_invalidates_cache() {
+        let mut g = MemoryGraph::new(0.2, usize::MAX);
+        for n in ["hub", "x", "y", "dead"] {
+            g.upsert_node(n.into(), n.into(), "".into(), NodeType::Module);
+        }
+        for s in ["x", "y", "dead"] {
+            g.add_edge(s.into(), "hub".into(), 1.0, EdgeType::DependsOn);
+        }
+        assert_eq!(g.node_in_degree(&"hub".into()), 3); // primes the cache
+                                                        // Marking `dead` Orphan must drop it from the structural signal — and the cache,
+                                                        // keyed only on edge count, must be invalidated by set_node_state.
+        g.set_node_state(&"dead".into(), NodeState::Orphan);
+        assert_eq!(
+            g.node_in_degree(&"hub".into()),
+            2,
+            "an orphan dependent no longer inflates the hub's in-degree"
+        );
+        assert!(
+            !g.eigencentrality().contains_key(&"dead".into()),
+            "an orphan has no eigenvector centrality"
+        );
+    }
+
+    #[test]
+    fn orphan_evicted_first_and_working_pinned_regardless_of_recency() {
+        let mut g = MemoryGraph::new(0.2, usize::MAX);
+        for n in ["dead", "work", "stable"] {
+            g.upsert_node(n.into(), n.into(), "".into(), NodeType::Module);
+        }
+        let score = |g: &MemoryGraph, id: &str| g.compute_node_score(g.node(&id.into()).unwrap());
+        // `dead` is freshly upserted (recency 1.0) yet, once Orphan, scores below a Stable peer.
+        g.set_node_state(&"dead".into(), NodeState::Orphan);
+        assert!(
+            score(&g, "dead") < score(&g, "stable"),
+            "orphan scores below a stable peer even at full recency → evicted first"
+        );
+        // `work` is Working; after decay it still outscores a decayed Stable peer (pinned).
+        g.set_node_state(&"work".into(), NodeState::Working);
+        for _ in 0..30 {
+            g.tick();
+        }
+        assert!(
+            score(&g, "work") > score(&g, "stable"),
+            "Working is pinned above a decayed Stable peer"
+        );
+    }
+
+    #[test]
     fn smaller_failure_decay_reduces_distant_pressure() {
         let pressure_at_c = |decay: f64| {
             let mut g = MemoryGraph::new(0.0, usize::MAX);
@@ -3457,6 +3595,7 @@ mod tests {
                 access_count: 1,
                 created_at: 0,
                 last_accessed: 0,
+                state: NodeState::Stable,
             };
             node.recency = (5 - i) as f64 * 0.1;
             graph.nodes.insert(node.id.clone(), node);
