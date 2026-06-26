@@ -729,6 +729,13 @@ retriever at a sufficient budget and loses to it at a tight one; on real fix
 commits the files a fix touches are lexically similar, so the simulation's premise
 of a lexically-dissimilar cause does not hold. The strong absolute numbers are a
 \emph{necessary} condition that a baseline also satisfies, not a CCOS win.
+(A complementary measurement on the engine's own source isolates a different,
+structurally-defined relation: a lexical TF-IDF retriever recovers only $49\%$
+(recall@$10$) of the AST-resolved \emph{import} dependencies---pairs that routinely
+share no vocabulary, dependency cosine $0.53$ vs $0.43$ random---so RAG's blind spot
+is real, but it lies off the fix-\emph{cohesion} axis the headline metric measures,
+where a fix's files do share vocabulary. The structural layer recovers those edges by
+construction; the now-default AST is what makes that recovery complete.)
 \textbf{(2) Necessary $\neq$ sufficient.} We never measure whether a region
 \emph{helps an agent fix} a bug (Phase 4: a patch passing the hidden tests) ---
 only whether the relevant files are retrievable.
@@ -738,12 +745,17 @@ exercise the regime where a symptom is lexically far from its cause --- the regi
 most favourable to causal selection.
 \textbf{(4) Scale and statistics.} Three single-crate repositories, $n\!\approx\!20$
 each; differences are reported with their standard deviation but not cross-validated.
-\textbf{(5) Engine.} The parser is a line/AST heuristic (shallow neighbourhoods);
-regions are file-granular and merge only on explicit cross-file edges;
-temperature/policy and scoring weights are hand-tuned, not learned. None of these
-affect the \emph{proven} properties (partition, determinism, replay) or the
-measured locality --- but the empirical case for a downstream agent benefit is, at
-this point, \emph{unproven}.
+\textbf{(5) Engine.} The parser now \emph{defaults} to a real \texttt{syn} AST ---
+measured $36.5\%$ more accurate than the former line heuristic on the engine's own
+source (two-thirds vs.\ full import recall), the heuristic kept only as a fallback for
+non-Rust input --- and ingestion was hardened to reconstruct bit-identically across
+processes (sorted import resolution; order-invariant centrality). Regions remain
+file-granular and merge only on explicit cross-file edges; scoring weights are
+hand-tuned, though off-by-default eigenvector-centrality and node-lifecycle
+(\texttt{Stable}/\texttt{Working}/\texttt{Orphan}) refinements are now available. None of
+these affect the \emph{proven} properties (partition, determinism, replay) or the
+measured locality --- but the empirical case for a downstream agent benefit is, at this
+point, \emph{unproven}.
 
 \section{Conclusion}
 
