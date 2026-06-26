@@ -1208,6 +1208,9 @@ impl ExternalMemory for CcosMemory {
         // import edges miss). Whole-graph pass — a call may target a symbol in another file.
         let call_edges = self.graph.resolve_symbol_calls();
         let _ = call_edges;
+        // Resolve in-body static/const references into reader→item `DataFlow` edges (the shared
+        // -global-state structure call/import edges miss). Whole-graph pass, like call resolution.
+        let _ = self.graph.resolve_data_flow();
         let file_hash = sha256_hex(source);
         self.event_log.append(
             EventType::Parsing,

@@ -30,24 +30,63 @@ use ccos::util::sha256_hex;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
+/// A CLI failure: an exit `code`, plus an optional stderr `message`. `message: None` is a non-zero
+/// *status* whose report the handler already printed (not an error to announce again).
+struct CliError {
+    code: i32,
+    message: Option<String>,
+}
+impl CliError {
+    fn usage(m: impl Into<String>) -> Self {
+        Self {
+            code: 2,
+            message: Some(m.into()),
+        }
+    }
+    fn fail(m: impl Into<String>) -> Self {
+        Self {
+            code: 1,
+            message: Some(m.into()),
+        }
+    }
+    fn status(code: i32) -> Self {
+        Self {
+            code,
+            message: None,
+        }
+    }
+}
+type CliResult = Result<(), CliError>;
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
     let command = args.get(1).map(String::as_str).unwrap_or("demo");
     let rest = &args[args.len().min(2)..];
 
-    let code = match command {
+    // Map an `i32` exit code from a handler that has already printed its own
+    // report (the v0.3 runtime handlers in `commands_runtime`) into a CliResult,
+    // preserving the exact code without re-announcing any message.
+    let from_code = |code: i32| -> CliResult {
+        if code == 0 {
+            Ok(())
+        } else {
+            Err(CliError::status(code))
+        }
+    };
+
+    let result: CliResult = match command {
         "-h" | "--help" | "help" => {
             print_help();
-            0
+            Ok(())
         }
         "-V" | "--version" | "version" => {
             println!("ccos {}", env!("CARGO_PKG_VERSION"));
-            0
+            Ok(())
         }
         "demo" => {
             commands_demo::run_demo().await;
-            0
+            Ok(())
         }
         "analyze" => run_analyze(&AnalyzeOpts::parse(rest)),
         "verify" => run_verify(rest.first().map(String::as_str)),
@@ -76,24 +115,30 @@ async fn main() {
                 .map(PathBuf::from)
                 .or_else(|| std::env::var("CCOS_MCP_WORKSPACE").ok().map(PathBuf::from));
             match ccos::mcp::serve_workspace(workspace) {
-                Ok(()) => 0,
-                Err(e) => {
-                    eprintln!("ccos mcp: {e}");
-                    1
-                }
+                Ok(()) => Ok(()),
+                Err(e) => Err(CliError::fail(format!("ccos mcp: {e}"))),
             }
         }
         "postmortem" => run_postmortem(rest),
         "sanitize" => run_sanitize(rest),
         // ── CCOS v0.3 — Autonomous Context Runtime ──────────────────
-        "scan" => commands_runtime::run_scan(rest).await,
-        "agents" => commands_runtime::run_agents(rest).await,
-        "benchmark" => commands_runtime::run_benchmark(rest),
-        "runtime" => commands_runtime::run_runtime(rest).await,
+        "scan" => from_code(commands_runtime::run_scan(rest).await),
+        "agents" => from_code(commands_runtime::run_agents(rest).await),
+        "benchmark" => from_code(commands_runtime::run_benchmark(rest)),
+        "runtime" => from_code(commands_runtime::run_runtime(rest).await),
         other => {
             eprintln!("ccos: unknown command '{other}'\n");
             print_help();
-            2
+            Err(CliError::status(2))
+        }
+    };
+    let code = match result {
+        Ok(()) => 0,
+        Err(e) => {
+            if let Some(m) = e.message {
+                eprintln!("{m}");
+            }
+            e.code
         }
     };
     std::process::exit(code);
@@ -158,11 +203,13 @@ impl AnalyzeOpts {
 /// `ccos analyze <path> [--json] [--cycles] [--out FILE]` — ingest every `.rs`
 /// file under `path` into the causal memory graph and print (or export) a
 /// structural report. Returns a process exit code (0 on success).
-fn run_analyze(opts: &AnalyzeOpts) -> i32 {
+fn run_analyze(opts: &AnalyzeOpts) -> CliResult {
     let root = Path::new(&opts.path);
     if !root.exists() {
-        eprintln!("ccos: path '{}' does not exist", opts.path);
-        return 1;
+        return Err(CliError::fail(format!(
+            "ccos: path '{}' does not exist",
+            opts.path
+        )));
     }
 
     let human = !opts.json;
@@ -181,8 +228,10 @@ fn run_analyze(opts: &AnalyzeOpts) -> i32 {
     files.sort();
 
     if files.is_empty() {
-        eprintln!("ccos: no .rs files found under '{}'", opts.path);
-        return 1;
+        return Err(CliError::fail(format!(
+            "ccos: no .rs files found under '{}'",
+            opts.path
+        )));
     }
 
     let mut graph = MemoryGraph::new(MemoryGraph::paging_threshold_from_env(0.2), opts.max_nodes);
@@ -349,30 +398,29 @@ fn run_analyze(opts: &AnalyzeOpts) -> i32 {
         match snapshot.save(out) {
             Ok(()) => eprintln!("\n[SAVE] snapshot written to {out}"),
             Err(e) => {
-                eprintln!("ccos: failed to save snapshot to {out}: {e}");
-                return 1;
+                return Err(CliError::fail(format!(
+                    "ccos: failed to save snapshot to {out}: {e}"
+                )));
             }
         }
     }
 
     if dangling != 0 {
-        return 1;
+        return Err(CliError::status(1));
     }
-    0
+    Ok(())
 }
 
 /// `ccos verify <snapshot.json>` — re-check a saved snapshot's integrity: the
 /// hash chain must validate and the graph must hold no dangling edges.
-fn run_verify(file: Option<&str>) -> i32 {
+fn run_verify(file: Option<&str>) -> CliResult {
     let Some(file) = file else {
-        eprintln!("usage: ccos verify <snapshot.json>");
-        return 2;
+        return Err(CliError::usage("usage: ccos verify <snapshot.json>"));
     };
     let snapshot = match KernelSnapshot::load(file) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("ccos: cannot load '{file}': {e}");
-            return 1;
+            return Err(CliError::fail(format!("ccos: cannot load '{file}': {e}")));
         }
     };
 
@@ -409,25 +457,23 @@ fn run_verify(file: Option<&str>) -> i32 {
 
     if integrity.valid && log_integrity.valid && dangling == 0 {
         println!("\n  ✓ snapshot verified");
-        0
+        Ok(())
     } else {
         println!("\n  ✗ verification FAILED");
-        1
+        Err(CliError::status(1))
     }
 }
 
 /// `ccos replay <snapshot.json>` — deterministically replay a saved event log
 /// and print the reconstructed statistics, then re-verify the hash chain.
-fn run_replay(file: Option<&str>) -> i32 {
+fn run_replay(file: Option<&str>) -> CliResult {
     let Some(file) = file else {
-        eprintln!("usage: ccos replay <snapshot.json>");
-        return 2;
+        return Err(CliError::usage("usage: ccos replay <snapshot.json>"));
     };
     let snapshot = match KernelSnapshot::load(file) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("ccos: cannot load '{file}': {e}");
-            return 1;
+            return Err(CliError::fail(format!("ccos: cannot load '{file}': {e}")));
         }
     };
 
@@ -451,8 +497,7 @@ fn run_replay(file: Option<&str>) -> i32 {
             );
         }
         Err(e) => {
-            eprintln!("ccos: replay error: {e}");
-            return 1;
+            return Err(CliError::fail(format!("ccos: replay error: {e}")));
         }
     }
 
@@ -477,25 +522,25 @@ fn run_replay(file: Option<&str>) -> i32 {
         integrity.valid, log_integrity.valid, log_integrity.verified_events
     );
     if integrity.valid && log_integrity.valid {
-        0
+        Ok(())
     } else {
-        1
+        Err(CliError::status(1))
     }
 }
 
 /// `ccos diff <a.json> <b.json>` — structural difference between two saved
 /// snapshots: nodes/edges added & removed, plus the biggest causal-score movers.
-fn run_diff(a: Option<&str>, b: Option<&str>) -> i32 {
+fn run_diff(a: Option<&str>, b: Option<&str>) -> CliResult {
     let (Some(a_path), Some(b_path)) = (a, b) else {
-        eprintln!("usage: ccos diff <old-snapshot.json> <new-snapshot.json>");
-        return 2;
+        return Err(CliError::usage(
+            "usage: ccos diff <old-snapshot.json> <new-snapshot.json>",
+        ));
     };
     let load = |p: &str| KernelSnapshot::load(p).map_err(|e| format!("cannot load '{p}': {e}"));
     let (snap_a, snap_b) = match (load(a_path), load(b_path)) {
         (Ok(a), Ok(b)) => (a, b),
         (Err(e), _) | (_, Err(e)) => {
-            eprintln!("ccos: {e}");
-            return 1;
+            return Err(CliError::fail(format!("ccos: {e}")));
         }
     };
 
@@ -549,7 +594,7 @@ fn run_diff(a: Option<&str>, b: Option<&str>) -> i32 {
             println!("    {:+.4}  {}", drift, truncate(id, 44));
         }
     }
-    0
+    Ok(())
 }
 
 /// Options for `ccos failure`.
@@ -623,18 +668,16 @@ impl FailureOpts {
 /// hook the causal-validation harness drives: inject a mined fault, then measure
 /// `R_cov = |F_target ∩ WorkingSet_K| / |F_target|`. Honours `CCOS_W_*` /
 /// `CCOS_FAILURE_DECAY` so a hyperparameter trial re-scores without recompiling.
-fn run_failure(opts: &FailureOpts) -> i32 {
+fn run_failure(opts: &FailureOpts) -> CliResult {
     let (Some(file), Some(node_id)) = (opts.snapshot.as_deref(), opts.node.as_deref()) else {
-        eprintln!(
-            "usage: ccos failure <snapshot.json> <node-id> [--depth N] [--max-nodes K] [--bidirectional] [--json]"
-        );
-        return 2;
+        return Err(CliError::usage(
+            "usage: ccos failure <snapshot.json> <node-id> [--depth N] [--max-nodes K] [--bidirectional] [--json]",
+        ));
     };
     let snapshot = match KernelSnapshot::load(file) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("ccos: cannot load '{file}': {e}");
-            return 1;
+            return Err(CliError::fail(format!("ccos: cannot load '{file}': {e}")));
         }
     };
     let mut graph = snapshot.graph;
@@ -642,11 +685,10 @@ fn run_failure(opts: &FailureOpts) -> i32 {
     graph.set_scoring_weights(ScoringWeights::from_env());
     let origin = NodeId(node_id.to_string());
     if !graph.contains_node(&origin) {
-        eprintln!(
+        return Err(CliError::fail(format!(
             "ccos: node '{node_id}' not found ({} nodes). List ids with `ccos analyze <path> --json`.",
             graph.node_count()
-        );
-        return 1;
+        )));
     }
 
     let nodes_before = graph.node_count();
@@ -701,7 +743,7 @@ fn run_failure(opts: &FailureOpts) -> i32 {
             },
         });
         println!("{}", serde_json::to_string_pretty(&report).unwrap());
-        return 0;
+        return Ok(());
     }
 
     println!("╔══════════════════════════════════════════════╗");
@@ -722,7 +764,7 @@ fn run_failure(opts: &FailureOpts) -> i32 {
             println!("    {:.3}  {}", fr, truncate(id, 46));
         }
     }
-    0
+    Ok(())
 }
 
 /// Options for `ccos chaos`.
@@ -750,7 +792,7 @@ impl ChaosOpts {
 /// `ccos chaos [--iters N]` — drive adversarial payloads (JSON corruption,
 /// hallucination, prompt injection, timeouts) through the guard and assert its
 /// core invariant: the guard must *never* emit non-JSON output.
-fn run_chaos(opts: &ChaosOpts) -> i32 {
+fn run_chaos(opts: &ChaosOpts) -> CliResult {
     println!("╔══════════════════════════════════════════════╗");
     println!(
         "║  CCOS chaos — {:>5} iterations                ║",
@@ -789,10 +831,10 @@ fn run_chaos(opts: &ChaosOpts) -> i32 {
 
     if invalid_outputs == 0 {
         println!("\n  ✓ guard never emitted invalid JSON under chaos");
-        0
+        Ok(())
     } else {
         println!("\n  ✗ guard emitted invalid JSON — safety invariant violated");
-        1
+        Err(CliError::status(1))
     }
 }
 
@@ -869,12 +911,11 @@ impl TopOpts {
 
 /// `ccos top <path> [--limit N] [--json]` — ingest `path` and print the hottest
 /// nodes by causal score: the working set the kernel would page in first.
-fn run_top(opts: &TopOpts) -> i32 {
+fn run_top(opts: &TopOpts) -> CliResult {
     let graph = match build_graph_from_path(&opts.path, opts.max_nodes) {
         Ok(g) => g,
         Err(e) => {
-            eprintln!("ccos: {e}");
-            return 1;
+            return Err(CliError::fail(format!("ccos: {e}")));
         }
     };
     let hot = query::hot_set(&graph, opts.limit);
@@ -891,7 +932,7 @@ fn run_top(opts: &TopOpts) -> i32 {
             "top": rows,
         });
         println!("{}", serde_json::to_string_pretty(&report).unwrap());
-        return 0;
+        return Ok(());
     }
 
     println!("╔══════════════════════════════════════════════╗");
@@ -916,7 +957,7 @@ fn run_top(opts: &TopOpts) -> i32 {
             truncate(&id.0, 44)
         );
     }
-    0
+    Ok(())
 }
 
 /// Options for `ccos blame`.
@@ -964,26 +1005,25 @@ impl BlameOpts {
 
 /// `ccos blame <snapshot.json> <node-id> [--depth N]` — show a node's upstream
 /// causes (what it rests on) and downstream blast radius (what breaks with it).
-fn run_blame(opts: &BlameOpts) -> i32 {
+fn run_blame(opts: &BlameOpts) -> CliResult {
     let (Some(file), Some(node_id)) = (opts.snapshot.as_deref(), opts.node.as_deref()) else {
-        eprintln!("usage: ccos blame <snapshot.json> <node-id> [--depth N]");
-        return 2;
+        return Err(CliError::usage(
+            "usage: ccos blame <snapshot.json> <node-id> [--depth N]",
+        ));
     };
     let snapshot = match KernelSnapshot::load(file) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("ccos: cannot load '{file}': {e}");
-            return 1;
+            return Err(CliError::fail(format!("ccos: cannot load '{file}': {e}")));
         }
     };
     let graph = snapshot.graph;
     let origin = NodeId(node_id.to_string());
     if !graph.contains_node(&origin) {
-        eprintln!(
+        return Err(CliError::fail(format!(
             "ccos: node '{node_id}' not found ({} nodes). List ids with `ccos analyze <path> --json`.",
             graph.node_count()
-        );
-        return 1;
+        )));
     }
 
     let causes = query::source_set(&graph, &origin, opts.depth);
@@ -1004,7 +1044,7 @@ fn run_blame(opts: &BlameOpts) -> i32 {
             "impact": to_rows(&impact),
         });
         println!("{}", serde_json::to_string_pretty(&report).unwrap());
-        return 0;
+        return Ok(());
     }
 
     println!("╔══════════════════════════════════════════════╗");
@@ -1037,7 +1077,7 @@ fn run_blame(opts: &BlameOpts) -> i32 {
             truncate(&r.id.0, 42)
         );
     }
-    0
+    Ok(())
 }
 
 /// Options for `ccos export`.
@@ -1079,16 +1119,16 @@ impl ExportOpts {
 
 /// `ccos export <snapshot.json> [--out FILE]` — export the snapshot's causal
 /// graph as GraphML for Gephi / yEd / Cytoscape / networkx.
-fn run_export(opts: &ExportOpts) -> i32 {
+fn run_export(opts: &ExportOpts) -> CliResult {
     let Some(file) = opts.snapshot.as_deref() else {
-        eprintln!("usage: ccos export <snapshot.json> [--out FILE]");
-        return 2;
+        return Err(CliError::usage(
+            "usage: ccos export <snapshot.json> [--out FILE]",
+        ));
     };
     let snapshot = match KernelSnapshot::load(file) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("ccos: cannot load '{file}': {e}");
-            return 1;
+            return Err(CliError::fail(format!("ccos: cannot load '{file}': {e}")));
         }
     };
     let graphml = query::to_graphml(&snapshot.graph);
@@ -1100,12 +1140,12 @@ fn run_export(opts: &ExportOpts) -> i32 {
                 snapshot.graph.edge_count(),
                 opts.out
             );
-            0
+            Ok(())
         }
-        Err(e) => {
-            eprintln!("ccos: failed to write '{}': {e}", opts.out);
-            1
-        }
+        Err(e) => Err(CliError::fail(format!(
+            "ccos: failed to write '{}': {e}",
+            opts.out
+        ))),
     }
 }
 
@@ -1165,12 +1205,11 @@ impl RegionsOpts {
 /// `ccos regions <path> [--activate ID] [--metrics ID] [--radius N] [--json]` —
 /// cluster the causal graph into spatial regions; optionally activate one
 /// (hydrate a context window) or print the flat-vs-region locality comparison.
-fn run_regions(opts: &RegionsOpts) -> i32 {
+fn run_regions(opts: &RegionsOpts) -> CliResult {
     let graph = match build_graph_from_path(&opts.path, opts.max_nodes) {
         Ok(g) => g,
         Err(e) => {
-            eprintln!("ccos: {e}");
-            return 1;
+            return Err(CliError::fail(format!("ccos: {e}")));
         }
     };
     let mut engine = ContextRegionEngine::new();
@@ -1180,12 +1219,13 @@ fn run_regions(opts: &RegionsOpts) -> i32 {
     // ── metrics mode: flat vs region locality for a target node ──
     if let Some(target) = &opts.metrics {
         let Some(report) = region_metrics::locality_report(&graph, target, opts.radius) else {
-            eprintln!("ccos: node '{target}' not found in graph");
-            return 1;
+            return Err(CliError::fail(format!(
+                "ccos: node '{target}' not found in graph"
+            )));
         };
         if opts.json {
             println!("{}", serde_json::to_string_pretty(&report).unwrap());
-            return 0;
+            return Ok(());
         }
         println!("╔══════════════════════════════════════════════╗");
         println!("║  CCOS regions — locality metrics             ║");
@@ -1212,7 +1252,7 @@ fn run_regions(opts: &RegionsOpts) -> i32 {
             report.region_tokens_to_cover,
             report.token_saving_ratio * 100.0
         );
-        return 0;
+        return Ok(());
     }
 
     // ── activate mode: hydrate a context window from a region ──
@@ -1224,8 +1264,9 @@ fn run_regions(opts: &RegionsOpts) -> i32 {
             &policy,
             &mut log,
         ) else {
-            eprintln!("ccos: node '{target}' not found in any region");
-            return 1;
+            return Err(CliError::fail(format!(
+                "ccos: node '{target}' not found in any region"
+            )));
         };
         if opts.json {
             let report = serde_json::json!({
@@ -1236,7 +1277,7 @@ fn run_regions(opts: &RegionsOpts) -> i32 {
                 "reason": win.reason,
             });
             println!("{}", serde_json::to_string_pretty(&report).unwrap());
-            return 0;
+            return Ok(());
         }
         println!("╔══════════════════════════════════════════════╗");
         println!("║  CCOS regions — context window               ║");
@@ -1249,7 +1290,7 @@ fn run_regions(opts: &RegionsOpts) -> i32 {
         for f in win.files.iter().take(20) {
             println!("    • {}", truncate(f, 44));
         }
-        return 0;
+        return Ok(());
     }
 
     // ── default: region map summary ──
@@ -1282,7 +1323,7 @@ fn run_regions(opts: &RegionsOpts) -> i32 {
             "map": rows,
         });
         println!("{}", serde_json::to_string_pretty(&report).unwrap());
-        return 0;
+        return Ok(());
     }
 
     println!("╔══════════════════════════════════════════════╗");
@@ -1304,13 +1345,13 @@ fn run_regions(opts: &RegionsOpts) -> i32 {
             truncate(&r.id, 40)
         );
     }
-    0
+    Ok(())
 }
 
 /// `ccos experiment [--tasks N] [--seed S] [--budget B] [--json]` — run the
 /// LLM-free hypothesis simulation: regional causal memory vs. RAG / GraphRAG
 /// baselines on synthetic multi-file causal tasks of growing diameter.
-fn run_experiment_cmd(args: &[String]) -> i32 {
+fn run_experiment_cmd(args: &[String]) -> CliResult {
     let mut cfg = ExperimentConfig::default();
     let mut json = false;
     let mut i = 0;
@@ -1354,7 +1395,7 @@ fn run_experiment_cmd(args: &[String]) -> i32 {
     if json {
         let out = serde_json::json!({ "clean": clean, "noisy": noisy });
         println!("{}", serde_json::to_string_pretty(&out).unwrap());
-        return 0;
+        return Ok(());
     }
 
     let strategies = [
@@ -1411,18 +1452,17 @@ fn run_experiment_cmd(args: &[String]) -> i32 {
          only `ccos-region`, which anchors on the workspace signal (not the query),\n  \
          survives. The differentiator is the anchor, not the region machinery."
     );
-    0
+    Ok(())
 }
 
 /// `ccos trace` — read `cargo test` / panic / backtrace text on **stdin** and
 /// emit the project source locations the crash touched as JSON (`message`,
 /// `files`, `hits`). The seed set for a trace-driven context page fault.
-fn run_trace_cmd() -> i32 {
+fn run_trace_cmd() -> CliResult {
     use std::io::Read;
     let mut input = String::new();
     if std::io::stdin().read_to_string(&mut input).is_err() {
-        eprintln!("ccos: failed to read stdin");
-        return 1;
+        return Err(CliError::fail("ccos: failed to read stdin"));
     }
     let trace = parse_cargo_test_output(&input);
     let hits: Vec<_> = trace
@@ -1438,7 +1478,7 @@ fn run_trace_cmd() -> i32 {
         "hits": hits,
     });
     println!("{}", serde_json::to_string_pretty(&report).unwrap());
-    0
+    Ok(())
 }
 
 /// Options for `ccos focus` — the human "attentional shield".
@@ -1569,11 +1609,13 @@ fn crate_relative(p: &Path) -> String {
 /// trace, and shows the **causal region** (the likely root cause + its direct
 /// dependencies), hiding the backtrace noise and the unrelated files. The host can
 /// be a human (terminal) or an editor (`--json`).
-fn run_focus(opts: &FocusOpts) -> i32 {
+fn run_focus(opts: &FocusOpts) -> CliResult {
     let root = Path::new(&opts.path);
     if !root.exists() {
-        eprintln!("ccos: path '{}' does not exist", opts.path);
-        return 1;
+        return Err(CliError::fail(format!(
+            "ccos: path '{}' does not exist",
+            opts.path
+        )));
     }
     let mut files: Vec<PathBuf> = Vec::new();
     if root.is_dir() {
@@ -1583,8 +1625,10 @@ fn run_focus(opts: &FocusOpts) -> i32 {
     }
     files.sort();
     if files.is_empty() {
-        eprintln!("ccos: no .rs files under '{}'", opts.path);
-        return 1;
+        return Err(CliError::fail(format!(
+            "ccos: no .rs files under '{}'",
+            opts.path
+        )));
     }
 
     // Ingest under crate-relative URIs (`src/…`), matching how `cargo` reports paths
@@ -1596,8 +1640,9 @@ fn run_focus(opts: &FocusOpts) -> i32 {
         Some(ws) => match AgentSession::open(ws) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("ccos: cannot open workspace '{ws}': {e}");
-                return 1;
+                return Err(CliError::fail(format!(
+                    "ccos: cannot open workspace '{ws}': {e}"
+                )));
             }
         },
         None => AgentSession::new(),
@@ -1658,7 +1703,7 @@ fn run_focus(opts: &FocusOpts) -> i32 {
             "entries": entries,
         });
         println!("{}", serde_json::to_string_pretty(&report).unwrap());
-        return 0;
+        return Ok(());
     }
 
     render_focus_human(
@@ -1669,7 +1714,7 @@ fn run_focus(opts: &FocusOpts) -> i32 {
         opts.workspace.as_deref(),
         reparsed,
     );
-    0
+    Ok(())
 }
 
 /// Render the focused view for a human terminal — the cause first, noise hidden.
@@ -1732,7 +1777,7 @@ fn render_focus_human(
 /// `{"op":"recall","strategy":"around|task|working_set",..,"budget":N}`,
 /// `{"op":"impact|causes","node":..,"depth":N}`, `{"op":"verify"}`,
 /// `{"op":"stats"}`.
-fn run_memory_cmd(args: &[String]) -> i32 {
+fn run_memory_cmd(args: &[String]) -> CliResult {
     use std::io::BufRead;
     let mut path = "workspace.ccos".to_string();
     let mut i = 0;
@@ -1752,8 +1797,9 @@ fn run_memory_cmd(args: &[String]) -> i32 {
     let mut mem = match CcosMemory::open(&path) {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("ccos: cannot open memory '{path}': {e}");
-            return 1;
+            return Err(CliError::fail(format!(
+                "ccos: cannot open memory '{path}': {e}"
+            )));
         }
     };
 
@@ -1846,11 +1892,14 @@ fn run_memory_cmd(args: &[String]) -> i32 {
 
     if dirty {
         if let Err(e) = mem.checkpoint() {
-            eprintln!("ccos: checkpoint failed: {e}");
-            return 1;
+            return Err(CliError::fail(format!("ccos: checkpoint failed: {e}")));
         }
     }
-    i32::from(had_error)
+    if had_error {
+        Err(CliError::status(1))
+    } else {
+        Ok(())
+    }
 }
 
 /// `ccos postmortem [workspace.ccos] [--json]` — open the interactive **time-travel
@@ -1860,15 +1909,16 @@ fn run_memory_cmd(args: &[String]) -> i32 {
 /// stdin (`timeline`, `goto N`, `recall`, `diff A B`, `help`, `quit`). With
 /// `--json` it dumps the field record (stats / integrity / timeline / working set)
 /// as JSON and exits — for archiving / fleet collection (see `scripts/fleet_collect.sh`).
-fn run_postmortem(args: &[String]) -> i32 {
+fn run_postmortem(args: &[String]) -> CliResult {
     let as_json = args.iter().any(|a| a == "--json");
     let path = args.iter().find(|a| !a.starts_with("--"));
     let session = match path {
         Some(p) => match ccos::agent_session::AgentSession::open(p) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("ccos: cannot open session '{p}': {e}");
-                return 1;
+                return Err(CliError::fail(format!(
+                    "ccos: cannot open session '{p}': {e}"
+                )));
             }
         },
         None => ccos::postmortem::demo_session(),
@@ -1877,10 +1927,10 @@ fn run_postmortem(args: &[String]) -> i32 {
         let ws = path.map(String::as_str).unwrap_or("(built-in demo)");
         let record = ccos::postmortem::export(&session, ws, 4096);
         println!("{}", serde_json::to_string_pretty(&record).unwrap());
-        return 0;
+        return Ok(());
     }
     ccos::postmortem::serve(session);
-    0
+    Ok(())
 }
 
 /// `ccos eval [--tasks N] [--seed S] [--budget T] [--model M] [--json]` — the
@@ -1890,7 +1940,7 @@ fn run_postmortem(args: &[String]) -> i32 {
 /// runs an offline stub (every answer wrong) to exercise the pipeline. `--model`
 /// overrides the active provider's model (defaulting to a local Ollama server if
 /// no provider env is set).
-async fn run_eval_cmd(args: &[String]) -> i32 {
+async fn run_eval_cmd(args: &[String]) -> CliResult {
     let mut cfg = EvalConfig::default();
     let mut json = false;
     let mut model: Option<String> = None;
@@ -1954,7 +2004,7 @@ async fn run_eval_cmd(args: &[String]) -> i32 {
     if json {
         let out = serde_json::json!({ "clean": clean, "noisy": noisy });
         println!("{}", serde_json::to_string_pretty(&out).unwrap());
-        return 0;
+        return Ok(());
     }
 
     let strategies = [
@@ -2020,7 +2070,7 @@ async fn run_eval_cmd(args: &[String]) -> i32 {
         &noisy,
         "NOISY query (a decoy out-matches the target lexically)",
     );
-    0
+    Ok(())
 }
 
 /// Recursively collect `.rs` files, skipping `target/`, VCS and hidden dirs.
@@ -2067,7 +2117,7 @@ fn truncate(s: &str, max: usize) -> String {
 /// residue for injection with a per-feature forensic decomposition. `--strict`
 /// exits non-zero when a high-severity anomaly or a flagged injection is found
 /// (handy as a pre-commit / CI gate).
-fn run_sanitize(args: &[String]) -> i32 {
+fn run_sanitize(args: &[String]) -> CliResult {
     use ccos::injection_classifier::InjectionDetector;
     use ccos::sanitizer::{self, Severity};
 
@@ -2080,8 +2130,9 @@ fn run_sanitize(args: &[String]) -> i32 {
             "--strict" => strict = true,
             s if !s.starts_with("--") => path = Some(s.to_string()),
             other => {
-                eprintln!("ccos sanitize: unknown flag '{other}'");
-                return 2;
+                return Err(CliError::usage(format!(
+                    "ccos sanitize: unknown flag '{other}'"
+                )));
             }
         }
     }
@@ -2091,16 +2142,14 @@ fn run_sanitize(args: &[String]) -> i32 {
             use std::io::Read;
             let mut s = String::new();
             if std::io::stdin().read_to_string(&mut s).is_err() {
-                eprintln!("ccos sanitize: failed to read stdin");
-                return 1;
+                return Err(CliError::fail("ccos sanitize: failed to read stdin"));
             }
             s
         }
         Some(p) => match std::fs::read_to_string(p) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("ccos sanitize: {p}: {e}");
-                return 1;
+                return Err(CliError::fail(format!("ccos sanitize: {p}: {e}")));
             }
         },
     };
@@ -2173,9 +2222,9 @@ fn run_sanitize(args: &[String]) -> i32 {
     }
 
     if strict && dangerous {
-        1
+        Err(CliError::status(1))
     } else {
-        0
+        Ok(())
     }
 }
 

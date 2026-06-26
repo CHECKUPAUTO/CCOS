@@ -357,9 +357,10 @@ honesty code↔docs↔paper, tests/API). **Fixed in this pass:**
   `id`/`timestamp` so the chain stays reproducible). `EventLog::verify_integrity`
   detects any payload tamper, reorder, insertion or deletion, and `ccos verify` /
   `ccos replay` check it on every run. See `src/event_log.rs`.
-3. **Semantic edges.** (L) — *call-graph half done* (fn→fn `Calls` edges: bare, qualified, and
-   `self`/`Self` method calls — see #74/#75/#76/#77 and `src/memory.rs::resolve_symbol_calls`).
-   **Remaining: data-flow edges** (who writes/reads which variable) and call-graph polish
+3. **Semantic edges.** (L) — *both halves now underway.* Call-graph (fn→fn `Calls`: bare,
+   qualified, `self`/`Self` methods — #74/#75/#76/#77) **and data-flow** (`fn → static/const`
+   `DataFlow` edges, Slice 1: `src/memory.rs::resolve_data_flow`, global-unique resolve-or-skip).
+   Remaining: data-flow qualified `m::CONST` + write/read direction; call-graph polish
    (`x.bar()` receiver-type inference, renamed-import alias calls, cross-impl-block self-calls).
 
 ### P2 — Ergonomics
@@ -381,8 +382,10 @@ honesty code↔docs↔paper, tests/API). **Fixed in this pass:**
 8. ✅ **Property tests** — *done.* `proptest` covers graph invariants under random edit sequences
    (`tests/property_invariants.rs`), edit determinism, parser ingestion (`tests/integration_ccos.rs`),
    and snapshot round-trips (`tests/snapshot_roundtrip_property.rs`).
-9. **Result-returning CLI commands** end-to-end (thread `Result` instead of
-   ad-hoc exit codes). (S)
+9. ✅ **Result-returning CLI commands** — *done.* A `CliError { code, message }` / `CliResult`
+   abstraction threads `Result` through all 17 command handlers; `main()` maps the final result to
+   the exact exit code (status-only failures keep their printed report, error messages print once).
+   Exit-code behaviour byte-identical (`tests/cli.rs` asserts it). See `src/main.rs`.
 
 ---
 
@@ -390,5 +393,5 @@ honesty code↔docs↔paper, tests/API). **Fixed in this pass:**
 
 ~~`P0.1 (syn)`~~ ✅ → ~~`P1.2 (canonical log)`~~ ✅ → ~~`P1.3 (call graph, Slices 1–3a)`~~ ✅ →
 ~~`P2.5 (benches)`~~ ✅ → ~~`P2.6 (analyze extras)`~~ ✅ → ~~`P3.8 (property tests)`~~ ✅ →
-~~`P2.4 (config)`~~ ✅ → **`P3.9 (Result CLI)`** (last quick win) → **`P1.3 data-flow edges`**
-(the next depth jump) → call-graph polish.
+~~`P2.4 (config)`~~ ✅ → ~~`P3.9 (Result CLI)`~~ ✅ → **`P1.3 data-flow edges`**
+(the next depth jump) → call-graph polish. **All P2/P3 quick wins are now done.**

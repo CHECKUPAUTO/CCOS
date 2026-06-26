@@ -111,6 +111,12 @@ pub enum EdgeType {
     /// (a call crosses files even when the two functions share no vocabulary). Appended last so
     /// the enum's serialized form is strictly additive — old snapshots never contain `Calls`.
     Calls,
+    /// A `function → static/const` data-flow edge: the function reads (references) a module-level
+    /// `static`/`const` item, resolved from in-body data-references by
+    /// [`MemoryGraph::resolve_data_flow`]. Captures the shared-mutable-state channel that connects
+    /// functions through globals — invisible to call and import edges. Appended last so the
+    /// serialized form stays strictly additive.
+    DataFlow,
 }
 
 /// Tunable coefficients of the causal score and failure-propagation decay.
@@ -382,6 +388,15 @@ pub struct MemoryGraph {
     /// deterministic iteration.
     #[serde(skip)]
     pending_calls: BTreeMap<String, Vec<(String, String, usize)>>,
+    /// In-body `static`/`const` references awaiting resolution into `DataFlow` edges, keyed by
+    /// source file → `(reader, name, line)`. Same **runtime-only** contract as `pending_calls`.
+    #[serde(skip)]
+    pending_data_refs: BTreeMap<String, Vec<(String, String, usize)>>,
+    /// Node ids of `static`/`const` symbols (the only valid `DataFlow` targets). The graph node
+    /// stores `NodeType`, not the finer `SymbolKind`, so the parser marks these at ingest. Runtime
+    /// -only; rebuilt on the replay re-ingest, and filtered to still-resident nodes at resolve time.
+    #[serde(skip)]
+    data_symbols: std::collections::BTreeSet<NodeId>,
 }
 
 /// Cache value behind [`MemoryGraph::node_eigencentrality`]: the centrality vector keyed
@@ -616,6 +631,8 @@ impl MemoryGraph {
             indegree_cache: RefCell::new(None),
             eigencentrality_cache: RefCell::new(None),
             pending_calls: BTreeMap::new(),
+            pending_data_refs: BTreeMap::new(),
+            data_symbols: std::collections::BTreeSet::new(),
         }
     }
 
@@ -2185,6 +2202,75 @@ impl MemoryGraph {
         }
     }
 
+    /// Record a file's in-body `static`/`const` references, awaiting
+    /// [`resolve_data_flow`](Self::resolve_data_flow). Mirrors
+    /// [`set_pending_calls`](Self::set_pending_calls).
+    pub fn set_pending_data_refs(&mut self, file: &str, refs: Vec<(String, String, usize)>) {
+        if refs.is_empty() {
+            self.pending_data_refs.remove(file);
+        } else {
+            self.pending_data_refs.insert(file.to_string(), refs);
+        }
+    }
+
+    /// Mark a symbol node as a `static`/`const` — the only valid `DataFlow` target. The parser
+    /// calls this at ingest (the graph node itself does not carry `SymbolKind`).
+    pub fn mark_data_symbol(&mut self, id: NodeId) {
+        self.data_symbols.insert(id);
+    }
+
+    /// Resolve recorded `static`/`const` references into `reader → item` [`EdgeType::DataFlow`]
+    /// edges — the shared-global-state channel call and import edges miss (a function reads a
+    /// global defined in a file it never imports by name). A **whole-graph** pass, run after
+    /// [`resolve_symbol_calls`](Self::resolve_symbol_calls). Resolution is **global-unique,
+    /// resolve-uniquely-or-skip**: a reference to `X` links only when exactly one resident
+    /// `static`/`const` named `X` exists graph-wide, so a wrong edge is never invented. Self-edges
+    /// dropped. Deterministic: indices over the **sorted** `data_symbols`/`pending_data_refs`,
+    /// candidate edges sorted+deduped before insertion. Returns the number of `DataFlow` edges added.
+    pub fn resolve_data_flow(&mut self) -> usize {
+        // Build the global-unique index from resident data symbols, then collect candidate edges —
+        // in an inner scope so its borrows of `self` end before the mutating `add_edge` below.
+        let mut to_add: Vec<(NodeId, NodeId)> = {
+            let mut name_count: HashMap<&str, u32> = HashMap::new();
+            let mut name_first: HashMap<&str, &NodeId> = HashMap::new();
+            for id in &self.data_symbols {
+                if !self.nodes.contains_key(id) {
+                    continue; // evicted since it was marked — skip the stale entry
+                }
+                if let Some((_, name)) = id.0.rsplit_once(':') {
+                    *name_count.entry(name).or_insert(0) += 1;
+                    name_first.entry(name).or_insert(id);
+                }
+            }
+            let mut acc: Vec<(NodeId, NodeId)> = Vec::new();
+            for (file, refs) in &self.pending_data_refs {
+                for (reader, name, _line) in refs {
+                    let reader_sym = NodeId(format!("sym:{file}:{reader}"));
+                    if !self.nodes.contains_key(&reader_sym) {
+                        continue;
+                    }
+                    if name_count.get(name.as_str()).copied() == Some(1) {
+                        if let Some(target) = name_first.get(name.as_str()) {
+                            if **target != reader_sym {
+                                acc.push((reader_sym.clone(), (*target).clone()));
+                            }
+                        }
+                    }
+                }
+            }
+            acc
+        };
+        to_add.sort();
+        to_add.dedup();
+        let mut added = 0usize;
+        for (s, t) in to_add {
+            if self.add_edge(s, t, 0.6, EdgeType::DataFlow) {
+                added += 1;
+            }
+        }
+        added
+    }
+
     /// Resolve recorded call-sites into `caller → callee` [`EdgeType::Calls`] edges — the fn→fn
     /// structure import edges miss (a call crosses files even when the two functions share no
     /// vocabulary). A **whole-graph** pass (a call may target a symbol in a file ingested later);
@@ -3107,6 +3193,67 @@ mod tests {
             .collect();
         v.sort();
         v
+    }
+
+    fn data_flow_of(g: &MemoryGraph) -> Vec<(String, String)> {
+        let mut v: Vec<(String, String)> = g
+            .edges()
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::DataFlow)
+            .map(|e| (e.source.0.clone(), e.target.0.clone()))
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn resolve_data_flow_links_reader_to_global_unique_static() {
+        // `reader()` references `CONFIG`, a uniquely-named const in config.rs → a `DataFlow` edge,
+        // the shared-state channel call/import edges miss.
+        let mut g = graph_with_defs(&[("src/config.rs", "CONFIG"), ("src/api.rs", "reader")]);
+        g.mark_data_symbol(NodeId("sym:src/config.rs:CONFIG".into()));
+        g.set_pending_data_refs("src/api.rs", vec![("reader".into(), "CONFIG".into(), 1)]);
+        g.resolve_data_flow();
+        assert_eq!(
+            data_flow_of(&g),
+            vec![(
+                "sym:src/api.rs:reader".to_string(),
+                "sym:src/config.rs:CONFIG".to_string()
+            )],
+            "reader → CONFIG data-flow edge"
+        );
+    }
+
+    #[test]
+    fn resolve_data_flow_skips_ambiguous_global_name() {
+        // `CONFIG` defined in two files (ambiguous) → the reference skips (resolve-uniquely-or-skip).
+        let mut g = graph_with_defs(&[
+            ("src/a.rs", "CONFIG"),
+            ("src/b.rs", "CONFIG"),
+            ("src/api.rs", "reader"),
+        ]);
+        g.mark_data_symbol(NodeId("sym:src/a.rs:CONFIG".into()));
+        g.mark_data_symbol(NodeId("sym:src/b.rs:CONFIG".into()));
+        g.set_pending_data_refs("src/api.rs", vec![("reader".into(), "CONFIG".into(), 1)]);
+        g.resolve_data_flow();
+        assert!(
+            data_flow_of(&g).is_empty(),
+            "an ambiguous global static name skips — no guessed edge"
+        );
+    }
+
+    #[test]
+    fn resolve_data_flow_skips_reference_to_non_data_symbol() {
+        // `HELPER` exists as a symbol but is NOT a static/const (it was never marked) — e.g. a
+        // SCREAMING-named function. A reference to it must not become a data-flow edge.
+        let mut g = graph_with_defs(&[("src/x.rs", "HELPER"), ("src/api.rs", "reader")]);
+        // deliberately do NOT mark HELPER as a data symbol
+        g.set_pending_data_refs("src/api.rs", vec![("reader".into(), "HELPER".into(), 1)]);
+        g.resolve_data_flow();
+        assert!(
+            data_flow_of(&g).is_empty(),
+            "a reference resolving to a non-static/const symbol is not a data-flow edge"
+        );
     }
 
     #[test]

@@ -20,6 +20,23 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Data-flow semantic edges — `EdgeType::DataFlow` (ROADMAP P1.3, the second half of "semantic
+  edges").** The `syn` AST captures in-body references to module-level `static`/`const` items
+  (Slice 1: bare `SCREAMING_SNAKE` value paths — the Rust convention, which precisely excludes
+  PascalCase types and snake_case fns/locals). A deterministic whole-graph pass
+  (`MemoryGraph::resolve_data_flow`, run after call resolution) links each `reader → item` with a
+  `DataFlow` edge when **exactly one** resident `static`/`const` of that name exists graph-wide
+  (**resolve-uniquely-or-skip**, so a wrong edge is never invented) — the shared-global-state
+  channel that call and import edges miss (a function reads a global defined in a file it never
+  imports by name). The graph node carries `NodeType` not `SymbolKind`, so the parser marks the
+  data-symbols at ingest; the references live in a transient `#[serde(skip)]` field (only the edges
+  persist, rebuilt on the replay re-ingest → `replay == live` holds). Off on the heuristic path.
+  A **scope guard** excludes locally-bound names (parameters, `let`s, fn-local `const`/`static`)
+  from capture, so a local never mislinks to a same-named global — closing the cardinal false-edge
+  an adversarial review found. Slice 1 covers bare references resolved global-unique; qualified
+  `m::CONST`, same-module disambiguation, write/read direction, and the rare residual (a bare
+  `SCREAMING`-cased `use`-imported enum variant coinciding with a global const) are later slices.
+
 - **Call-graph semantic edges — `EdgeType::Calls` (ROADMAP P1.3, Slice 1).** The `syn` AST
   now extracts in-body function-call sites; a deterministic whole-graph pass
   (`MemoryGraph::resolve_symbol_calls`) resolves each `caller → callee` via a strict
