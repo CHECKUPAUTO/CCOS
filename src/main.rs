@@ -243,6 +243,9 @@ fn run_analyze(opts: &AnalyzeOpts) -> i32 {
         Vec::new()
     };
     let orphans = graph.orphan_nodes().len();
+    // Dead-symbol *candidates*: symbols nothing references (heuristic — pub API, `main`, and
+    // trait-impl methods reached from outside the analyzed set are false positives).
+    let dead = graph.dead_symbols();
 
     if let Some(dot_path) = &opts.dot {
         match std::fs::write(dot_path, graph.to_dot()) {
@@ -271,6 +274,7 @@ fn run_analyze(opts: &AnalyzeOpts) -> i32 {
             "cross_file_edges": cross_edges,
             "dangling_edges": dangling,
             "orphan_nodes": orphans,
+            "dead_symbol_candidates": dead.iter().map(|id| &id.0).collect::<Vec<_>>(),
             "dependency_cycles": cycles.len(),
             "node_types": types,
             "top_nodes": top,
@@ -286,6 +290,23 @@ fn run_analyze(opts: &AnalyzeOpts) -> i32 {
         println!("  Events logged:   {}", event_log.event_count());
         println!("  Dangling edges:  {dangling} (must be 0)");
         println!("  Orphan nodes:    {orphans}");
+        println!(
+            "  Dead symbols:    {} (unreferenced; heuristic)",
+            dead.len()
+        );
+
+        if !dead.is_empty() {
+            println!(
+                "\n─── Potentially unreferenced symbols ({}) ───",
+                dead.len()
+            );
+            for id in dead.iter().take(10) {
+                println!("    {}", truncate(&id.0, 46));
+            }
+            if dead.len() > 10 {
+                println!("    … (+{} more)", dead.len() - 10);
+            }
+        }
 
         println!("\n─── Node types ───");
         for (ty, count) in graph.node_type_counts() {
