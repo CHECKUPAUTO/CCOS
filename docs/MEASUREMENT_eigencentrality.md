@@ -65,5 +65,31 @@ because eviction acts on a thin resident slice where the difference collapses. S
 This is the same measure-first discipline as the recall/RAG result: build the capability, measure
 where it helps, and let the measurement — not the intuition — decide where to invest next.
 
+## Follow-up: the full graph, on real code (`examples/pillar_ranking.rs`)
+
+The verdict above said the eigenvector payoff is the **full** graph (where the whole hierarchy is
+visible), not the resident slice. So the next test runs it there: parse CCOS's *own* source into one
+fully-resident causal graph (~1.8k nodes), and rank the **file** nodes by in-degree vs eigenvector
+centrality — scored against an objective ground truth, each file's **transitive-dependent count**
+(`query::source_set`, i.e. how much of the system depends on it).
+
+| signal | Spearman vs. transitive dependents |
+|--------|:----------------------------------:|
+| in-degree (local) | **0.936** |
+| eigenvector centrality (global) | 0.892 |
+
+Both predict the real pillars well, and the two rankings are nearly identical (top files:
+`memory.rs`, `util.rs`, `event_log.rs`, `context_region.rs`). But the **local in-degree predicts
+structural importance *slightly better* than the global eigenvector** — the spectral sophistication
+does not pay off even on the full graph. The reason is structural: a real code dependency graph is
+**shallow** (importer→imported chains are short), so importance is overwhelmingly *direct*, and the
+eigenvector's recursive weighting adds variance rather than signal.
+
+**Two independent measurements now agree:** the rank-2 spectrum does not beat a simple count on
+CCOS — once at eviction (tie), once at full-graph pillar ranking (in-degree wins, 0.936 vs 0.892).
+That is the honest baseline any higher-rank / "tensor" elaboration has to beat to earn its
+complexity. It does not close the door on the direction, but it sets the bar: a new dimension must
+**measurably** out-predict in-degree before it ships.
+
 [`CentralityMode::Eigenvector`]: ../src/memory.rs
 [`MemoryGraph::eigencentrality`]: ../src/memory.rs
