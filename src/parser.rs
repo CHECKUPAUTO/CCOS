@@ -18,6 +18,13 @@ pub struct ParseResult {
     /// skip-if-empty serde contract — empty on the heuristic path and for call-free bodies.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub data_refs: Vec<DataRef>,
+    /// Renamed-import bindings — one per `use a::b as c` (including inside groups). Records the
+    /// LOCAL name (`c`) and the ORIGINAL target path (`a::b`) so a later call to the alias (`c()`
+    /// or qualified `c::X`) resolves to the real definition. Only the `syn` (real-AST) path can
+    /// see a rename; the heuristic fallback leaves this empty (same skip-if-empty serde contract as
+    /// `call_sites`/`data_refs`, so the common no-alias case serializes unchanged).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub import_aliases: Vec<ImportAlias>,
     pub generated_nodes: usize,
     pub generated_edges: usize,
 }
@@ -70,6 +77,18 @@ pub struct DataRef {
     pub line: usize,
 }
 
+/// A **renamed import**: `use a::b as c` binds the LOCAL name `local` (`c`) to the ORIGINAL target
+/// path `target` (`a::b`). A later call to the alias — bare `c()` or qualified `c::X` — is resolved
+/// by [`crate::memory::MemoryGraph::resolve_symbol_calls`] by rewriting the alias's leading segment
+/// through `target`, so the edge lands on `a::b`'s real definition (never on a same-named sibling
+/// module/symbol). The plain (non-renamed) `use a::b` keeps the local name `b`, so it needs no
+/// entry here. Only emitted on the `syn` (real-AST) path; empty on the heuristic fallback.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportAlias {
+    pub local: String,
+    pub target: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum SymbolKind {
     Function,
@@ -94,7 +113,7 @@ impl ASTParser {
 
     pub fn parse_source(&self, file_path: &str, source_code: &str) -> ParseResult {
         let hash = Self::compute_hash(source_code);
-        let (modules, use_statements, symbols, call_sites, data_refs) =
+        let (modules, use_statements, symbols, call_sites, data_refs, import_aliases) =
             Self::extract_all(source_code);
 
         ParseResult {
@@ -107,6 +126,7 @@ impl ASTParser {
             symbols,
             call_sites,
             data_refs,
+            import_aliases,
         }
     }
 
@@ -125,6 +145,7 @@ impl ASTParser {
         Vec<Symbol>,
         Vec<CallSite>,
         Vec<DataRef>,
+        Vec<ImportAlias>,
     ) {
         #[cfg(feature = "syn-parser")]
         {
@@ -132,13 +153,14 @@ impl ASTParser {
                 return parsed;
             }
         }
-        // Heuristic fallback emits no call-sites or data-refs (it does not parse expression
-        // trees), so the call/data-flow graphs simply stay empty on that path — a build can only
-        // ever *omit* those edges.
+        // Heuristic fallback emits no call-sites, data-refs, or import aliases (it does not parse
+        // expression trees or `use`-tree renames), so the call/data-flow graphs simply stay empty
+        // on that path — a build can only ever *omit* those edges.
         (
             Self::extract_modules(source),
             Self::extract_uses(source),
             Self::extract_symbols(source),
+            Vec::new(),
             Vec::new(),
             Vec::new(),
         )
@@ -275,6 +297,16 @@ impl ASTParser {
                 .data_refs
                 .iter()
                 .map(|d| (d.reader.clone(), d.name.clone(), d.line))
+                .collect(),
+        );
+        // And this file's renamed-import bindings (`use a::b as c` → local `c` ↦ target `a::b`),
+        // consulted by `resolve_symbol_calls` so a call to the alias resolves to the real target.
+        graph.set_pending_aliases(
+            &result.file_path,
+            result
+                .import_aliases
+                .iter()
+                .map(|a| (a.local.clone(), a.target.clone()))
                 .collect(),
         );
     }
@@ -744,7 +776,7 @@ fn symbol_span(lines: &[&str], start_line: usize) -> (usize, usize) {
 /// natively. Returns `None` on a syntax error so the caller can fall back.
 #[cfg(feature = "syn-parser")]
 mod syn_ast {
-    use super::{CallSite, DataRef, ModuleDecl, Symbol, SymbolKind, UseStatement};
+    use super::{CallSite, DataRef, ImportAlias, ModuleDecl, Symbol, SymbolKind, UseStatement};
     use proc_macro2::Span;
     use std::collections::HashSet;
     use syn::spanned::Spanned;
@@ -759,11 +791,19 @@ mod syn_ast {
         Vec<Symbol>,
         Vec<CallSite>,
         Vec<DataRef>,
+        Vec<ImportAlias>,
     )> {
         let file = syn::parse_file(source).ok()?;
         let mut out = Collected::default();
         walk(&file.items, &mut out);
-        Some((out.modules, out.uses, out.symbols, out.calls, out.data_refs))
+        Some((
+            out.modules,
+            out.uses,
+            out.symbols,
+            out.calls,
+            out.data_refs,
+            out.aliases,
+        ))
     }
 
     #[derive(Default)]
@@ -773,6 +813,7 @@ mod syn_ast {
         symbols: Vec<Symbol>,
         calls: Vec<CallSite>,
         data_refs: Vec<DataRef>,
+        aliases: Vec<ImportAlias>,
     }
 
     /// Collects single-segment free-function call-sites from a function body, in source
@@ -960,6 +1001,7 @@ mod syn_ast {
                     }
                     out.uses.append(&mut child.uses);
                     out.symbols.append(&mut child.symbols);
+                    out.aliases.append(&mut child.aliases);
                     out.modules.push(ModuleDecl {
                         name: m.ident.to_string(),
                         line: line_of(m.ident.span()),
@@ -968,7 +1010,13 @@ mod syn_ast {
                     });
                 }
                 syn::Item::Use(u) => {
-                    flatten_use(&u.tree, String::new(), line_of(u.span()), &mut out.uses);
+                    flatten_use(
+                        &u.tree,
+                        String::new(),
+                        line_of(u.span()),
+                        &mut out.uses,
+                        &mut out.aliases,
+                    );
                 }
                 syn::Item::Fn(f) => {
                     push_sym(out, &f.sig.ident, SymbolKind::Function);
@@ -1047,8 +1095,16 @@ mod syn_ast {
     }
 
     /// Expand a (possibly grouped) `use` tree into one `UseStatement` per leaf
-    /// path, e.g. `use a::{b, c::d}` → `a::b` and `a::c::d`.
-    fn flatten_use(tree: &syn::UseTree, prefix: String, line: usize, out: &mut Vec<UseStatement>) {
+    /// path, e.g. `use a::{b, c::d}` → `a::b` and `a::c::d`. A renamed leaf
+    /// (`use a::b as c`, including inside a group) additionally records an
+    /// [`ImportAlias`] binding `c ↦ a::b` in `aliases`.
+    fn flatten_use(
+        tree: &syn::UseTree,
+        prefix: String,
+        line: usize,
+        out: &mut Vec<UseStatement>,
+        aliases: &mut Vec<ImportAlias>,
+    ) {
         let join = |p: &str, s: &str| {
             if p.is_empty() {
                 s.to_string()
@@ -1057,20 +1113,31 @@ mod syn_ast {
             }
         };
         match tree {
-            syn::UseTree::Path(p) => {
-                flatten_use(&p.tree, join(&prefix, &p.ident.to_string()), line, out)
-            }
+            syn::UseTree::Path(p) => flatten_use(
+                &p.tree,
+                join(&prefix, &p.ident.to_string()),
+                line,
+                out,
+                aliases,
+            ),
             syn::UseTree::Name(n) => push_use(join(&prefix, &n.ident.to_string()), line, out),
-            // A renamed import `use a::b as c` binds `b` under the name `c`. We record the ORIGINAL
-            // path (`a::b`) so import-linking resolves the real module. Call-resolution by the alias
-            // `c` is deferred: a single path string cannot carry alias→real-module, and recording
-            // the alias instead (`a::c`) would mislink a call `c::foo()` to a real sibling module
-            // `c` if one exists (a wrong-existing-target edge). Proper alias support is future work.
-            syn::UseTree::Rename(r) => push_use(join(&prefix, &r.ident.to_string()), line, out),
+            // A renamed import `use a::b as c` binds the target `a::b` under the LOCAL name `c`.
+            // Record the ORIGINAL path (`a::b`) as the `UseStatement` so import-linking still
+            // resolves the real module (identical to a plain `use a::b`), AND record the alias
+            // binding `c ↦ a::b` so `resolve_symbol_calls` can rewrite a call to `c` onto the real
+            // target — never onto a same-named sibling module/symbol `c`.
+            syn::UseTree::Rename(r) => {
+                let target = join(&prefix, &r.ident.to_string());
+                aliases.push(ImportAlias {
+                    local: r.rename.to_string(),
+                    target: target.clone(),
+                });
+                push_use(target, line, out);
+            }
             syn::UseTree::Glob(_) => push_use(join(&prefix, "*"), line, out),
             syn::UseTree::Group(g) => {
                 for t in &g.items {
-                    flatten_use(t, prefix.clone(), line, out);
+                    flatten_use(t, prefix.clone(), line, out, aliases);
                 }
             }
         }
@@ -1503,5 +1570,210 @@ mod syn_tests {
         assert!(r.symbols.iter().any(|s| s.name == "real"));
         assert!(!r.symbols.iter().any(|s| s.name == "commented"));
         assert!(!r.symbols.iter().any(|s| s.name == "blocked"));
+    }
+
+    // ── Renamed-import alias support (`use a::b as c`) ────────────────────────────────────────
+
+    #[test]
+    fn syn_records_top_level_rename_alias() {
+        // `use a::b as c` records the LOCAL name `c` bound to the ORIGINAL target path `a::b`. The
+        // `UseStatement` keeps the original path (so import-linking is unchanged from `use a::b`).
+        let r = ASTParser::new().parse_source("t.rs", "use a::b as c;");
+        assert_eq!(r.import_aliases.len(), 1);
+        assert_eq!(r.import_aliases[0].local, "c");
+        assert_eq!(r.import_aliases[0].target, "a::b");
+        assert!(
+            r.use_statements.iter().any(|u| u.full_path == "a::b"),
+            "the original path is still recorded as a use statement, got {:?}",
+            r.use_statements
+                .iter()
+                .map(|u| &u.full_path)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn syn_records_alias_inside_group_and_nested_group() {
+        // Aliases inside a group — `use a::{b, c as d}` — and inside a NESTED group —
+        // `use a::{e::{f as g}}` — must both be captured, each with the full target path.
+        let r = ASTParser::new().parse_source("t.rs", "use a::{b, c as d, e::{f as g}};");
+        let mut got: Vec<(String, String)> = r
+            .import_aliases
+            .iter()
+            .map(|a| (a.local.clone(), a.target.clone()))
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("d".to_string(), "a::c".to_string()),
+                ("g".to_string(), "a::e::f".to_string()),
+            ],
+            "group + nested-group aliases captured with full target paths"
+        );
+        // The non-renamed member `b` is a plain import, not an alias.
+        assert!(r.use_statements.iter().any(|u| u.full_path == "a::b"));
+    }
+
+    #[test]
+    fn syn_glob_import_still_works_and_is_not_an_alias() {
+        // `use a::*` must keep producing an `a::*` use statement and record NO alias.
+        let r = ASTParser::new().parse_source("t.rs", "use a::*;");
+        assert!(
+            r.use_statements.iter().any(|u| u.full_path == "a::*"),
+            "glob import is preserved, got {:?}",
+            r.use_statements
+                .iter()
+                .map(|u| &u.full_path)
+                .collect::<Vec<_>>()
+        );
+        assert!(r.import_aliases.is_empty(), "a glob is not a rename");
+    }
+
+    /// Build a graph from `(path, src)` files through the real parser, then run the
+    /// import/call resolution passes. Returns the resolved `Calls` edges as `(src_id, dst_id)`
+    /// pairs (sorted), i.e. the exact fn→fn structure the call graph encodes.
+    fn calls_edges_of(files: &[(&str, &str)]) -> Vec<(String, String)> {
+        let p = ASTParser::new();
+        let mut g = MemoryGraph::new(0.0, usize::MAX);
+        for (path, src) in files {
+            let r = p.parse_source(path, src);
+            p.update_memory_graph(&r, src, &mut g);
+        }
+        g.link_module_imports();
+        g.resolve_symbol_calls();
+        let mut edges: Vec<(String, String)> = g
+            .edges()
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::Calls)
+            .map(|e| (e.source.0.clone(), e.target.0.clone()))
+            .collect();
+        edges.sort();
+        edges
+    }
+
+    #[test]
+    fn syn_alias_call_resolves_to_original_target() {
+        // `use crate::a::b as c; ... c()` — the alias call resolves to `a::b`'s symbol, end to end.
+        let edges = calls_edges_of(&[
+            ("src/a.rs", "pub fn b() {}"),
+            ("src/api.rs", "use crate::a::b as c;\nfn caller() { c(); }"),
+        ]);
+        assert!(
+            edges.contains(&(
+                "sym:src/api.rs:caller".to_string(),
+                "sym:src/a.rs:b".to_string()
+            )),
+            "aliased call c() resolves to a::b, got {edges:?}"
+        );
+    }
+
+    #[test]
+    fn syn_alias_call_inside_group_resolves() {
+        // The alias is declared inside a group — `use crate::a::{x as y}` — and `y()` resolves to x.
+        let edges = calls_edges_of(&[
+            ("src/a.rs", "pub fn x() {}"),
+            (
+                "src/api.rs",
+                "use crate::a::{x as y};\nfn caller() { y(); }",
+            ),
+        ]);
+        assert!(
+            edges.contains(&(
+                "sym:src/api.rs:caller".to_string(),
+                "sym:src/a.rs:x".to_string()
+            )),
+            "grouped alias call y() resolves to a::x, got {edges:?}"
+        );
+    }
+
+    #[test]
+    fn syn_qualified_alias_call_resolves() {
+        // A qualified call through the alias — `use crate::a::b as c; ... c::CONST` (rewritten to
+        // `crate::a::b::CONST`) resolves to the symbol in module `a::b`.
+        let edges = calls_edges_of(&[
+            ("src/a/b.rs", "pub fn deep() {}"),
+            (
+                "src/api.rs",
+                "use crate::a::b as c;\nfn caller() { c::deep(); }",
+            ),
+        ]);
+        assert!(
+            edges.contains(&(
+                "sym:src/api.rs:caller".to_string(),
+                "sym:src/a/b.rs:deep".to_string()
+            )),
+            "qualified alias call c::deep() resolves to a::b::deep, got {edges:?}"
+        );
+    }
+
+    #[test]
+    fn syn_alias_with_missing_target_is_skipped() {
+        // The alias target `crate::a::nope` has NO resident symbol → resolve-uniquely-or-skip yields
+        // NO edge (a false edge would be the bug). `a.rs` defines only an unrelated `other`.
+        let edges = calls_edges_of(&[
+            ("src/a.rs", "pub fn other() {}"),
+            (
+                "src/api.rs",
+                "use crate::a::nope as c;\nfn caller() { c(); }",
+            ),
+        ]);
+        assert!(
+            !edges.iter().any(|(s, _)| s == "sym:src/api.rs:caller"),
+            "alias to a non-existent target must add no Calls edge, got {edges:?}"
+        );
+    }
+
+    #[test]
+    fn syn_alias_does_not_collide_with_same_named_real_symbol() {
+        // There is a REAL `fn c` in another module (`z`). `api.rs` aliases `crate::a::b as c` and
+        // calls `c()`. The alias must win — the call resolves to `a::b`, NEVER cross-linking to the
+        // unrelated real `z::c` (which is what bare global-unique resolution would have done).
+        let edges = calls_edges_of(&[
+            ("src/a.rs", "pub fn b() {}"),
+            ("src/z.rs", "pub fn c() {}"),
+            ("src/api.rs", "use crate::a::b as c;\nfn caller() { c(); }"),
+        ]);
+        assert!(
+            edges.contains(&(
+                "sym:src/api.rs:caller".to_string(),
+                "sym:src/a.rs:b".to_string()
+            )),
+            "aliased c() resolves to a::b, got {edges:?}"
+        );
+        assert!(
+            !edges.contains(&(
+                "sym:src/api.rs:caller".to_string(),
+                "sym:src/z.rs:c".to_string()
+            )),
+            "the alias must NOT cross-link to the same-named real z::c, got {edges:?}"
+        );
+    }
+
+    #[test]
+    fn syn_alias_resolution_is_deterministic() {
+        // The same source must yield byte-for-byte identical Calls edges across runs (the replay
+        // invariant): indices over sorted ids, sorted+deduped candidate edges.
+        let files: &[(&str, &str)] = &[
+            ("src/a.rs", "pub fn b() {}"),
+            ("src/z.rs", "pub fn c() {}"),
+            (
+                "src/api.rs",
+                "use crate::a::{b as c, b as e};\nfn caller() { c(); e(); }",
+            ),
+        ];
+        let first = calls_edges_of(files);
+        for _ in 0..5 {
+            assert_eq!(first, calls_edges_of(files), "alias edges must be stable");
+        }
+        // Both aliases (`b as c`, `b as e`) point at the same target, so exactly one caller→b edge.
+        assert_eq!(
+            first,
+            vec![(
+                "sym:src/api.rs:caller".to_string(),
+                "sym:src/a.rs:b".to_string()
+            )],
+            "two aliases to one target dedupe to a single edge, got {first:?}"
+        );
     }
 }
