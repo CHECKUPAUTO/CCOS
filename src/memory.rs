@@ -2167,7 +2167,10 @@ impl MemoryGraph {
     /// vocabulary). A **whole-graph** pass (a call may target a symbol in a file ingested later);
     /// run right after [`link_module_imports`](Self::link_module_imports). Resolution is a strict
     /// precision ladder, **resolve-uniquely-or-skip** at every tier, so a wrong edge is never
-    /// invented. A **qualified** callee (`mod::…::name`, Slice 2) resolves its module prefix to a
+    /// invented. A **`Self::method`** callee (a captured `self.m()` or `Self::assoc()`, Slice 3)
+    /// resolves the method name in the caller's OWN module only — never via imports or global-unique,
+    /// so a method is never mislinked to a same-named free function elsewhere. A **qualified** callee
+    /// (`mod::…::name`, Slice 2) resolves its module prefix to a
     /// file — crate-rooted (`crate::m::name`) directly, or an `alias::name` by expanding the leading
     /// segment through the file's imports — then takes `sym:<file>:name`; unresolvable/ambiguous
     /// qualified paths skip without falling back. A **bare** callee (`foo()`, Slice 1) uses the
@@ -2557,6 +2560,15 @@ fn resolve_call(
     name_count: &HashMap<String, u32>,
     name_first: &HashMap<String, NodeId>,
 ) -> Option<NodeId> {
+    // Slice 3 — `Self::method` (a captured `self.m()` or `Self::assoc()`): the receiver is the
+    // enclosing impl's type, whose methods live in the caller's own file/module. Resolve the method
+    // name there ONLY — never via imports (Tier A) or global-unique (Tier C), so a method is never
+    // mislinked to a free function of the same name elsewhere. Unresolvable → skip.
+    if let Some(method) = callee.strip_prefix("Self::") {
+        return defs
+            .get(&(fcrate.to_string(), fmodule.to_string(), method.to_string()))
+            .cloned();
+    }
     // Slice 2 — qualified path `mod::…::name`: pin the module prefix to its defining file, then take
     // the unique `sym:<file>:name`. resolve-uniquely-or-skip, so anything unresolvable or ambiguous →
     // no edge (and a qualified path never falls through to the bare same-module/global ladder below).
@@ -3197,26 +3209,27 @@ mod tests {
     }
 
     #[test]
-    fn resolve_symbol_calls_qualified_external_or_associated_skips() {
-        // `std::mem::swap()` (external root) and `Self::new()` (associated, Slice 3) expand to no
-        // local module — qualified-but-unresolvable skips, and never falls back to a same-file local
-        // of the same final name (here `swap`/`new` exist locally yet must NOT be linked).
+    fn resolve_symbol_calls_qualified_external_or_unknown_type_skips() {
+        // `std::mem::swap()` (external root) and `Foo::bar()` (a type with no import bringing in
+        // `Foo`) expand to no local module — qualified-but-unresolvable skips, never falling back to
+        // a same-file local of the same final name (`swap`/`bar` exist locally yet must NOT be
+        // linked). (`Self::…` is a different case — it resolves same-module; see the Slice-3 tests.)
         let mut g = graph_with_defs(&[
             ("src/api.rs", "run"),
-            ("src/api.rs", "new"),
+            ("src/api.rs", "bar"),
             ("src/api.rs", "swap"),
         ]);
         g.set_pending_calls(
             "src/api.rs",
             vec![
                 ("run".into(), "std::mem::swap".into(), 1),
-                ("run".into(), "Self::new".into(), 2),
+                ("run".into(), "Foo::bar".into(), 2),
             ],
         );
         g.resolve_symbol_calls();
         assert!(
             calls_of(&g).is_empty(),
-            "qualified external/associated calls skip — no import expands them, no fallback to a local"
+            "qualified external/unknown-type calls skip — no import expands them, no fallback to a local"
         );
     }
 
@@ -3250,6 +3263,57 @@ mod tests {
         assert!(
             calls_of(&g).is_empty(),
             "associated/variant call skips — the type tail is not collapsed to the module's free fn"
+        );
+    }
+
+    #[test]
+    fn resolve_symbol_calls_self_method_resolves_same_module() {
+        // `self.helper()` (captured as `Self::helper`) inside api.rs resolves to api.rs's own
+        // `helper` — the enclosing impl's method lives in the caller's module.
+        let mut g = graph_with_defs(&[("src/api.rs", "run"), ("src/api.rs", "helper")]);
+        g.set_pending_calls("src/api.rs", vec![("run".into(), "Self::helper".into(), 1)]);
+        g.resolve_symbol_calls();
+        assert_eq!(
+            calls_of(&g),
+            vec![(
+                "sym:src/api.rs:run".to_string(),
+                "sym:src/api.rs:helper".to_string()
+            )],
+            "self.helper() resolves to the same-module method (Slice 3)"
+        );
+    }
+
+    #[test]
+    fn resolve_symbol_calls_self_method_never_uses_imports_or_global() {
+        // api.rs has its OWN `connect` AND imports `crate::db::connect` (also a global in db.rs).
+        // `self.connect()` must resolve to api.rs's own connect (same module) — NEVER the imported
+        // or global db::connect. This isolates the Slice-3 same-module-only guard: if it leaked to
+        // Tier A it would pick db's connect; if it fell to the qualified branch it would skip.
+        let mut g = graph_with_defs(&[
+            ("src/db.rs", "connect"),
+            ("src/api.rs", "connect"),
+            ("src/api.rs", "run"),
+        ]);
+        let uid = NodeId("use:src/api.rs:crate::db::connect".into());
+        g.upsert_node(uid.clone(), "use".into(), "".into(), NodeType::Module);
+        g.add_edge(
+            NodeId("file:src/api.rs".into()),
+            uid,
+            0.5,
+            EdgeType::DependsOn,
+        );
+        g.set_pending_calls(
+            "src/api.rs",
+            vec![("run".into(), "Self::connect".into(), 1)],
+        );
+        g.resolve_symbol_calls();
+        assert_eq!(
+            calls_of(&g),
+            vec![(
+                "sym:src/api.rs:run".to_string(),
+                "sym:src/api.rs:connect".to_string()
+            )],
+            "self.connect() resolves to api's OWN connect, not the imported or global db::connect"
         );
     }
 

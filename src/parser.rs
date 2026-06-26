@@ -710,6 +710,7 @@ fn symbol_span(lines: &[&str], start_line: usize) -> (usize, usize) {
 mod syn_ast {
     use super::{CallSite, ModuleDecl, Symbol, SymbolKind, UseStatement};
     use proc_macro2::Span;
+    use std::collections::HashSet;
     use syn::spanned::Spanned;
     use syn::visit::Visit;
 
@@ -738,41 +739,74 @@ mod syn_ast {
 
     /// Collects single-segment free-function call-sites from a function body, in source
     /// (document) order — a pure function of the AST, so call extraction is deterministic.
-    struct CallVisitor {
+    struct CallVisitor<'a> {
         caller: String,
+        /// Method / associated-fn names defined on the enclosing impl or trait (empty for free
+        /// functions). A `self.m()` / `Self::m()` is captured ONLY when `m` is in this set, so a
+        /// Deref- or blanket-trait-provided method (not defined here) is never mislinked to a
+        /// same-named free function in this module.
+        own_methods: &'a std::collections::HashSet<String>,
         calls: Vec<CallSite>,
     }
-    impl<'ast> Visit<'ast> for CallVisitor {
+    impl<'a, 'ast> Visit<'ast> for CallVisitor<'a> {
         fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
             if let syn::Expr::Path(p) = &*node.func {
-                // Capture the call path as a `::`-joined callee: bare `foo` (Slice 1, one
-                // segment) and qualified `a::b::foo` (Slice 2). `<T>::x` (qself) and `::abs::x`
-                // (leading `::`) are skipped; method calls `x.bar()` are Slice 3.
+                // Capture the call path as a `::`-joined callee: bare `foo` (Slice 1) and qualified
+                // `a::b::foo` (Slice 2). `<T>::x` (qself) and `::abs::x` (leading `::`) are skipped.
+                // A `Self::assoc()` is captured only when `assoc` is defined on this type (Slice 3) —
+                // else it is a trait/blanket assoc fn that must not match a same-named free fn.
                 if p.qself.is_none() && p.path.leading_colon.is_none() {
                     if let Some(last) = p.path.segments.last() {
-                        let path = p
+                        let segs = p
                             .path
                             .segments
                             .iter()
                             .map(|s| s.ident.to_string())
-                            .collect::<Vec<_>>()
-                            .join("::");
-                        self.calls.push(CallSite {
-                            caller: self.caller.clone(),
-                            callee: path,
-                            line: line_of(last.ident.span()),
-                        });
+                            .collect::<Vec<_>>();
+                        let is_self = segs.first().is_some_and(|s| s == "Self");
+                        if !is_self || self.own_methods.contains(&last.ident.to_string()) {
+                            self.calls.push(CallSite {
+                                caller: self.caller.clone(),
+                                callee: segs.join("::"),
+                                line: line_of(last.ident.span()),
+                            });
+                        }
                     }
                 }
             }
             // Always recurse so calls nested in args, closures, match arms, blocks are seen.
             syn::visit::visit_expr_call(self, node);
         }
+        fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+            // Slice 3 — `self.method()`: the receiver type is the enclosing impl. Capture as
+            // `Self::method` ONLY when `method` is defined on this type here, so a Deref/blanket
+            // method (absent from `own_methods`) is skipped, not mislinked to a same-named free fn.
+            // Only a bare `self` receiver; `self.field.m()` / `x.m()` have an unknown receiver type.
+            if let syn::Expr::Path(p) = &*node.receiver {
+                if p.qself.is_none()
+                    && p.path.is_ident("self")
+                    && self.own_methods.contains(&node.method.to_string())
+                {
+                    self.calls.push(CallSite {
+                        caller: self.caller.clone(),
+                        callee: format!("Self::{}", node.method),
+                        line: line_of(node.method.span()),
+                    });
+                }
+            }
+            syn::visit::visit_expr_method_call(self, node);
+        }
     }
 
-    fn collect_calls(caller: &str, block: &syn::Block, out: &mut Vec<CallSite>) {
+    fn collect_calls(
+        caller: &str,
+        own_methods: &std::collections::HashSet<String>,
+        block: &syn::Block,
+        out: &mut Vec<CallSite>,
+    ) {
         let mut v = CallVisitor {
             caller: caller.to_string(),
+            own_methods,
             calls: Vec::new(),
         };
         v.visit_block(block);
@@ -821,17 +855,36 @@ mod syn_ast {
                 }
                 syn::Item::Fn(f) => {
                     push_sym(out, &f.sig.ident, SymbolKind::Function);
-                    collect_calls(&f.sig.ident.to_string(), &f.block, &mut out.calls);
+                    // A free function has no `self`/`Self` methods in scope → empty own-method set.
+                    collect_calls(
+                        &f.sig.ident.to_string(),
+                        &HashSet::new(),
+                        &f.block,
+                        &mut out.calls,
+                    );
                 }
                 syn::Item::Struct(s) => push_sym(out, &s.ident, SymbolKind::Struct),
                 syn::Item::Enum(e) => push_sym(out, &e.ident, SymbolKind::Enum),
                 syn::Item::Trait(t) => {
                     push_sym(out, &t.ident, SymbolKind::Trait);
+                    let methods: HashSet<String> = t
+                        .items
+                        .iter()
+                        .filter_map(|ti| match ti {
+                            syn::TraitItem::Fn(m) => Some(m.sig.ident.to_string()),
+                            _ => None,
+                        })
+                        .collect();
                     for ti in &t.items {
                         if let syn::TraitItem::Fn(method) = ti {
                             push_sym(out, &method.sig.ident, SymbolKind::Function);
                             if let Some(body) = &method.default {
-                                collect_calls(&method.sig.ident.to_string(), body, &mut out.calls);
+                                collect_calls(
+                                    &method.sig.ident.to_string(),
+                                    &methods,
+                                    body,
+                                    &mut out.calls,
+                                );
                             }
                         }
                     }
@@ -845,11 +898,20 @@ mod syn_ast {
                     }
                 }
                 syn::Item::Impl(i) => {
+                    let methods: HashSet<String> = i
+                        .items
+                        .iter()
+                        .filter_map(|ii| match ii {
+                            syn::ImplItem::Fn(m) => Some(m.sig.ident.to_string()),
+                            _ => None,
+                        })
+                        .collect();
                     for ii in &i.items {
                         if let syn::ImplItem::Fn(method) = ii {
                             push_sym(out, &method.sig.ident, SymbolKind::Function);
                             collect_calls(
                                 &method.sig.ident.to_string(),
+                                &methods,
                                 &method.block,
                                 &mut out.calls,
                             );
@@ -1164,6 +1226,47 @@ mod syn_tests {
             .iter()
             .any(|s| s.name == "a" && s.kind == SymbolKind::Function));
         assert!(r.symbols.iter().any(|s| s.name == "b"));
+    }
+
+    #[test]
+    fn syn_captures_self_method_call_not_other_receivers() {
+        // `self.helper()` is captured as `Self::helper`; an arbitrary receiver `x.helper()` is not
+        // captured (unknown type — Slice 3+).
+        let src = "struct T;\nimpl T {\n  fn run(&self, x: T) { self.helper(); x.helper(); }\n  fn helper(&self) {}\n}";
+        let r = ASTParser::new().parse_source("t.rs", src);
+        assert!(
+            r.call_sites
+                .iter()
+                .any(|c| c.caller == "run" && c.callee == "Self::helper"),
+            "self.helper() is captured as Self::helper, got {:?}",
+            r.call_sites
+                .iter()
+                .map(|c| (&c.caller, &c.callee))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            r.call_sites
+                .iter()
+                .filter(|c| c.callee.ends_with("helper"))
+                .count(),
+            1,
+            "only the self-receiver method call is captured, not x.helper()"
+        );
+    }
+
+    #[test]
+    fn syn_self_method_skips_deref_or_external_method() {
+        // `self.len()` where the type has NO `len` method (it would come from Deref / a trait) is
+        // NOT captured — so it can never be mislinked to the same-named free `len`. This is the
+        // exact false-edge the own-method-set guard closes.
+        let src =
+            "struct W;\nimpl W { fn run(&self) -> usize { self.len() } }\nfn len() -> usize { 0 }";
+        let r = ASTParser::new().parse_source("t.rs", src);
+        assert!(
+            !r.call_sites.iter().any(|c| c.callee == "Self::len"),
+            "self.len() (not a method of W) is not captured, got {:?}",
+            r.call_sites.iter().map(|c| &c.callee).collect::<Vec<_>>()
+        );
     }
 
     #[test]
