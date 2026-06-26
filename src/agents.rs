@@ -70,7 +70,7 @@ pub struct AgentExecutor {
 impl AgentExecutor {
     pub fn new() -> Self {
         Self {
-            guard: GuardLayer::new(GuardConfig::default()),
+            guard: GuardLayer::new(GuardConfig::from_env()),
         }
     }
 

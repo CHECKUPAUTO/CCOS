@@ -185,9 +185,9 @@ fn run_analyze(opts: &AnalyzeOpts) -> i32 {
         return 1;
     }
 
-    let mut graph = MemoryGraph::new(0.2, opts.max_nodes);
-    // Honour scoring-weight overrides (CCOS_W_*) so the validation harness can
-    // re-score the ingest under a trial's hyperparameters without recompiling.
+    let mut graph = MemoryGraph::new(MemoryGraph::paging_threshold_from_env(0.2), opts.max_nodes);
+    // Honour scoring-weight (CCOS_W_*) and paging (CCOS_PAGING_THRESHOLD) overrides so the
+    // validation harness can re-score the ingest under a trial's hyperparameters without recompiling.
     graph.set_scoring_weights(ScoringWeights::from_env());
     let mut engine = IncrementalGraphEngine::new();
     let mut event_log = EventLog::new(Uuid::new_v4().to_string());
@@ -814,7 +814,7 @@ fn build_graph_from_path(path: &str, max_nodes: usize) -> Result<MemoryGraph, St
         return Err(format!("no .rs files found under '{path}'"));
     }
 
-    let mut graph = MemoryGraph::new(0.2, max_nodes);
+    let mut graph = MemoryGraph::new(MemoryGraph::paging_threshold_from_env(0.2), max_nodes);
     let mut engine = IncrementalGraphEngine::new();
     for file in &files {
         if let Ok(source) = std::fs::read_to_string(file) {
