@@ -20,6 +20,23 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Q-Page dual-evidence belief layer — contested-knowledge memory (`EdgeType::Supports` /
+  `EdgeType::Contradicts`).** A claim node carries two opposing, explicitly-asserted evidence
+  surfaces — the affirmative `S_A` (`Supports`) and the negative `S_¬A` (`Contradicts`) — and
+  `MemoryGraph::qbelief` derives `{support, contradiction, belief, conflict}` from a claim's incoming
+  edges. It is **pure and derived** (no stored state, so snapshots are unchanged and `replay == live`
+  holds): `belief` is the Laplace-smoothed support fraction (`0.5` with no evidence), `conflict` the
+  evidence balance `2·min(s,c)/(s+c)` — high *only* when both surfaces carry weight, the resolution
+  signal a similarity index cannot represent (relatedness has no polarity). The two `EdgeType`
+  variants are appended additively (old snapshots never contain them). Contradictions are **explicit
+  cognitive events** — `CcosMemory::assert_support` / `assert_contradiction` (agent API, recorded in
+  the hash-chained audit) and an `AgentSession` `Op::Assert` replayed in `replay_to`, so an
+  agent-asserted contradiction reconstructs identically (`replay == live` for contested knowledge,
+  not just for ingested structure). Measured in `docs/MEASUREMENT_contradiction_crux.md`: a
+  refutation's lexical similarity to its claim falls *inside* the band of the confirmations, so no
+  cosine threshold separates support from refutation — the typed edge does, and `conflict` flags the
+  contested claim. Auto-detection (rules / NLI), resolution propagation, and decay are later slices.
+
 - **Data-flow semantic edges — `EdgeType::DataFlow` (ROADMAP P1.3, the second half of "semantic
   edges").** The `syn` AST captures in-body references to module-level `static`/`const` items
   (Slice 1: bare `SCREAMING_SNAKE` value paths — the Rust convention, which precisely excludes

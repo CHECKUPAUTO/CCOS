@@ -68,7 +68,7 @@ use crate::context_region::file_of;
 use crate::distributed_event_log::DistributedEventLog;
 use crate::event_log::{EventLog, EventPayload, EventType};
 use crate::incremental::IncrementalGraphEngine;
-use crate::memory::{GraphNode, MemoryGraph, NodeId};
+use crate::memory::{EdgeType, GraphNode, MemoryGraph, NodeId, NodeType};
 use crate::query::{self, Reached};
 use crate::region_engine::ContextRegionEngine;
 use crate::sanitizer::{self, Finding};
@@ -383,6 +383,69 @@ impl CcosMemory {
     /// it can never serve a stale cache).
     fn bump_version(&mut self) {
         self.version = self.version.wrapping_add(1);
+    }
+
+    /// Assert that `evidence` **supports** `claim` — the affirmative surface `S_A` of the claim's
+    /// [Q-Page](crate::memory::MemoryGraph::qbelief). An explicit cognitive event (an agent/tool
+    /// recording a fact *for* a claim, not something derived from source). Both endpoints are
+    /// created as empty `ContextBlock`s if absent; an existing node keeps its content. Idempotent
+    /// (a duplicate edge is rejected). Returns whether a new edge was added.
+    pub fn assert_support(&mut self, evidence: &str, claim: &str, weight: f64) -> bool {
+        self.assert_evidence(evidence, claim, true, weight)
+    }
+
+    /// Assert that `evidence` **contradicts** `claim` — the negative surface `S_¬A`, dual of
+    /// [`assert_support`](Self::assert_support). This is the channel a contradiction-aware recall
+    /// surfaces that similarity-only retrieval is structurally blind to (relatedness ≠ polarity).
+    pub fn assert_contradiction(&mut self, evidence: &str, claim: &str, weight: f64) -> bool {
+        self.assert_evidence(evidence, claim, false, weight)
+    }
+
+    /// Shared body of [`assert_support`](Self::assert_support) /
+    /// [`assert_contradiction`](Self::assert_contradiction): create the endpoints if missing (never
+    /// clobbering an existing node), add the polarity edge, and record the assertion in the
+    /// tamper-evident audit chain. Deterministic — replaying the same assertions rebuilds the
+    /// identical graph (`replay == live`; the agent-session `Op::Assert` replays exactly this).
+    fn assert_evidence(
+        &mut self,
+        evidence: &str,
+        claim: &str,
+        supports: bool,
+        weight: f64,
+    ) -> bool {
+        self.bump_version();
+        let evidence = NodeId(evidence.to_string());
+        let claim = NodeId(claim.to_string());
+        self.ensure_node(&evidence);
+        self.ensure_node(&claim);
+        let polarity = if supports {
+            EdgeType::Supports
+        } else {
+            EdgeType::Contradicts
+        };
+        let added = self
+            .graph
+            .add_edge(evidence.clone(), claim.clone(), weight, polarity);
+        // Audit trail ("why does the system believe this?") in the hash chain — no derived state.
+        let tag = if supports { "support" } else { "contradict" };
+        self.dist_log.append(
+            sha256_hex(&format!("{tag}:{}->{}:{weight}", evidence.0, claim.0)),
+            "assertion".to_string(),
+        );
+        added
+    }
+
+    /// Insert `id` as an empty `ContextBlock` node iff absent — so an assertion about a not-yet-
+    /// ingested node still lands while an existing node (e.g. an ingested claim) is left untouched.
+    fn ensure_node(&mut self, id: &NodeId) {
+        if !self.graph.node_ids().any(|n| n == id) {
+            self.graph.upsert_node(
+                id.clone(),
+                id.0.clone(),
+                String::new(),
+                NodeType::ContextBlock,
+            );
+        }
     }
 
     /// Open a memory backed by `path`: load it if the file exists, otherwise
