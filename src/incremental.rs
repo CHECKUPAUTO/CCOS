@@ -315,4 +315,43 @@ mod tests {
         let changed = engine.changed_files(&current);
         assert!(changed.contains(&"b.rs".to_string()));
     }
+
+    /// The headline `O(Δ)` claim, guarded **deterministically** in CI (criterion's `delta_bench`
+    /// only *times* it): editing one file must produce the same node/edge footprint no matter how
+    /// large the surrounding graph already is. If `process_delta` ever did work proportional to the
+    /// whole repo (re-linking everything), this footprint would drift with the background.
+    #[test]
+    fn process_delta_footprint_is_background_independent() {
+        fn footprint(background: usize) -> (usize, usize, usize, usize) {
+            let mut engine = IncrementalGraphEngine::new();
+            let mut graph = MemoryGraph::new(0.0, usize::MAX);
+            for f in 0..background {
+                let src = format!("mod m{f};\npub fn func_{f}() {{}}\nstruct S{f};\n");
+                engine.process_delta(&format!("bg/file_{f}.rs"), None, &src, &mut graph);
+            }
+            engine.process_delta(
+                "hot/file.rs",
+                None,
+                "pub fn a() {}\nstruct A;\n",
+                &mut graph,
+            );
+            let d = engine.process_delta(
+                "hot/file.rs",
+                Some("pub fn a() {}\nstruct A;\n"),
+                "pub fn a() {}\npub fn b() {}\nstruct A;\n",
+                &mut graph,
+            );
+            (
+                d.nodes_added,
+                d.nodes_removed,
+                d.edges_added,
+                d.edges_removed,
+            )
+        }
+        assert_eq!(
+            footprint(0),
+            footprint(200),
+            "per-edit footprint must not grow with the background graph (O(Δ))"
+        );
+    }
 }

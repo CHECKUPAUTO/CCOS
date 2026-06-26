@@ -2417,6 +2417,31 @@ impl MemoryGraph {
         out
     }
 
+    /// Symbol nodes that **nothing references** — no incoming edge other than the structural
+    /// `Contains` from their own file. A deliberate **heuristic**: a `pub` API, an entry point
+    /// (`main`), or a trait-impl method reached only from outside the analyzed graph are false
+    /// positives, so these are dead-code *candidates*, not a proof. Deterministic (sorted ids).
+    pub fn dead_symbols(&self) -> Vec<NodeId> {
+        let mut referenced: std::collections::HashSet<&NodeId> = std::collections::HashSet::new();
+        for e in &self.edges {
+            if e.edge_type != EdgeType::Contains {
+                referenced.insert(&e.target);
+            }
+        }
+        let mut dead: Vec<NodeId> = self
+            .nodes
+            .iter()
+            .filter(|(id, n)| {
+                n.node_type == NodeType::Symbol
+                    && id.0.starts_with("sym:")
+                    && !referenced.contains(*id)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        dead.sort();
+        dead
+    }
+
     pub fn get_node_scores(&self) -> Vec<(NodeId, f64)> {
         let mut scores: Vec<(NodeId, f64)> = self
             .nodes
@@ -3059,6 +3084,25 @@ mod tests {
             .collect();
         v.sort();
         v
+    }
+
+    #[test]
+    fn dead_symbols_flags_only_unreferenced() {
+        // api.rs: `run` is called by nothing; `helper` is called by `run`. Only `run` is a
+        // candidate — `helper` has an incoming Calls edge, and the file's Contains edges (which
+        // every symbol has) do not count as references.
+        let mut g = graph_with_defs(&[("src/api.rs", "run"), ("src/api.rs", "helper")]);
+        g.add_edge(
+            NodeId("sym:src/api.rs:run".into()),
+            NodeId("sym:src/api.rs:helper".into()),
+            0.75,
+            EdgeType::Calls,
+        );
+        assert_eq!(
+            g.dead_symbols(),
+            vec![NodeId("sym:src/api.rs:run".into())],
+            "only the unreferenced symbol is flagged"
+        );
     }
 
     #[test]

@@ -357,22 +357,28 @@ honesty code↔docs↔paper, tests/API). **Fixed in this pass:**
   `id`/`timestamp` so the chain stays reproducible). `EventLog::verify_integrity`
   detects any payload tamper, reorder, insertion or deletion, and `ccos verify` /
   `ccos replay` check it on every run. See `src/event_log.rs`.
-3. **Semantic edges.** (L) Call-graph and data-flow edges, not just
-   containment/dependency — richer causal propagation.
+3. **Semantic edges.** (L) — *call-graph half done* (fn→fn `Calls` edges: bare, qualified, and
+   `self`/`Self` method calls — see #74/#75/#76/#77 and `src/memory.rs::resolve_symbol_calls`).
+   **Remaining: data-flow edges** (who writes/reads which variable) and call-graph polish
+   (`x.bar()` receiver-type inference, renamed-import alias calls, cross-impl-block self-calls).
 
 ### P2 — Ergonomics
 
-4. **Configurable scoring/paging/guard** via CLI flags or a config file instead
-   of magic constants. (S)
-5. **Benchmarks.** (S) `criterion` benches for `process_delta` to guard the
-   `O(Δ)` claim against regressions.
-6. **`analyze` extras.** (S) dead-symbol detection, per-file failure simulation,
-   GraphML export to complement the existing Graphviz/DOT output.
+4. **Configurable scoring/paging/guard** — *scoring done* (`ScoringWeights::from_env`:
+   `CCOS_W_BASE/FAILURE/RECENCY/ACCESS/CENTRALITY`, `CCOS_FAILURE_DECAY`, `CCOS_CENTRALITY_MODE`).
+   Remaining: paging-cap / guard knobs (small). (S)
+5. ✅ **Benchmarks** — *done.* `benches/delta_bench.rs` (criterion) times `process_delta` across
+   backgrounds 0→8000, plus a **deterministic CI guard** (`process_delta_footprint_is_background_independent`)
+   so the `O(Δ)` claim is asserted, not just measured.
+6. **`analyze` extras** — *GraphML export* ✅ (`query::to_graphml`, `ccos export`) and *dead-symbol
+   detection* ✅ (`MemoryGraph::dead_symbols`, surfaced by `ccos analyze`). Remaining: per-file
+   failure simulation. (S)
 
 ### P3 — Hygiene
 
-8. **Property tests.** (S) `proptest` for parser round-trips and graph invariants
-   (dangling-free, bounded) under random edit sequences.
+8. ✅ **Property tests** — *done.* `proptest` covers graph invariants under random edit sequences
+   (`tests/property_invariants.rs`), edit determinism, parser ingestion (`tests/integration_ccos.rs`),
+   and snapshot round-trips (`tests/snapshot_roundtrip_property.rs`).
 9. **Result-returning CLI commands** end-to-end (thread `Result` instead of
    ad-hoc exit codes). (S)
 
@@ -380,6 +386,7 @@ honesty code↔docs↔paper, tests/API). **Fixed in this pass:**
 
 ### Suggested order
 
-~~`P0.1 (syn)`~~ ✅ → ~~`P1.2 (canonical log)`~~ ✅ → ~~`P1.3 (semantic edges — call graph
-Slice 1)`~~ ✅ → **`P2.5 (benches)`** (next) → P1.3 Slices 2–3 (qualified paths, methods) →
-polish. P2.4 and P3.7 are quick wins that can land anytime.
+~~`P0.1 (syn)`~~ ✅ → ~~`P1.2 (canonical log)`~~ ✅ → ~~`P1.3 (call graph, Slices 1–3a)`~~ ✅ →
+~~`P2.5 (benches)`~~ ✅ → ~~`P2.6 (analyze extras)`~~ ✅ → ~~`P3.8 (property tests)`~~ ✅ →
+**`P3.9 (Result CLI)`** + **`P2.4 (paging/guard config)`** (quick wins) → **`P1.3 data-flow edges`**
+(the next depth jump) → call-graph polish.
