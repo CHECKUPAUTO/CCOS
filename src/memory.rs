@@ -164,6 +164,25 @@ pub struct QBelief {
     pub conflict: f64,
 }
 
+/// Build a [`QBelief`] from already-summed support/contradiction evidence weights — the shared core
+/// of [`MemoryGraph::qbelief`] and [`MemoryGraph::qbelief_decayed`]. `belief` is the Laplace-smoothed
+/// support fraction and `conflict` the evidence balance; see [`QBelief`] for the formulas.
+fn belief_from_sums(support: f64, contradiction: f64) -> QBelief {
+    let belief = (support + BELIEF_PRIOR) / (support + contradiction + 2.0 * BELIEF_PRIOR);
+    let total = support + contradiction;
+    let conflict = if total > 0.0 {
+        2.0 * support.min(contradiction) / total
+    } else {
+        0.0
+    };
+    QBelief {
+        support,
+        contradiction,
+        belief,
+        conflict,
+    }
+}
+
 /// Tunable coefficients of the causal score and failure-propagation decay.
 ///
 /// A node's score is
@@ -2170,19 +2189,49 @@ impl MemoryGraph {
                 _ => {}
             }
         }
-        let belief = (support + BELIEF_PRIOR) / (support + contradiction + 2.0 * BELIEF_PRIOR);
-        let total = support + contradiction;
-        let conflict = if total > 0.0 {
-            2.0 * support.min(contradiction) / total
-        } else {
-            0.0
-        };
-        QBelief {
-            support,
-            contradiction,
-            belief,
-            conflict,
+        belief_from_sums(support, contradiction)
+    }
+
+    /// A **time-decayed** [`QBelief`]: each evidence edge's weight is scaled by
+    /// `0.5^(age / half_life)`, where `age` is the clock ticks elapsed since the edge was asserted
+    /// (its `created_at` vs the current [`clock`](Self::clock)) and `half_life` is the ticks an
+    /// unreinforced piece of evidence takes to count for half. Stale evidence fades, so a claim
+    /// whose evidence has all aged sees its support/contradiction **magnitudes** shrink toward 0, so
+    /// `belief` relaxes to the neutral prior `0.5` (the Laplace smoothing dominates once little
+    /// evidence remains) — the "knowledge half-life". A freshly (re-)asserted edge keeps full weight,
+    /// so re-assertion **reinforces**: a fresh assertion on one side also tips the balance, driving
+    /// `conflict` down, so recent evidence resolves a stale, never-reaffirmed dissent that plain
+    /// [`qbelief`](Self::qbelief) would keep treating as fully contested forever. (`conflict` is a
+    /// scale-free balance, so *equally*-aged evidence leaves it unchanged — decay moves it only when
+    /// the two surfaces age differently.)
+    /// Lazy and pure: `O(edges)`, computed on demand from `created_at`/`clock` with no stored decay
+    /// state, so it is deterministic and `replay == live` holds (replay reproduces the same clock and
+    /// edges). `half_life <= 0` ⇒ no decay (identical to [`qbelief`](Self::qbelief)).
+    pub fn qbelief_decayed(&self, claim: &NodeId, half_life: f64) -> QBelief {
+        if half_life <= 0.0 {
+            return self.qbelief(claim);
         }
+        let now = self.clock;
+        let mut support = 0.0_f64;
+        let mut contradiction = 0.0_f64;
+        for e in &self.edges {
+            if &e.target != claim {
+                continue;
+            }
+            let decayed = match e.edge_type {
+                EdgeType::Supports | EdgeType::Contradicts => {
+                    let age = now.saturating_sub(e.created_at) as f64;
+                    e.weight * 0.5_f64.powf(age / half_life)
+                }
+                _ => continue,
+            };
+            if e.edge_type == EdgeType::Supports {
+                support += decayed;
+            } else {
+                contradiction += decayed;
+            }
+        }
+        belief_from_sums(support, contradiction)
     }
 
     /// The evidence nodes pointing at `claim` with a given **polarity** —
@@ -3747,6 +3796,117 @@ mod tests {
             back.qbelief(&"claim".into()),
             g.qbelief(&"claim".into()),
             "belief is identical after a serde round-trip"
+        );
+    }
+
+    // ── Q-Page decay (knowledge half-life) ──────────────────────────────────────────────────────
+
+    #[test]
+    fn qbelief_decayed_equals_qbelief_with_no_elapsed_time() {
+        // All evidence asserted at the current clock (age 0, factor 1.0) ⇒ decay is a no-op.
+        let g = graph_with_evidence(2, 1);
+        let claim: NodeId = "claim".into();
+        assert_eq!(g.qbelief_decayed(&claim, 10.0), g.qbelief(&claim));
+    }
+
+    #[test]
+    fn qbelief_decayed_nonpositive_half_life_is_no_decay() {
+        let mut g = graph_with_evidence(2, 1);
+        for _ in 0..50 {
+            g.tick();
+        }
+        let claim: NodeId = "claim".into();
+        assert_eq!(g.qbelief_decayed(&claim, 0.0), g.qbelief(&claim));
+    }
+
+    #[test]
+    fn qbelief_decayed_relaxes_belief_toward_prior_as_evidence_ages() {
+        // A strongly-supported claim, then a long silence: the decayed belief relaxes from 0.8 back
+        // toward the neutral prior 0.5 (the support mass faded), while plain qbelief stays frozen.
+        let mut g = graph_with_evidence(3, 0);
+        for _ in 0..100 {
+            g.tick();
+        }
+        let claim: NodeId = "claim".into();
+        let plain = g.qbelief(&claim);
+        let decayed = g.qbelief_decayed(&claim, 10.0);
+        assert!(
+            (plain.belief - 0.8).abs() < 1e-9,
+            "plain belief frozen at 0.8"
+        );
+        assert!(
+            decayed.belief < 0.55 && decayed.belief >= 0.5,
+            "decayed belief relaxes toward the prior, got {}",
+            decayed.belief
+        );
+        assert_eq!(decayed.conflict, 0.0, "one-sided ⇒ no conflict either way");
+    }
+
+    #[test]
+    fn qbelief_decayed_fresh_evidence_resolves_stale_dissent() {
+        // A claim contested long ago (one contradiction at t=0), then a FRESH support arrives. Plain
+        // qbelief still sees it as fully contested forever; the decayed view lets the fresh evidence
+        // win — belief rises and conflict collapses, because the stale dissent has decayed.
+        let mut g = MemoryGraph::new(0.0, usize::MAX);
+        let claim: NodeId = "claim".into();
+        for id in ["claim", "old_con", "fresh_sup"] {
+            g.upsert_node(
+                NodeId(id.into()),
+                id.into(),
+                String::new(),
+                NodeType::ContextBlock,
+            );
+        }
+        g.add_edge("old_con".into(), claim.clone(), 1.0, EdgeType::Contradicts); // t = 0
+        for _ in 0..40 {
+            g.tick();
+        }
+        g.add_edge("fresh_sup".into(), claim.clone(), 1.0, EdgeType::Supports); // t = 40
+
+        let plain = g.qbelief(&claim);
+        let decayed = g.qbelief_decayed(&claim, 10.0); // dissent aged 4 half-lives ⇒ ×0.0625
+        assert!(
+            (plain.conflict - 1.0).abs() < 1e-9,
+            "plain view: still fully contested"
+        );
+        assert!((plain.belief - 0.5).abs() < 1e-9);
+        assert!(
+            decayed.conflict < 0.2,
+            "decay lets fresh support resolve the stale dissent, conflict {}",
+            decayed.conflict
+        );
+        assert!(
+            decayed.belief > plain.belief,
+            "decayed belief rises above the contested 0.5 ({} > {})",
+            decayed.belief,
+            plain.belief
+        );
+    }
+
+    #[test]
+    fn qbelief_decayed_is_deterministic() {
+        let build = || {
+            let mut g = MemoryGraph::new(0.0, usize::MAX);
+            let claim: NodeId = "claim".into();
+            for id in ["claim", "c", "s"] {
+                g.upsert_node(
+                    NodeId(id.into()),
+                    id.into(),
+                    String::new(),
+                    NodeType::ContextBlock,
+                );
+            }
+            g.add_edge("c".into(), claim.clone(), 1.0, EdgeType::Contradicts);
+            for _ in 0..30 {
+                g.tick();
+            }
+            g.add_edge("s".into(), claim.clone(), 1.0, EdgeType::Supports);
+            g.qbelief_decayed(&claim, 7.0)
+        };
+        assert_eq!(
+            build(),
+            build(),
+            "same timed construction ⇒ identical decayed belief"
         );
     }
 
