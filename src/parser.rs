@@ -41,11 +41,12 @@ pub struct Symbol {
     pub kind: SymbolKind,
 }
 
-/// A **call-site**: a `callee()` invocation found inside `caller`'s body (Slice 1 captures
-/// only single-segment free-function calls — `foo()`, not `a::b::foo()` or `x.bar()`). Resolved
-/// to a definition symbol by [`crate::memory::MemoryGraph::resolve_symbol_calls`], which adds a
-/// `caller → callee` [`EdgeType::Calls`](crate::memory::EdgeType) edge — the fn→fn structure that
-/// imports alone miss. Only emitted on the `syn` (real-AST) path; empty on the heuristic fallback.
+/// A **call-site**: a `callee()` invocation found inside `caller`'s body. `callee` is the
+/// `::`-joined call path — a bare `foo` (Slice 1) or a qualified `a::b::foo` (Slice 2); method
+/// calls `x.bar()` are Slice 3. Resolved to a definition symbol by
+/// [`crate::memory::MemoryGraph::resolve_symbol_calls`], which adds a `caller → callee`
+/// [`EdgeType::Calls`](crate::memory::EdgeType) edge — the fn→fn structure that imports alone
+/// miss. Only emitted on the `syn` (real-AST) path; empty on the heuristic fallback.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallSite {
     pub caller: String,
@@ -744,16 +745,24 @@ mod syn_ast {
     impl<'ast> Visit<'ast> for CallVisitor {
         fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
             if let syn::Expr::Path(p) = &*node.func {
-                // Slice 1: only bare `foo()` (one path segment, no leading `::`). Qualified
-                // paths (`a::b::foo`) and method calls (`x.bar()`) are Slices 2/3.
-                if p.qself.is_none() && p.path.leading_colon.is_none() && p.path.segments.len() == 1
-                {
-                    let seg = &p.path.segments[0];
-                    self.calls.push(CallSite {
-                        caller: self.caller.clone(),
-                        callee: seg.ident.to_string(),
-                        line: line_of(seg.ident.span()),
-                    });
+                // Capture the call path as a `::`-joined callee: bare `foo` (Slice 1, one
+                // segment) and qualified `a::b::foo` (Slice 2). `<T>::x` (qself) and `::abs::x`
+                // (leading `::`) are skipped; method calls `x.bar()` are Slice 3.
+                if p.qself.is_none() && p.path.leading_colon.is_none() {
+                    if let Some(last) = p.path.segments.last() {
+                        let path = p
+                            .path
+                            .segments
+                            .iter()
+                            .map(|s| s.ident.to_string())
+                            .collect::<Vec<_>>()
+                            .join("::");
+                        self.calls.push(CallSite {
+                            caller: self.caller.clone(),
+                            callee: path,
+                            line: line_of(last.ident.span()),
+                        });
+                    }
                 }
             }
             // Always recurse so calls nested in args, closures, match arms, blocks are seen.
@@ -1154,10 +1163,10 @@ mod syn_tests {
 
     #[test]
     fn syn_captures_free_function_call_sites() {
-        let src = "fn caller() { helper(); ns::skipped(); recur(); }\nfn helper() {}\nfn recur() { recur(); }";
+        let src = "fn caller() { helper(); ns::deep(); recur(); }\nfn helper() {}\nfn recur() { recur(); }";
         let r = ASTParser::new().parse_source("t.rs", src);
-        // bare free-function calls are captured with their caller; qualified `ns::skipped` (Slice 2)
-        // and method calls are not.
+        // bare free-function calls are captured with their caller; a qualified call keeps its full
+        // `::`-joined path (Slice 2). Method calls `x.bar()` are still not captured (Slice 3).
         assert!(r
             .call_sites
             .iter()
@@ -1167,8 +1176,10 @@ mod syn_tests {
             .iter()
             .any(|c| c.caller == "recur" && c.callee == "recur"));
         assert!(
-            !r.call_sites.iter().any(|c| c.callee == "skipped"),
-            "a qualified-path call is not captured in Slice 1"
+            r.call_sites
+                .iter()
+                .any(|c| c.caller == "caller" && c.callee == "ns::deep"),
+            "a qualified-path call keeps its full path (Slice 2)"
         );
     }
 

@@ -2167,10 +2167,14 @@ impl MemoryGraph {
     /// vocabulary). A **whole-graph** pass (a call may target a symbol in a file ingested later);
     /// run right after [`link_module_imports`](Self::link_module_imports). Resolution is a strict
     /// precision ladder, **resolve-uniquely-or-skip** at every tier, so a wrong edge is never
-    /// invented: (A) import-scoped — `foo()` where the file does `use …::foo`, the import's module
-    /// resolving (as in `link_module_imports`) to the defining file with a real `sym:<file>:foo`;
-    /// (B) same-module — `foo` defined in the caller's own file/module; (C) global-unique — exactly
-    /// one `sym:*:foo` exists graph-wide. Self-edges are dropped. Deterministic: indices built over
+    /// invented. A **qualified** callee (`mod::…::name`, Slice 2) resolves its module prefix to a
+    /// file — crate-rooted (`crate::m::name`) directly, or an `alias::name` by expanding the leading
+    /// segment through the file's imports — then takes `sym:<file>:name`; unresolvable/ambiguous
+    /// qualified paths skip without falling back. A **bare** callee (`foo()`, Slice 1) uses the
+    /// ladder: (A) import-scoped — the file does `use …::foo`, its module resolving (as in
+    /// `link_module_imports`) to the defining file with a real `sym:<file>:foo`; (B) same-module —
+    /// `foo` defined in the caller's own file/module; (C) global-unique — exactly one `sym:*:foo`
+    /// exists graph-wide. Self-edges are dropped. Deterministic: indices built over
     /// **sorted** node ids, calls iterated in sorted (file, source) order, candidate edges
     /// sorted+deduped before insertion. Returns the number of Calls edges added.
     pub fn resolve_symbol_calls(&mut self) -> usize {
@@ -2527,6 +2531,41 @@ fn resolve_call(
     name_count: &HashMap<String, u32>,
     name_first: &HashMap<String, NodeId>,
 ) -> Option<NodeId> {
+    // Slice 2 — qualified path `mod::…::name`: resolve the module prefix to a file, then the final
+    // segment within it. resolve-uniquely-or-skip, so anything unresolvable or ambiguous → no edge
+    // (and a qualified path never falls through to the bare same-module/global ladder below).
+    if let Some((prefix, name)) = callee.rsplit_once("::") {
+        let deffile = if prefix == "crate" || prefix.starts_with("crate::") {
+            // (a) crate-rooted `crate::m::name` — absolute, resolve directly.
+            resolve_use(fcrate, prefix, file_index)
+        } else {
+            // (b) `alias::…::name` — expand the leading segment via the file's imports
+            //     (`use …::alias`) into an absolute module path, then resolve. Skip if the alias
+            //     matches no import, or more than one (ambiguous). `self`/`super`/`Self`/`Type`
+            //     and external roots (`std::…`) match no import here → skipped (Slice 3 / by design).
+            let first = prefix.split("::").next().unwrap_or(prefix);
+            let rest = prefix.strip_prefix(first).unwrap_or(""); // "" or "::b::c"
+            let mut hits = scope
+                .get(file)
+                .into_iter()
+                .flatten()
+                .filter(|u| u.rsplit("::").next() == Some(first));
+            match (hits.next(), hits.next()) {
+                (Some(use_path), None) => {
+                    resolve_use(fcrate, &format!("{use_path}{rest}"), file_index)
+                }
+                _ => None,
+            }
+        };
+        if let Some(df) = deffile {
+            if let Some(deffile_str) = df.0.strip_prefix("file:") {
+                if let Some((c, m)) = crate_and_module(deffile_str) {
+                    return defs.get(&(c, m, name.to_string())).cloned();
+                }
+            }
+        }
+        return None;
+    }
     // Tier A — import-scoped: an import `use <module>::callee` pins the defining module; resolve it
     // to a file and require exactly one unique `sym:<file>:callee`. (Rust-name-resolution-correct:
     // links the cross-module call without linking same-named fns in unrelated modules.)
@@ -3089,6 +3128,73 @@ mod tests {
         assert!(
             calls_of(&g).is_empty(),
             "ambiguous import scope skips — it does not fall back to the same-module local"
+        );
+    }
+
+    #[test]
+    fn resolve_symbol_calls_qualified_crate_rooted() {
+        // `crate::db::connect()` resolves absolutely via its module prefix — no import needed.
+        let mut g = graph_with_defs(&[("src/db.rs", "connect"), ("src/api.rs", "run")]);
+        g.set_pending_calls(
+            "src/api.rs",
+            vec![("run".into(), "crate::db::connect".into(), 1)],
+        );
+        g.resolve_symbol_calls();
+        assert_eq!(
+            calls_of(&g),
+            vec![(
+                "sym:src/api.rs:run".to_string(),
+                "sym:src/db.rs:connect".to_string()
+            )],
+            "crate-rooted qualified call resolves to the module's symbol (Slice 2)"
+        );
+    }
+
+    #[test]
+    fn resolve_symbol_calls_qualified_via_import_alias() {
+        // `use crate::db;` then `db::connect()` — the leading segment is expanded via the import.
+        let mut g = graph_with_defs(&[("src/db.rs", "connect"), ("src/api.rs", "run")]);
+        let uid = NodeId("use:src/api.rs:crate::db".into());
+        g.upsert_node(uid.clone(), "use".into(), "".into(), NodeType::Module);
+        g.add_edge(
+            NodeId("file:src/api.rs".into()),
+            uid,
+            0.5,
+            EdgeType::DependsOn,
+        );
+        g.set_pending_calls("src/api.rs", vec![("run".into(), "db::connect".into(), 1)]);
+        g.resolve_symbol_calls();
+        assert_eq!(
+            calls_of(&g),
+            vec![(
+                "sym:src/api.rs:run".to_string(),
+                "sym:src/db.rs:connect".to_string()
+            )],
+            "module-alias call resolves by expanding the import to an absolute path (Slice 2)"
+        );
+    }
+
+    #[test]
+    fn resolve_symbol_calls_qualified_external_or_associated_skips() {
+        // `std::mem::swap()` (external root) and `Self::new()` (associated, Slice 3) expand to no
+        // local module — qualified-but-unresolvable skips, and never falls back to a same-file local
+        // of the same final name (here `swap`/`new` exist locally yet must NOT be linked).
+        let mut g = graph_with_defs(&[
+            ("src/api.rs", "run"),
+            ("src/api.rs", "new"),
+            ("src/api.rs", "swap"),
+        ]);
+        g.set_pending_calls(
+            "src/api.rs",
+            vec![
+                ("run".into(), "std::mem::swap".into(), 1),
+                ("run".into(), "Self::new".into(), 2),
+            ],
+        );
+        g.resolve_symbol_calls();
+        assert!(
+            calls_of(&g).is_empty(),
+            "qualified external/associated calls skip — no import expands them, no fallback to a local"
         );
     }
 
