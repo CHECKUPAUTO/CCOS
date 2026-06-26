@@ -381,8 +381,10 @@ honesty code↔docs↔paper, tests/API). **Fixed in this pass:**
 8. ✅ **Property tests** — *done.* `proptest` covers graph invariants under random edit sequences
    (`tests/property_invariants.rs`), edit determinism, parser ingestion (`tests/integration_ccos.rs`),
    and snapshot round-trips (`tests/snapshot_roundtrip_property.rs`).
-9. **Result-returning CLI commands** end-to-end (thread `Result` instead of
-   ad-hoc exit codes). (S)
+9. ✅ **Result-returning CLI commands** — *done.* A `CliError { code, message }` / `CliResult`
+   abstraction threads `Result` through all 17 command handlers; `main()` maps the final result to
+   the exact exit code (status-only failures keep their printed report, error messages print once).
+   Exit-code behaviour byte-identical (`tests/cli.rs` asserts it). See `src/main.rs`.
 
 ---
 
@@ -390,5 +392,5 @@ honesty code↔docs↔paper, tests/API). **Fixed in this pass:**
 
 ~~`P0.1 (syn)`~~ ✅ → ~~`P1.2 (canonical log)`~~ ✅ → ~~`P1.3 (call graph, Slices 1–3a)`~~ ✅ →
 ~~`P2.5 (benches)`~~ ✅ → ~~`P2.6 (analyze extras)`~~ ✅ → ~~`P3.8 (property tests)`~~ ✅ →
-~~`P2.4 (config)`~~ ✅ → **`P3.9 (Result CLI)`** (last quick win) → **`P1.3 data-flow edges`**
-(the next depth jump) → call-graph polish.
+~~`P2.4 (config)`~~ ✅ → ~~`P3.9 (Result CLI)`~~ ✅ → **`P1.3 data-flow edges`**
+(the next depth jump) → call-graph polish. **All P2/P3 quick wins are now done.**
