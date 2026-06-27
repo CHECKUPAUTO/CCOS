@@ -491,6 +491,14 @@ pub struct MemoryGraph {
     /// deterministic-`BTreeMap` contract as `pending_calls`.
     #[serde(skip)]
     pending_aliases: BTreeMap<String, Vec<(String, String)>>,
+    /// Per-impl-block method-ownership facts, keyed source file → `(type_name, method)` — one per
+    /// `impl Foo { fn bar }` whose Self type is concrete (Slice 3). The input to the `(type, method) →
+    /// symbol` index [`resolve_symbol_calls`](Self::resolve_symbol_calls) builds to resolve a `Foo::bar`
+    /// callee (minted by `x.bar()` receiver-type inference, or written explicitly as `Foo::bar()`).
+    /// Same **runtime-only** (`serde(skip)`, rebuilt on the replay re-ingest) and deterministic-
+    /// `BTreeMap` contract as `pending_calls`; the resolved `Calls` edges are the durable state.
+    #[serde(skip)]
+    pending_methods: BTreeMap<String, Vec<(String, String)>>,
     /// Node ids of `static`/`const` symbols (the only valid `DataFlow` targets). The graph node
     /// stores `NodeType`, not the finer `SymbolKind`, so the parser marks these at ingest. Runtime
     /// -only; rebuilt on the replay re-ingest, and filtered to still-resident nodes at resolve time.
@@ -739,6 +747,7 @@ impl MemoryGraph {
             pending_calls: BTreeMap::new(),
             pending_data_refs: BTreeMap::new(),
             pending_aliases: BTreeMap::new(),
+            pending_methods: BTreeMap::new(),
             data_symbols: std::collections::BTreeSet::new(),
             edge_set: HashSet::new(),
         }
@@ -2587,6 +2596,18 @@ impl MemoryGraph {
         }
     }
 
+    /// Record (replacing) this file's impl-block method-ownership facts — each `(type_name, method)`
+    /// from an `impl Foo { fn bar }` — the input to the `(type, method) → symbol` index
+    /// [`resolve_symbol_calls`](Self::resolve_symbol_calls) uses to resolve a `Foo::bar` callee
+    /// (Slice 3). Empty ⇒ drop the entry. Mirrors [`set_pending_calls`](Self::set_pending_calls).
+    pub fn set_pending_methods(&mut self, file: &str, methods: Vec<(String, String)>) {
+        if methods.is_empty() {
+            self.pending_methods.remove(file);
+        } else {
+            self.pending_methods.insert(file.to_string(), methods);
+        }
+    }
+
     /// Mark a symbol node as a `static`/`const` — the only valid `DataFlow` target. The parser
     /// calls this at ingest (the graph node itself does not carry `SymbolKind`).
     pub fn mark_data_symbol(&mut self, id: NodeId) {
@@ -2757,6 +2778,29 @@ impl MemoryGraph {
         }
         let empty_aliases: HashMap<&str, &str> = HashMap::new();
 
+        // Slice 3 — the `(type_name, method) → method symbol` index for `x.bar()` / `Type::assoc()`
+        // resolution, built from the impl-block facts the parser handed over (`pending_methods`).
+        // `tm_count` carries each bucket's cardinality so a type name shared by two impls (a cross-file
+        // / cross-crate homonym) is **ambiguous and skipped**, never resolved last-writer-wins.
+        // Cardinality is counted over **all** ingested method defs (NOT just resident ones), so a
+        // homonym whose one definition is paged COLD is still seen as ambiguous → skipped, rather than
+        // resolved to the surviving twin (a false edge a resident-only count could mint). Only a
+        // **resident** symbol can be the link *target* (you cannot point a fresh edge at a paged node);
+        // a unique method whose symbol is COLD therefore drops the edge — precision-safe. Built over the
+        // sorted `pending_methods` ⇒ deterministic and a pure function of the ingested op-stream.
+        let mut type_method: HashMap<(String, String), NodeId> = HashMap::new();
+        let mut tm_count: HashMap<(String, String), u32> = HashMap::new();
+        for (file, methods) in &self.pending_methods {
+            for (ty, method) in methods {
+                let key = (ty.clone(), method.clone());
+                *tm_count.entry(key.clone()).or_default() += 1;
+                let sym = NodeId(format!("sym:{file}:{method}"));
+                if self.nodes.contains_key(&sym) {
+                    type_method.entry(key).or_insert(sym);
+                }
+            }
+        }
+
         let mut to_add: Vec<(NodeId, NodeId)> = Vec::new();
         for (file, calls) in &self.pending_calls {
             let (fcrate, fmodule) = crate_and_module(file).unwrap_or_default();
@@ -2777,6 +2821,8 @@ impl MemoryGraph {
                     &name_count,
                     &name_first,
                     file_aliases,
+                    &type_method,
+                    &tm_count,
                 ) {
                     if t != caller_sym {
                         to_add.push((caller_sym, t));
@@ -3180,6 +3226,8 @@ fn resolve_call(
     name_count: &HashMap<String, u32>,
     name_first: &HashMap<String, NodeId>,
     aliases: &HashMap<&str, &str>,
+    type_method: &HashMap<(String, String), NodeId>,
+    tm_count: &HashMap<(String, String), u32>,
 ) -> Option<NodeId> {
     // Renamed import — `use a::b as c` binds local `c` to target `a::b`. If the call's LEADING
     // segment is such a local name, rewrite it onto the target (`c` ⇒ `a::b`, `c::X` ⇒ `a::b::X`)
@@ -3198,8 +3246,18 @@ fn resolve_call(
             };
             let empty: HashMap<&str, &str> = HashMap::new();
             return resolve_call(
-                file, &rewritten, fcrate, fmodule, scope, file_index, defs, name_count, name_first,
+                file,
+                &rewritten,
+                fcrate,
+                fmodule,
+                scope,
+                file_index,
+                defs,
+                name_count,
+                name_first,
                 &empty,
+                type_method,
+                tm_count,
             );
         }
     }
@@ -3216,7 +3274,30 @@ fn resolve_call(
     // the unique `sym:<file>:name`. resolve-uniquely-or-skip, so anything unresolvable or ambiguous →
     // no edge (and a qualified path never falls through to the bare same-module/global ladder below).
     if callee.contains("::") {
-        return resolve_qualified(file, callee, fcrate, scope, file_index, defs);
+        // Slice 3 — a 2-segment `A::b` is ambiguous between a **module path** (`module::fn`) and a
+        // **type method** (`Type::method`, minted by `x.bar()` inference or written as `Foo::bar()`).
+        // Resolve BOTH interpretations and link only when they AGREE or exactly one resolves —
+        // resolve-uniquely-or-skip: a real collision where both resolve to *different* symbols is
+        // dropped, never guessed. A 3+-segment path (`a::b::C::d`) has a multi-segment prefix, so the
+        // type side abstains and behaviour is exactly the prior module-only resolution.
+        let module_hit = resolve_qualified(file, callee, fcrate, scope, file_index, defs);
+        let type_hit = match callee.rsplit_once("::") {
+            Some((ty, method)) if !ty.contains("::") => {
+                let key = (ty.to_string(), method.to_string());
+                // Only a graph-wide-unique `(type, method)` resolves; a homonym bucket abstains.
+                (tm_count.get(&key).copied() == Some(1))
+                    .then(|| type_method.get(&key).cloned())
+                    .flatten()
+            }
+            _ => None,
+        };
+        return match (module_hit, type_hit) {
+            (Some(m), Some(t)) if m == t => Some(m),
+            (Some(_), Some(_)) => None, // both resolve, to DIFFERENT symbols ⇒ ambiguous ⇒ skip
+            (Some(m), None) => Some(m),
+            (None, Some(t)) => Some(t),
+            (None, None) => None,
+        };
     }
     // Tier A — import-scoped: an import `use <module>::callee` pins the defining module; resolve it
     // to a file and require exactly one unique `sym:<file>:callee`. (Rust-name-resolution-correct:
@@ -3688,6 +3769,81 @@ mod tests {
             .collect();
         v.sort();
         v
+    }
+
+    // ── Slice 3: (type, method) resolution of an inferred `Foo::bar` callee ───────
+    #[test]
+    fn resolve_type_method_links_cross_file() {
+        // `Foo::bar` (minted by `x.bar()` inference) resolves to the method symbol via the
+        // (type, method) index — `bar` lives in a different file than the caller and `Foo` is no module.
+        let mut g = graph_with_defs(&[("src/a.rs", "bar"), ("src/b.rs", "run")]);
+        g.set_pending_methods("src/a.rs", vec![("Foo".into(), "bar".into())]);
+        g.set_pending_calls("src/b.rs", vec![("run".into(), "Foo::bar".into(), 1)]);
+        g.resolve_symbol_calls();
+        assert_eq!(
+            calls_of(&g),
+            vec![(
+                "sym:src/b.rs:run".to_string(),
+                "sym:src/a.rs:bar".to_string()
+            )],
+            "Foo::bar resolves to the method symbol via the type index"
+        );
+    }
+
+    #[test]
+    fn resolve_type_method_homonym_is_ambiguous_skip() {
+        // Two types both named `Foo`, each with a `bar` method: the (Foo,bar) bucket is non-unique, so
+        // the type interpretation abstains and the call is SKIPPED — never last-writer-wins (the prime
+        // false-edge hazard the cardinality guard closes).
+        let mut g = graph_with_defs(&[
+            ("src/a.rs", "bar"),
+            ("src/b.rs", "bar"),
+            ("src/c.rs", "run"),
+        ]);
+        g.set_pending_methods("src/a.rs", vec![("Foo".into(), "bar".into())]);
+        g.set_pending_methods("src/b.rs", vec![("Foo".into(), "bar".into())]);
+        g.set_pending_calls("src/c.rs", vec![("run".into(), "Foo::bar".into(), 1)]);
+        g.resolve_symbol_calls();
+        assert!(
+            calls_of(&g).is_empty(),
+            "a type-name homonym makes Foo::bar ambiguous — skip, never guess: {:?}",
+            calls_of(&g)
+        );
+    }
+
+    #[test]
+    fn resolve_type_method_paged_out_homonym_still_skips() {
+        // A genuine (Foo, bar) homonym where ONE method symbol is absent from the resident set (paged
+        // COLD): cardinality is counted over ALL ingested method defs, not just resident ones, so the
+        // homonym is still detected → skip. A resident-only count would under-count to 1 and mint a
+        // false edge to the surviving resident twin. (Adversarial-review regression.)
+        let mut g = graph_with_defs(&[("src/a.rs", "bar"), ("src/c.rs", "run")]);
+        // src/b.rs:bar is a real second definition, but its symbol node is NOT resident — we register
+        // the method-ownership fact without creating the sym node (simulating a paged-COLD twin).
+        g.set_pending_methods("src/a.rs", vec![("Foo".into(), "bar".into())]);
+        g.set_pending_methods("src/b.rs", vec![("Foo".into(), "bar".into())]);
+        g.set_pending_calls("src/c.rs", vec![("run".into(), "Foo::bar".into(), 1)]);
+        g.resolve_symbol_calls();
+        assert!(
+            calls_of(&g).is_empty(),
+            "a paged-out homonym still makes Foo::bar ambiguous — no false edge to the resident twin: {:?}",
+            calls_of(&g)
+        );
+    }
+
+    #[test]
+    fn resolve_type_method_unknown_type_skips_no_name_fallback() {
+        // `Foo::bar` where (Foo, bar) is NOT in the index resolves as NEITHER module nor type — it must
+        // skip, never fall back to a same-named free `bar` (the type branch is not a name fallback).
+        let mut g = graph_with_defs(&[("src/a.rs", "bar"), ("src/b.rs", "run")]);
+        // No set_pending_methods ⇒ (Foo, bar) is absent from the index.
+        g.set_pending_calls("src/b.rs", vec![("run".into(), "Foo::bar".into(), 1)]);
+        g.resolve_symbol_calls();
+        assert!(
+            calls_of(&g).is_empty(),
+            "unknown type Foo::bar skips, no fallback to the free bar: {:?}",
+            calls_of(&g)
+        );
     }
 
     #[test]

@@ -1652,6 +1652,68 @@ mod tests {
         m.resolve(); // …run them once, at the batch boundary
         m
     }
+    /// Sorted `Calls` edges as `(source_id, target_id)` pairs.
+    fn calls_edges(m: &CcosMemory) -> Vec<(String, String)> {
+        let mut v: Vec<(String, String)> = m
+            .graph()
+            .edges()
+            .iter()
+            .filter(|e| e.edge_type == crate::memory::EdgeType::Calls)
+            .map(|e| (e.source.0.clone(), e.target.0.clone()))
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[cfg(feature = "syn-parser")]
+    #[test]
+    fn method_call_receiver_inference_resolves_cross_file_without_false_edges() {
+        // Slice 3 end-to-end through the live engine: `w.render()` (w: Widget via the constructor
+        // idiom) resolves cross-file to Widget::render; a typed param `g: Gadget` resolves g.render()
+        // to Gadget::render; and the adversarial twin (same method name on a DIFFERENT type) never
+        // mints a false edge. Plus eager ≡ batch for the new method edges.
+        let files = [
+            ("src/widget.rs", "pub struct Widget;\nimpl Widget { pub fn new() -> Widget { Widget } pub fn render(&self) -> i64 { 1 } }\n"),
+            ("src/gadget.rs", "pub struct Gadget;\nimpl Gadget { pub fn new() -> Gadget { Gadget } pub fn render(&self) -> i64 { 2 } }\n"),
+            ("src/caller.rs", "pub fn drive_widget() -> i64 { let w = Widget::new(); w.render() }\npub fn drive_typed(g: Gadget) -> i64 { g.render() }\n"),
+        ];
+        let calls = calls_edges(&eager_build(&files));
+        let edge = |s: &str, t: &str| (s.to_string(), t.to_string());
+        assert!(
+            calls.contains(&edge(
+                "sym:src/caller.rs:drive_widget",
+                "sym:src/widget.rs:render"
+            )),
+            "w.render() (w: Widget) → Widget::render cross-file: {calls:?}"
+        );
+        assert!(
+            calls.contains(&edge(
+                "sym:src/caller.rs:drive_typed",
+                "sym:src/gadget.rs:render"
+            )),
+            "g.render() (g: Gadget) → Gadget::render: {calls:?}"
+        );
+        // The same-named method on the WRONG type must never link (the prime false edge #23 risks).
+        assert!(
+            !calls.contains(&edge(
+                "sym:src/caller.rs:drive_widget",
+                "sym:src/gadget.rs:render"
+            )),
+            "drive_widget must NOT cross-link to Gadget::render: {calls:?}"
+        );
+        assert!(
+            !calls.contains(&edge(
+                "sym:src/caller.rs:drive_typed",
+                "sym:src/widget.rs:render"
+            )),
+            "drive_typed must NOT cross-link to Widget::render: {calls:?}"
+        );
+        assert_eq!(
+            calls,
+            calls_edges(&batch_build(&files)),
+            "method-call edges are order-independent (eager ≡ batch)"
+        );
+    }
     // Only used by the syn-only stale-edge test below; gated so it isn't dead code
     // under `--no-default-features` (where `-D warnings` would reject it).
     #[cfg(feature = "syn-parser")]
