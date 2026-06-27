@@ -1585,7 +1585,10 @@ mod tests {
     #[test]
     fn resolve_is_idempotent_and_noop_when_clean() {
         let mut m = CcosMemory::new();
-        m.ingest_deferred("src/a.rs", "pub const K: i32 = 1;\npub fn f() -> i32 { K }\n");
+        m.ingest_deferred(
+            "src/a.rs",
+            "pub const K: i32 = 1;\npub fn f() -> i32 { K }\n",
+        );
         m.resolve();
         let resolved = m.graph().edge_count();
         assert!(
@@ -1595,7 +1598,11 @@ mod tests {
                 .any(|e| e.edge_type == crate::memory::EdgeType::DataFlow),
             "resolution added the f -> K data-flow edge"
         );
-        assert_eq!(m.resolve(), 0, "a second resolve on a clean graph is a no-op");
+        assert_eq!(
+            m.resolve(),
+            0,
+            "a second resolve on a clean graph is a no-op"
+        );
         assert_eq!(
             m.graph().edge_count(),
             resolved,
