@@ -21,36 +21,50 @@
 // range-loop lint is silenced for the module rather than obscuring the math.
 #![allow(clippy::needless_range_loop)]
 
-/// Top-`rank` right singular vectors of the document–term matrix `rows`
-/// (`docs × dim`): the top eigenvectors of `Mᵀ M`. Returns a `rank × dim` matrix
-/// `V` — project a `dim`-vector `x` into latent space with
-/// `latent[j] = dot(x, V[j])`. Deterministic. Empty when there is nothing to
-/// project (`dim == 0` or `rank == 0`).
-pub fn lsa_projection(rows: &[Vec<f32>], rank: usize) -> Vec<Vec<f32>> {
-    let dim = rows.first().map(Vec::len).unwrap_or(0);
-    let rank = rank.min(dim);
-    if dim == 0 || rank == 0 {
-        return Vec::new();
-    }
-    // Gram matrix C = Mᵀ M (dim × dim), symmetric PSD. Build the upper triangle
-    // from the (typically sparse) rows, then mirror.
-    let mut c = vec![vec![0f64; dim]; dim];
-    for row in rows {
+/// Accumulate the (weighted) document outer products of `rows` into the Gram matrix `gram`
+/// (`dim × dim`): `gram += Σ_d (w_d·row_d) (w_d·row_d)ᵀ`, where `w_d = weights[d]` (or `1` when
+/// `weights` is `None`). The **single source of truth** for the Gram, so the batch and incremental
+/// builders are bit-identical. Documents accumulate in the given order with fixed `f64` arithmetic, so
+/// the same documents in the same order — one batch or several — yield the identical Gram (the basis of
+/// `replay == live` for the learned embedder).
+fn accumulate(gram: &mut [Vec<f64>], rows: &[Vec<f32>], weights: Option<&[f32]>) {
+    let dim = gram.len();
+    for (d, row) in rows.iter().enumerate() {
+        let w = weights.map(|ws| ws[d] as f64).unwrap_or(1.0);
+        if w == 0.0 {
+            continue;
+        }
         for i in 0..dim {
-            let ri = row[i] as f64;
+            let ri = w * row[i] as f64;
             if ri == 0.0 {
                 continue;
             }
-            let ci = &mut c[i];
-            for (j, cij) in ci.iter_mut().enumerate().skip(i) {
-                *cij += ri * row[j] as f64;
+            let gi = &mut gram[i];
+            for j in 0..dim {
+                gi[j] += ri * (w * row[j] as f64);
             }
         }
     }
-    for i in 0..dim {
-        for j in 0..i {
-            c[i][j] = c[j][i];
-        }
+}
+
+/// The (weighted) Gram matrix `C = Mᵀ M` (`dim × dim`, symmetric PSD) of the document–term matrix
+/// `rows` (`docs × dim`). See [`accumulate`].
+fn gram_matrix(rows: &[Vec<f32>], weights: Option<&[f32]>) -> Vec<Vec<f64>> {
+    let dim = rows.first().map(Vec::len).unwrap_or(0);
+    let mut c = vec![vec![0f64; dim]; dim];
+    accumulate(&mut c, rows, weights);
+    c
+}
+
+/// Top-`rank` eigenvectors of a symmetric Gram matrix `c` (`dim × dim`), as a `rank × dim` matrix of
+/// `f32` basis vectors — the latent-semantic projection. Ordered by eigenvalue descending (ties by
+/// index), each vector sign-pinned (first non-zero component positive): fully deterministic. Empty when
+/// `dim == 0` or `rank == 0`. Constant cost in the corpus size (Jacobi on the fixed Gram).
+fn gram_projection(c: Vec<Vec<f64>>, rank: usize) -> Vec<Vec<f32>> {
+    let dim = c.len();
+    let rank = rank.min(dim);
+    if dim == 0 || rank == 0 {
+        return Vec::new();
     }
     let (eigvals, eigvecs) = jacobi_eigen(c);
     // Order eigenpairs by eigenvalue descending; ties by index (deterministic).
@@ -78,6 +92,66 @@ pub fn lsa_projection(rows: &[Vec<f32>], rank: usize) -> Vec<Vec<f32>> {
             v
         })
         .collect()
+}
+
+/// Top-`rank` right singular vectors of the document–term matrix `rows` (`docs × dim`): the top
+/// eigenvectors of `Mᵀ M`. Returns a `rank × dim` matrix `V` — project a `dim`-vector `x` into latent
+/// space with `latent[j] = dot(x, V[j])`. Deterministic. Empty when there is nothing to project
+/// (`dim == 0` or `rank == 0`). The unweighted form (every document influence `1`).
+pub fn lsa_projection(rows: &[Vec<f32>], rank: usize) -> Vec<Vec<f32>> {
+    gram_projection(gram_matrix(rows, None), rank)
+}
+
+/// **Causal-topology-weighted** LSA projection: like [`lsa_projection`], but each document row `i` is
+/// scaled by `weights[i]` (its eigencentrality × Q-Page authority) *before* the reduction, so the
+/// latent space is shaped by a document's **causal importance** rather than raw term frequency — the
+/// fusion of CCOS's causal graph with the semantic algebra. `weights.len()` must equal `rows.len()`.
+pub fn weighted_lsa_projection(rows: &[Vec<f32>], weights: &[f32], rank: usize) -> Vec<Vec<f32>> {
+    gram_projection(gram_matrix(rows, Some(weights)), rank)
+}
+
+/// An **incrementally-updatable** LSA model. CCOS's LSA factors through the Gram matrix `C = Mᵀ M`
+/// (`dim × dim`, fixed size), and `C` is a **sum of per-document outer products** — so a batch of new
+/// documents simply *adds* its (weighted) outer products to the running `C` (O(batch · nnz · dim),
+/// independent of the corpus already folded in), and re-deriving the projection is a constant-cost
+/// Jacobi sweep on the fixed Gram. `update` per batch is therefore **O(batch), not the O(N) full
+/// recompute**, and it is **bit-exact** versus a single batch over the same documents in the same order
+/// — the learned-embedder basis of `replay == live`.
+#[derive(Debug, Clone)]
+pub struct IncrementalLsa {
+    rank: usize,
+    gram: Vec<Vec<f64>>,
+    docs: usize,
+}
+
+impl IncrementalLsa {
+    /// A fresh model for a `dim`-dimensional term space, projecting to `rank` latent factors.
+    pub fn new(dim: usize, rank: usize) -> Self {
+        Self {
+            rank,
+            gram: vec![vec![0f64; dim]; dim],
+            docs: 0,
+        }
+    }
+
+    /// Fold a batch of document rows (each scaled by its causal `weights[i]`) into the running Gram.
+    /// Deterministic and additive, so folding the same documents in the same order — one batch or many
+    /// — yields the identical Gram (and projection). `weights.len()` must equal `rows.len()`.
+    pub fn update(&mut self, rows: &[Vec<f32>], weights: &[f32]) {
+        accumulate(&mut self.gram, rows, Some(weights));
+        self.docs += rows.len();
+    }
+
+    /// The current top-`rank` latent projection (a `rank × dim` matrix), re-derived from the running
+    /// Gram. Constant cost in the corpus size.
+    pub fn projection(&self) -> Vec<Vec<f32>> {
+        gram_projection(self.gram.clone(), self.rank)
+    }
+
+    /// Number of documents folded in so far.
+    pub fn docs(&self) -> usize {
+        self.docs
+    }
 }
 
 /// Project a `dim`-vector into the `rank`-dim latent space of a `projection`
@@ -253,6 +327,64 @@ mod tests {
         assert!(
             cos > 0.05,
             "LSA gives the synonym-bridged doc a positive similarity (raw is 0): {cos}"
+        );
+    }
+
+    #[test]
+    fn incremental_lsa_is_bit_exact_with_a_single_batch() {
+        // Folding documents across several batches must produce the BIT-IDENTICAL projection a single
+        // batch over the same documents in the same order does — the `replay == live` property of the
+        // incremental learned embedder (the Gram is an order-fixed sum of outer products).
+        let rows = vec![
+            vec![1.0f32, 0.0, 2.0, 0.0, 1.0],
+            vec![0.0, 1.0, 1.0, 0.0, 0.0],
+            vec![0.0, 0.0, 1.0, 3.0, 0.0],
+            vec![2.0, 1.0, 0.0, 0.0, 1.0],
+        ];
+        let weights = vec![0.9f32, 0.3, 0.7, 0.5];
+        let (dim, rank) = (5, 3);
+
+        let batch = weighted_lsa_projection(&rows, &weights, rank);
+
+        let mut inc = IncrementalLsa::new(dim, rank);
+        inc.update(&rows[0..2], &weights[0..2]);
+        inc.update(&rows[2..4], &weights[2..4]);
+        assert_eq!(inc.docs(), 4);
+        assert_eq!(
+            batch,
+            inc.projection(),
+            "incremental fold == single batch, bit-for-bit"
+        );
+
+        // The unweighted helper equals an all-ones weighting (single Gram code path).
+        let ones = vec![1.0f32; rows.len()];
+        assert_eq!(
+            lsa_projection(&rows, rank),
+            weighted_lsa_projection(&rows, &ones, rank)
+        );
+    }
+
+    #[test]
+    fn causal_weighting_reshapes_the_latent_space() {
+        // One "A"-theme doc (terms 0,1) vs three "B"-theme docs (terms 2,3). Under uniform weight the
+        // B-theme has 3× the mass, so the dominant latent factor is B and an A-vector projects to ~0.
+        // Up-weighting the single authoritative A-doc flips dominance to A, so the same A-vector now
+        // projects with real magnitude — causal authority reshaping the semantic space.
+        let rows = vec![
+            vec![1.0f32, 1.0, 0.0, 0.0],
+            vec![0.0, 0.0, 1.0, 1.0],
+            vec![0.0, 0.0, 1.0, 1.0],
+            vec![0.0, 0.0, 1.0, 1.0],
+        ];
+        let a_vec = [1.0f32, 1.0, 0.0, 0.0];
+        let mag = |p: &[Vec<f32>]| project(&a_vec, p).iter().map(|x| x.abs()).sum::<f32>();
+
+        let uniform = mag(&lsa_projection(&rows, 1));
+        let weighted = mag(&weighted_lsa_projection(&rows, &[3.0, 1.0, 1.0, 1.0], 1));
+        assert!(
+            weighted > uniform + 0.5,
+            "authority-weighting the A-doc makes the dominant factor favour A: weighted {weighted} \
+             vs uniform {uniform}"
         );
     }
 
