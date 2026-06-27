@@ -351,6 +351,20 @@ pub fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// Whether a **real vendor public key** is baked into this build (vs the all-zero placeholder that
+/// licenses nothing). Without the `license` feature there is no verifier, so this is always `false`.
+/// Diagnostic only (surfaced by `ccos doctor`) — never part of verification.
+pub fn embedded_key_is_set() -> bool {
+    #[cfg(feature = "license")]
+    {
+        LICENSE_PUBLIC_KEY != [0u8; 32]
+    }
+    #[cfg(not(feature = "license"))]
+    {
+        false
+    }
+}
+
 impl Licensing {
     /// Determine the active licensing from the host: load any local token ([`load_license_blob`]) and
     /// verify it with the compiled-in verifier. With the `license` feature that is the offline
