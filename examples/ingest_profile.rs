@@ -151,11 +151,12 @@ fn main() {
             let r = parser.parse_source(&p, &s);
             parser.update_memory_graph(&r, &s, &mut g);
         }
-        // …then resolve the whole graph exactly once, timing only that.
+        // …then resolve the whole graph exactly once, timing only that. `resolve_all`
+        // is the order-independent driver (B2-full): it prunes the resolution-owned
+        // edges, then re-runs the three passes. On this fresh graph there are no prior
+        // resolution edges, so the prune is a no-op scan and the cost is the passes.
         let t = Instant::now();
-        g.link_module_imports();
-        g.resolve_symbol_calls();
-        g.resolve_data_flow();
+        g.resolve_all();
         let batch_ms = t.elapsed().as_secs_f64() * 1e3;
         let ratio = if prev_b > 0.0 {
             batch_ms / prev_b
@@ -177,13 +178,12 @@ fn main() {
          B2-batch (applied): the resolve passes are order-independent pure functions of the FINAL\n\
          node + pending-ref set, so deferring them to ONE call at the batch boundary collapses the\n\
          O(N²) above to a single O(N) pass (the `# B2-batch` table: ~×2 per doubling, not ~×4.3).\n\
-         `CcosMemory::ingest_deferred` + `resolve` expose exactly this; the eager `ingest_source` and\n\
-         the replayable AgentSession path stay eager (incremental), so `replay == live` is exact —\n\
-         the two semantics differ only under late-arriving name ambiguity, which the batch resolves\n\
-         more cleanly (final-state, resolve-uniquely-or-skip). See docs/MEASUREMENT_batch_resolution.md.\n\
-         B2-full (next): order-independent resolution (prune resolution-owned edges before each\n\
-         rebuild) makes eager ≡ batch everywhere and lets the replay path batch too — ownership is\n\
-         mapped in that doc. DOD/SoA would only shave a constant factor and was never the bottleneck.\n\
+         `CcosMemory::ingest_deferred` + `resolve` expose this (via `resolve_all`).\n\
+         B2-full (applied): `resolve_all` PRUNES the resolution-owned edges then rebuilds from the\n\
+         final state, so per-file (eager) and batch ingestion — and a replay re-ingest — converge on\n\
+         the IDENTICAL graph (no order-dependent stale edges). `replay == live` stays exact, so the\n\
+         replayable path may now batch too (mechanical follow-up). See docs/MEASUREMENT_batch_resolution.md.\n\
+         DOD/SoA would only shave a constant factor and was never the bottleneck.\n\
          THIS is why we measure first."
     );
 }

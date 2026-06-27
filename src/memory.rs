@@ -2351,6 +2351,64 @@ impl MemoryGraph {
             .count()
     }
 
+    /// **Order-independent resolution** — the driver behind the deferred
+    /// [`CcosMemory::resolve`](crate::external_memory::CcosMemory::resolve). It
+    /// *prunes* the edges the three resolve passes own
+    /// ([`prune_resolution_edges`](Self::prune_resolution_edges)), then rebuilds them
+    /// from the **current** graph, so a resolved edge is a pure function of the final
+    /// node + pending-ref state — never of ingestion order.
+    ///
+    /// Why prune-then-rebuild: the passes are add-only and *resolve-uniquely-or-skip*,
+    /// so a bare `foo()` linked while `foo` was globally-unique would keep that `Calls`
+    /// edge even after a later file makes `foo` ambiguous (an order-dependent stale
+    /// edge). Pruning first means a name that became ambiguous is simply not re-linked,
+    /// so per-file (eager) and batch (deferred) ingestion — and a replay that re-ingests
+    /// the same files — all converge on the **same** graph (`replay == live` stays
+    /// exact, and the replayable path may batch). Returns the number of cross-file
+    /// **import** edges (re)added, matching the historical `link_module_imports` count.
+    pub fn resolve_all(&mut self) -> usize {
+        self.prune_resolution_edges();
+        let cross = self.link_module_imports();
+        let _ = self.resolve_symbol_calls();
+        let _ = self.resolve_data_flow();
+        cross
+    }
+
+    /// Remove the resolution-owned edges [`resolve_all`](Self::resolve_all) is about to
+    /// rebuild, **without losing anything that can't be rebuilt**. Two ownership tiers:
+    ///
+    /// - **Import / module-hierarchy** edges — `file: → file:` [`DependsOn`](EdgeType::DependsOn)
+    ///   / [`Contains`](EdgeType::Contains). Always pruned: `link_module_imports` rebuilds
+    ///   them from the **durable** `file:`/`use:` node set, so this is loss-free even for a
+    ///   checkpoint-loaded graph. (Parser `DependsOn`/`Contains` always target a
+    ///   `use:`/`dep:`/`mod:`/`sym:` node, never `file: → file:`, so they're untouched.)
+    /// - **`Calls` / `DataFlow`** — rebuilt from the **runtime-only** (`serde(skip)`)
+    ///   `pending_calls`/`pending_data_refs`, which are empty after a load. Pruned **only**
+    ///   when the edge's source file still has pending refs (this session, or a replay
+    ///   re-ingest) so it *will* be rebuilt; a loaded file with no pending refs keeps its
+    ///   edges (they were resolved correctly at ingest — pruning them would lose them).
+    ///
+    /// `edge_set` is rebuilt lazily by the next [`add_edge`](Self::add_edge) on the length
+    /// mismatch, the same contract [`prune_dangling_edges`](Self::prune_dangling_edges)
+    /// relies on. Returns the number of edges removed.
+    pub fn prune_resolution_edges(&mut self) -> usize {
+        let before = self.edges.len();
+        // Disjoint field borrows: `retain` over `edges` while reading the pending maps.
+        let pending_calls = &self.pending_calls;
+        let pending_data_refs = &self.pending_data_refs;
+        self.edges.retain(|e| match e.edge_type {
+            EdgeType::DependsOn | EdgeType::Contains => {
+                !(e.source.0.starts_with("file:") && e.target.0.starts_with("file:"))
+            }
+            EdgeType::Calls => !sym_file(&e.source).is_some_and(|f| pending_calls.contains_key(f)),
+            EdgeType::DataFlow => {
+                !sym_file(&e.source).is_some_and(|f| pending_data_refs.contains_key(f))
+            }
+            _ => true,
+        });
+        before - self.edges.len()
+    }
+
     /// Resolve intra-crate imports into `file → file` dependency edges.
     ///
     /// The parser records imports as `use:<file>:<path>` nodes but does not link
@@ -2910,6 +2968,15 @@ fn module_of(after: &str) -> Option<String> {
         segs.join("::")
     };
     Some(module)
+}
+
+/// The source-file segment of a `sym:<file>:<name>` node id, or `None` for any other
+/// id shape. Used by [`MemoryGraph::prune_resolution_edges`] to look a `Calls`/`DataFlow`
+/// edge's origin file up in the pending-ref maps.
+fn sym_file(id: &NodeId) -> Option<&str> {
+    id.0.strip_prefix("sym:")
+        .and_then(|r| r.rsplit_once(':'))
+        .map(|(file, _name)| file)
 }
 
 /// Split a file path into `(crate, intra-module)` for import resolution, robust to
