@@ -78,6 +78,21 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Temporal-tensor measurement — the "fever curve" of belief (#13, design pass).** The
+  spectral/centrality direction was found flat on CCOS's own small, densely-coupled graph, so the
+  "temporal tensor" is re-aimed at what CCOS actually *is* — a conflict-resolution engine.
+  `examples/temporal_tensor_crux.rs` records the dynamic-profile tensor `Θ[node, component, t]`,
+  `component ∈ {Belief, Tension}`, across a deterministic **Conflict-of-Origins** crisis: a believed
+  source and a conflicting (refuted) source both *cause* three decisions; on injection the refutation
+  propagates one causal hop and the decisions' **tension spikes together** (0 → 0.49), then the
+  knowledge half-life **decays** it back (0.49 → 0.20) — the fever breaks on its own. The origins stay
+  cool (each is one-sided); the heat emerges only where conflicting origins *meet*; and a contested
+  node halts the wavefront (no cascade — conflict is localized, not spread). The signal is sharp and
+  legible, so the dynamic belief/tension profile is a real primitive — a client-facing real-time fever
+  chart of the knowledge base facing injected misinformation. Deterministic (logical clock, sorted
+  propagation, no RNG) ⇒ `replay == live`. See `docs/MEASUREMENT_temporal_tensor.md`. Productionizing
+  it (a `spectral::temporal_profile` primitive + a CLI / MCP surface) is the next slice.
+
 - **The three Pro license behaviors, built and gated through `require()` (license slice 29b —
   completes #29).** Each gated feature now has a real implementation; the **core is never touched**,
   only the advanced surface:
