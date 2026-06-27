@@ -337,6 +337,19 @@ pub struct CcosMemory {
     /// built. Over-invalidating (bumped even for changes that don't affect a given
     /// cache) keeps it always-correct and never stale.
     version: u64,
+    /// **Deferred-resolution dirty bit** (B2-batch). The three whole-graph resolve
+    /// passes (`link_module_imports`, `resolve_symbol_calls`, `resolve_data_flow`)
+    /// are order-independent pure functions of the *final* node + pending-ref set,
+    /// so re-running them after every single file (the old `ingest_source`) is
+    /// O(N²) over a batch — the measured ingestion hotspot (`examples/ingest_profile.rs`).
+    /// [`ingest_deferred`](Self::ingest_deferred) skips the passes and sets this
+    /// flag; [`resolve`](Self::resolve) runs them **once** and clears it, making a
+    /// batch O(N). The eager [`ingest_source`](ExternalMemory::ingest_source) keeps
+    /// its contract (ingest → fully resolved) by calling `resolve` itself, so the
+    /// flag is never observably set to a `&self` reader on that path. Runtime-only
+    /// (never serialised): the resolved *edges* are the durable state, and a loaded
+    /// snapshot is always already resolved (we resolve before every serialise).
+    needs_resolution: bool,
     /// Cached region clustering (`(version, engine)`), so `region_member_ids` does
     /// not re-`initialize_regions` over the whole graph on every recall — the
     /// dominant per-recall cost for `around`/`task` recalls. Interior mutability so
@@ -372,6 +385,7 @@ impl CcosMemory {
             sources: BTreeMap::new(),
             path: None,
             version: 0,
+            needs_resolution: false,
             region_cache: RefCell::new(None),
             embed_cache: RefCell::new(None),
             lsa_rerank_rank: None,
@@ -473,6 +487,15 @@ impl CcosMemory {
     /// [`AgentSession`](crate::agent_session::AgentSession)) capture a baseline
     /// without touching the filesystem.
     pub fn to_json(&self) -> Result<String, MemoryError> {
+        // The pending-ref indices are runtime-only (`serde(skip)`): a snapshot saved
+        // with resolution pending would lose its call / data-flow edges permanently
+        // (they can't be rebuilt post-load). The eager `ingest_source` and every
+        // batch boundary resolve first, so this never fires in practice; the assert
+        // catches a future deferred path that forgot to `resolve` before serialising.
+        debug_assert!(
+            !self.needs_resolution,
+            "to_json on a graph with deferred resolution pending — call resolve() first"
+        );
         let persisted = PersistedRef {
             graph: &self.graph,
             event_log: &self.event_log,
@@ -494,6 +517,7 @@ impl CcosMemory {
             sources: p.sources,
             path: None,
             version: 0,
+            needs_resolution: false,
             region_cache: RefCell::new(None),
             embed_cache: RefCell::new(None),
             lsa_rerank_rank: None,
@@ -503,6 +527,10 @@ impl CcosMemory {
     /// Persist to an explicit path and bind it for later [`checkpoint`](ExternalMemory::checkpoint).
     pub fn checkpoint_to(&mut self, path: impl AsRef<Path>) -> Result<(), MemoryError> {
         let p = path.as_ref().to_path_buf();
+        // Resolve any deferred batch first: the snapshot must carry the resolved
+        // call / data-flow edges (the pending-ref indices that produce them are
+        // runtime-only and gone after load). No-op when already resolved.
+        self.resolve();
         // Durabilize the COLD-tier indices so the spill directory is consistent with
         // the snapshot we're about to write (Lever 2 crash-consistency).
         self.graph.flush_cold_tier()?;
@@ -1241,8 +1269,24 @@ pub(crate) fn workspace_file(path: &Path) -> PathBuf {
     }
 }
 
-impl ExternalMemory for CcosMemory {
-    fn ingest_source(&mut self, uri: &str, source: &str) -> IngestReport {
+/// Deferred-ingestion API — the inherent counterparts of the eager
+/// [`ingest_source`](ExternalMemory::ingest_source) trait method, kept next to it.
+impl CcosMemory {
+    /// Ingest a file **without** running the three whole-graph resolution passes,
+    /// marking resolution pending instead (B2-batch). For bulk loads: call this for
+    /// every file, then [`resolve`](Self::resolve) **once** — O(N) over the batch
+    /// instead of the O(N²) an eager per-file
+    /// [`ingest_source`](ExternalMemory::ingest_source) loop pays (the measured
+    /// ingestion hotspot, `examples/ingest_profile.rs`). The returned report's
+    /// `edges_added` counts only the file's own direct edges; the cross-file
+    /// import / call / data-flow edges are added (and the import count returned) by
+    /// the later `resolve`.
+    ///
+    /// **Contract:** the graph is left *unresolved* — the caller MUST `resolve`
+    /// before any `recall` / serialise / `graph()` read, or those cross-file edges
+    /// are missing (a debug build asserts on such a read). Keep the dirty window
+    /// inside one `&mut` scope so no `&self` reader can observe it.
+    pub fn ingest_deferred(&mut self, uri: &str, source: &str) -> IngestReport {
         self.bump_version();
         // Tolerate a redundant `file:` namespace prefix on the uri (an agent often
         // copies a node id back from `recall`, which returns `file:<path>`); without
@@ -1267,16 +1311,11 @@ impl ExternalMemory for CcosMemory {
             .engine
             .process_delta(uri, prev.as_deref(), source, &mut self.graph);
         self.sources.insert(file_key, source.to_string());
-        // Resolve intra-crate imports into file→file edges so recall, failure
-        // propagation and regions see the real cross-file causal structure.
-        let cross_edges = self.graph.link_module_imports();
-        // Resolve in-body call-sites into caller→callee `Calls` edges (fn→fn structure that
-        // import edges miss). Whole-graph pass — a call may target a symbol in another file.
-        let call_edges = self.graph.resolve_symbol_calls();
-        let _ = call_edges;
-        // Resolve in-body static/const references into reader→item `DataFlow` edges (the shared
-        // -global-state structure call/import edges miss). Whole-graph pass, like call resolution.
-        let _ = self.graph.resolve_data_flow();
+        // Defer the three whole-graph resolve passes (imports, calls, data-flow) to
+        // a single `resolve` at the batch boundary — they are order-independent pure
+        // functions of the final node + pending-ref set, so running them once yields
+        // the same graph as per-file resolution at O(N) instead of O(N²).
+        self.needs_resolution = true;
         let file_hash = sha256_hex(source);
         self.event_log.append(
             EventType::Parsing,
@@ -1294,11 +1333,52 @@ impl ExternalMemory for CcosMemory {
             uri: uri.to_string(),
             nodes_added: delta.nodes_added,
             nodes_removed: delta.nodes_removed,
-            edges_added: delta.edges_added + cross_edges,
+            // Direct edges only; cross-file edges are resolved (and counted) later.
+            edges_added: delta.edges_added,
             anomalies: scan.findings,
             injection_score,
             injection_flagged: injection_score >= 0.5,
         }
+    }
+
+    /// Run the deferred whole-graph resolution passes **once** if any
+    /// [`ingest_deferred`](Self::ingest_deferred) is pending, then clear the dirty
+    /// bit. Idempotent and near-free when clean (the common case): a `&mut` batch
+    /// boundary calls it before the first read / serialise. Returns the number of
+    /// cross-file **import** edges added (the call / data-flow passes also run; their
+    /// counts are not reported, matching the historical `ingest_source` report).
+    /// Order-independent: the resolved edge set is a pure function of the current
+    /// node + pending-ref state, so a deferred batch yields exactly the graph an
+    /// eager file-by-file ingest would (see the equivalence tests).
+    pub fn resolve(&mut self) -> usize {
+        if !self.needs_resolution {
+            return 0;
+        }
+        // Resolve intra-crate imports into file→file edges so recall, failure
+        // propagation and regions see the real cross-file causal structure.
+        let cross_edges = self.graph.link_module_imports();
+        // Caller→callee `Calls` edges (fn→fn structure import edges miss), then
+        // reader→item `DataFlow` edges (shared-global state call/import edges miss).
+        let _ = self.graph.resolve_symbol_calls();
+        let _ = self.graph.resolve_data_flow();
+        self.needs_resolution = false;
+        self.bump_version();
+        cross_edges
+    }
+}
+
+impl ExternalMemory for CcosMemory {
+    fn ingest_source(&mut self, uri: &str, source: &str) -> IngestReport {
+        // Eager contract (single-file path): ingest, then resolve **immediately**, so
+        // a `&self` reader (recall / serialise) always sees a fully-resolved graph —
+        // exactly the historical behaviour. `resolve` returns the same cross-file
+        // import count this report has always carried (the call / data-flow passes
+        // run too; their counts were never reported). Bulk callers that ingest many
+        // files up front should use `ingest_deferred` + a single `resolve` instead —
+        // O(N) over the batch, not the O(N²) this per-file loop pays (B2-batch).
+        let mut report = self.ingest_deferred(uri, source);
+        report.edges_added += self.resolve();
+        report
     }
 
     fn signal_failure(&mut self, node: &str, depth: u32) -> Result<usize, MemoryError> {
@@ -1325,6 +1405,16 @@ impl ExternalMemory for CcosMemory {
     }
 
     fn recall(&self, recall: &Recall, budget_tokens: usize) -> RecallWindow {
+        // Cross-file selection (Around / failure propagation / regions) reads the
+        // resolved import / call / data-flow edges. The eager `ingest_source` and
+        // every batch boundary resolve before returning control, so this holds; the
+        // assert turns a future "deferred-ingest then recall without resolve" bug
+        // into a loud failure across the whole test suite instead of a silent
+        // under-resolved window.
+        debug_assert!(
+            !self.needs_resolution,
+            "recall on a graph with deferred resolution pending — call resolve() first"
+        );
         match recall {
             Recall::WorkingSet => {
                 let ids = self
@@ -1441,6 +1531,10 @@ impl ExternalMemory for CcosMemory {
     }
 
     fn checkpoint(&self) -> Result<(), MemoryError> {
+        debug_assert!(
+            !self.needs_resolution,
+            "checkpoint on a graph with deferred resolution pending — call resolve() first"
+        );
         match &self.path {
             Some(p) => self.write_to(p),
             None => Err(MemoryError::NoPath),
@@ -1451,6 +1545,169 @@ impl ExternalMemory for CcosMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── B2-batch: deferred whole-graph resolution ────────────────────────────────
+    // A structural fingerprint of the resolved graph (sorted edges), so the eager
+    // and deferred-batch paths can be compared edge-for-edge.
+    fn edge_fp(m: &CcosMemory) -> Vec<String> {
+        let mut e: Vec<String> = m
+            .graph()
+            .edges()
+            .iter()
+            .map(|e| format!("{}->{}:{:?}", e.source.0, e.target.0, e.edge_type))
+            .collect();
+        e.sort();
+        e
+    }
+    fn eager_build(files: &[(&str, &str)]) -> CcosMemory {
+        let mut m = CcosMemory::new();
+        for (u, s) in files {
+            m.ingest_source(u, s); // eager: resolves after every file
+        }
+        m
+    }
+    fn batch_build(files: &[(&str, &str)]) -> CcosMemory {
+        let mut m = CcosMemory::new();
+        for (u, s) in files {
+            m.ingest_deferred(u, s); // defer the three resolve passes…
+        }
+        m.resolve(); // …run them once, at the batch boundary
+        m
+    }
+    // Only used by the syn-only stale-edge test below; gated so it isn't dead code
+    // under `--no-default-features` (where `-D warnings` would reject it).
+    #[cfg(feature = "syn-parser")]
+    fn count_calls(m: &CcosMemory) -> usize {
+        m.graph()
+            .edges()
+            .iter()
+            .filter(|e| e.edge_type == crate::memory::EdgeType::Calls)
+            .count()
+    }
+
+    #[test]
+    fn resolve_is_idempotent_and_noop_when_clean() {
+        // Use a cross-file *import* edge (extracted by both the syn and line-heuristic
+        // parsers) so this runs under every feature config — the point is resolve()'s
+        // idempotency, not a parser-specific edge kind.
+        let mut m = CcosMemory::new();
+        m.ingest_deferred("src/db.rs", "pub fn connect() -> i32 { 1 }\n");
+        m.ingest_deferred(
+            "src/repo.rs",
+            "use crate::db;\npub fn load() -> i32 { db::connect() }\n",
+        );
+        let cross = m.resolve();
+        assert!(cross >= 1, "resolution added the cross-file import edge");
+        let resolved = m.graph().edge_count();
+        assert_eq!(
+            m.resolve(),
+            0,
+            "a second resolve on a clean graph is a no-op"
+        );
+        assert_eq!(
+            m.graph().edge_count(),
+            resolved,
+            "idempotent: resolving a clean graph adds nothing"
+        );
+    }
+
+    #[test]
+    fn deferred_batch_is_order_independent() {
+        // Same files, three ingest orders → the identical resolved graph, because the
+        // batch resolves the *final* node + pending-ref set (a pure function of the
+        // complete graph, not of arrival order) — even with the ambiguous `target`.
+        let files = [
+            ("src/a.rs", "pub fn target() -> i32 { 1 }\n"),
+            ("src/caller.rs", "pub fn run() -> i32 { target() }\n"),
+            ("src/b.rs", "pub fn target() -> i32 { 2 }\n"),
+        ];
+        let o1 = batch_build(&files);
+        let o2 = batch_build(&[files[2], files[0], files[1]]);
+        let o3 = batch_build(&[files[1], files[2], files[0]]);
+        assert_eq!(edge_fp(&o1), edge_fp(&o2), "order-independent (rotation 1)");
+        assert_eq!(edge_fp(&o1), edge_fp(&o3), "order-independent (rotation 2)");
+    }
+
+    #[test]
+    fn deferred_batch_equals_eager_on_unambiguous_corpus() {
+        // The common case: every name resolves uniquely at the end, so the eager
+        // per-file path and the deferred batch path produce the identical graph — the
+        // batch is a pure O(N) speedup with no semantic change. Exercises all three
+        // passes: imports (use crate::*), calls (db::connect/repo::load), data-flow (MAX).
+        let files = [
+            (
+                "src/db.rs",
+                "pub const MAX: usize = 10;\npub fn connect() -> usize { MAX }\n",
+            ),
+            (
+                "src/repo.rs",
+                "use crate::db;\npub fn load() -> usize { db::connect() }\n",
+            ),
+            (
+                "src/api.rs",
+                "use crate::repo;\npub fn handler() -> usize { repo::load() }\n",
+            ),
+        ];
+        assert_eq!(
+            edge_fp(&eager_build(&files)),
+            edge_fp(&batch_build(&files)),
+            "deferred batch == eager per-file on an unambiguous corpus"
+        );
+    }
+
+    // Calls edges only exist with the real `syn` AST parser (the line-heuristic
+    // fallback does not extract in-body call-sites), so this divergence is syn-only.
+    #[cfg(feature = "syn-parser")]
+    #[test]
+    fn eager_keeps_stale_edge_that_batch_drops_under_late_ambiguity() {
+        // Documented semantic difference (measured, not papered over). Eager per-file
+        // resolution adds `run -> a::target` while `target` is still globally-unique
+        // and never removes it once `b::target` makes the call ambiguous (resolution
+        // is add-only). The deferred batch resolves against the FINAL state, sees the
+        // ambiguity, and skips the edge (resolve-uniquely-or-skip). So: batch =
+        // order-independent final-state semantics; eager = order-dependent
+        // incremental. Making the two identical by pruning resolution-owned edges
+        // before each rebuild is the order-independent-resolution follow-up
+        // (ownership mapped in docs/MEASUREMENT_batch_resolution.md). Until then the
+        // replayable AgentSession path stays eager, so `replay == live` is exact.
+        let files = [
+            ("src/a.rs", "pub fn target() -> i32 { 1 }\n"),
+            ("src/caller.rs", "pub fn run() -> i32 { target() }\n"),
+            ("src/b.rs", "pub fn target() -> i32 { 2 }\n"),
+        ];
+        assert_eq!(
+            count_calls(&eager_build(&files)),
+            1,
+            "eager keeps the order-dependent Calls edge resolved while target was unique"
+        );
+        assert_eq!(
+            count_calls(&batch_build(&files)),
+            0,
+            "batch drops the now-ambiguous call — cleaner final-state semantics"
+        );
+    }
+
+    #[test]
+    fn ingest_source_leaves_graph_resolved_eagerly() {
+        // The eager contract is preserved: a cross-file import edge is present
+        // immediately after ingest_source, with no explicit resolve() call — every
+        // existing `&self` reader (recall / serialise) still sees a resolved graph.
+        let mut m = CcosMemory::new();
+        m.ingest_source("src/db.rs", "pub fn connect() -> i32 { 1 }\n");
+        m.ingest_source(
+            "src/repo.rs",
+            "use crate::db;\npub fn load() -> i32 { db::connect() }\n",
+        );
+        let has_dep = m.graph().edges().iter().any(|e| {
+            e.edge_type == crate::memory::EdgeType::DependsOn
+                && e.source.0 == "file:src/repo.rs"
+                && e.target.0 == "file:src/db.rs"
+        });
+        assert!(
+            has_dep,
+            "ingest_source resolves eagerly — cross-file edge present without resolve()"
+        );
+    }
 
     #[test]
     fn recall_excludes_external_dependency_hubs() {

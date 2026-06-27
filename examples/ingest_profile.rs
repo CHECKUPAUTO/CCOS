@@ -136,6 +136,36 @@ fn main() {
         prev = resolve_ms;
     }
 
+    // ── B2-batch: defer the whole-graph resolve passes to ONE call at the batch
+    // boundary (exactly what `CcosMemory::ingest_deferred` + `resolve` do). For this
+    // unambiguous corpus the resolved graph is identical to the per-file path; the
+    // cost collapses from the O(N²) above to a single O(N) pass. ──────────────────
+    println!("\n# B2-batch — defer, then resolve ONCE after all files (no paging)");
+    println!("  files   batch resolve(ms)   ratio when files ×2");
+    let mut prev_b = 0.0;
+    for &n in &[150usize, 300, 600] {
+        let mut g = MemoryGraph::new(0.0, usize::MAX);
+        // Ingest every file WITHOUT resolving (defer the three passes)…
+        for i in 0..n {
+            let (p, s) = synth_file(i, fns_per_file);
+            let r = parser.parse_source(&p, &s);
+            parser.update_memory_graph(&r, &s, &mut g);
+        }
+        // …then resolve the whole graph exactly once, timing only that.
+        let t = Instant::now();
+        g.link_module_imports();
+        g.resolve_symbol_calls();
+        g.resolve_data_flow();
+        let batch_ms = t.elapsed().as_secs_f64() * 1e3;
+        let ratio = if prev_b > 0.0 {
+            batch_ms / prev_b
+        } else {
+            f64::NAN
+        };
+        println!("  {n:>5}   {batch_ms:>16.1}   {ratio:>5.2}");
+        prev_b = batch_ms;
+    }
+
     println!(
         "\nFinding: parse (syn) is cheap (~5%); the cost is the whole-graph **resolve passes**\n\
          (data-flow ~49%, calls ~23%) — never the parser, never cache layout.\n\
@@ -143,9 +173,17 @@ fn main() {
          ingestion ~CUBIC (600 files = ~216 s). Replacing it with an O(1) membership-set dedup dropped\n\
          the single pass ~11x (resolve-data-flow ~70x) and the scaling to a clean ~O(N²) (×~4.3 per\n\
          file-count doubling; 600 files ≈ 11 s). The remaining quadratic is the second cause —\n\
-         `ingest_source` re-runs the whole-graph passes after EVERY file.\n\
-         B2 (next): incremental resolution — resolve only the new file's pending refs against a\n\
-         maintained index — removes it, → ~O(N). DOD/SoA would only shave a constant factor and was\n\
-         never the bottleneck. THIS is why we measure first."
+         per-file ingestion re-runs the whole-graph passes after EVERY file.\n\
+         B2-batch (applied): the resolve passes are order-independent pure functions of the FINAL\n\
+         node + pending-ref set, so deferring them to ONE call at the batch boundary collapses the\n\
+         O(N²) above to a single O(N) pass (the `# B2-batch` table: ~×2 per doubling, not ~×4.3).\n\
+         `CcosMemory::ingest_deferred` + `resolve` expose exactly this; the eager `ingest_source` and\n\
+         the replayable AgentSession path stay eager (incremental), so `replay == live` is exact —\n\
+         the two semantics differ only under late-arriving name ambiguity, which the batch resolves\n\
+         more cleanly (final-state, resolve-uniquely-or-skip). See docs/MEASUREMENT_batch_resolution.md.\n\
+         B2-full (next): order-independent resolution (prune resolution-owned edges before each\n\
+         rebuild) makes eager ≡ batch everywhere and lets the replay path batch too — ownership is\n\
+         mapped in that doc. DOD/SoA would only shave a constant factor and was never the bottleneck.\n\
+         THIS is why we measure first."
     );
 }
