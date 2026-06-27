@@ -105,6 +105,7 @@ async fn main() {
         "experiment" => run_experiment_cmd(rest),
         "eval" => run_eval_cmd(rest).await,
         "memory" => run_memory_cmd(rest),
+        "license" => run_license(rest),
         "trace" => run_trace_cmd(),
         "mcp" => {
             // Optional positional workspace path (else $CCOS_MCP_WORKSPACE, else
@@ -142,6 +143,60 @@ async fn main() {
         }
     };
     std::process::exit(code);
+}
+
+/// `ccos license` — report the active licensing tier (community / Pro), the licensee and expiry, and
+/// the Pro feature set. Read-only and **offline**: it loads any local token (`$CCOS_LICENSE` or the
+/// license file) and verifies it against the baked-in public key. Without the `license` feature there
+/// is no embedded verifier, so it always reports community — the core is never gated or degraded.
+fn run_license(_args: &[String]) -> CliResult {
+    use ccos::license::{Feature, Licensing, Tier};
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let blob = ccos::license::load_license_blob();
+
+    #[cfg(feature = "license")]
+    let licensing = match blob.as_deref() {
+        Some(b) => Licensing::from_blob(&ccos::license::Ed25519Verifier::new(), b, now),
+        None => Licensing::community(),
+    };
+    #[cfg(not(feature = "license"))]
+    let licensing = Licensing::community();
+
+    match licensing.tier(now) {
+        Tier::Pro => {
+            println!("ccos license: PRO");
+            if let Some(who) = licensing.licensee() {
+                println!("  licensee: {who}");
+            }
+            println!("  unlocked Pro features:");
+            for f in Feature::ALL {
+                println!("    - {f}");
+            }
+        }
+        Tier::Community => {
+            println!("ccos license: COMMUNITY (full core, no Pro features)");
+            if blob.is_some() {
+                println!("  note: a license token was found but is invalid or expired.");
+            }
+            println!(
+                "  the core (ingestion, causal graph, Q-Page belief/decay/propagation) is fully \
+                 functional."
+            );
+            println!("  Pro features (locally-verified annual license, nothing leaves your host):");
+            for f in Feature::ALL {
+                println!("    - {f}");
+            }
+            #[cfg(not(feature = "license"))]
+            println!(
+                "  (this build has no license verifier compiled in — rebuild with \
+                 `--features license` to enable Pro)"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Options for `ccos analyze`.

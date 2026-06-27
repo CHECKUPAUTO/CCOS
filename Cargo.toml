@@ -33,6 +33,13 @@ proc-macro2 = { version = "1", features = ["span-locations"], optional = true }
 # docs/PERFORMANCE.md.
 mimalloc = { version = "0.1", optional = true }
 
+# Optional offline license verifier (ROADMAP — Pro gating). Behind the `license`
+# feature so the default build pulls in **no cryptography**: a license is a locally
+# signed token verified with a baked-in ed25519 **public** key — no network, no
+# telemetry, nothing leaves the host. The matching private key is the vendor's and
+# never lives in this tree. See `src/license.rs`.
+ed25519-dalek = { version = "2", optional = true }
+
 [features]
 # Default = the **sync core** (causal memory, hash-chained event log, recall) plus
 # the real `syn` **AST parser**, now the default ingestion path: it is 36.5% more
@@ -53,6 +60,10 @@ mimalloc = ["dep:mimalloc"]
 # sweep), so the replay invariant holds; the default build keeps raw TF-IDF, the
 # measured baseline. See `src/lsa.rs` and ROADMAP "better retrieval — slice B".
 learned-embed = []
+# Offline **Pro license** verification: a locally signed (ed25519) token checked
+# against a baked-in public key. Pulls in `ed25519-dalek`; the default build has no
+# cryptography and runs in the free community tier. Nothing leaves the host.
+license = ["dep:ed25519-dalek"]
 
 [dev-dependencies]
 proptest = "1"
@@ -68,3 +79,9 @@ required-features = ["llm"]
 [[bench]]
 name = "delta_bench"
 harness = false
+
+# Vendor signing / keygen tool for offline licenses — requires the `license` feature
+# (it needs the ed25519 signing primitives). Never ships in the default build.
+[[example]]
+name = "license_sign"
+required-features = ["license"]

@@ -15,10 +15,11 @@
 //!   per-source authority weighting, cognitive-tension visualization in the logs, and audit-report
 //!   generation — tools the operator points *at their own system*.
 //!
-//! This module is the **gate**: tiers, the feature set, and the explicit-logging policy. It performs
-//! **no I/O itself** (a caller loads the local license file and passes the bytes in). The actual
-//! public-key signature check ([`LicenseVerifier`]) is pluggable; the bundled `ed25519` verifier is
-//! provided behind the `license` cargo feature so the default build pulls in no cryptography.
+//! This module is the **gate**: tiers, the feature set, and the explicit-logging policy. The gate and
+//! the verifier are **pure** — the single [`load_license_blob`] helper is the one explicit, opt-in I/O
+//! entry point (an env var or a local file; never a network call). The public-key signature check
+//! ([`LicenseVerifier`]) is pluggable; the bundled ed25519 verifier ([`Ed25519Verifier`]) is provided
+//! behind the `license` cargo feature so the default build pulls in no cryptography.
 
 use std::fmt;
 
@@ -131,6 +132,214 @@ impl LicenseVerifier for CommunityVerifier {
     fn verify(&self, _blob: &[u8], _now: u64) -> Result<License, LicenseError> {
         Err(LicenseError::NoLicense)
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Offline ed25519 verifier + signed-token format (behind the `license` feature)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The vendor's **ed25519 public key**, baked into the binary. A license token is signed by the
+/// matching private key — held only by the vendor, never in this tree — and verification is a pure
+/// offline signature check against this constant. A deployment with its own key replaces these 32
+/// bytes with its own public key (its private half then signs that deployment's licenses). An unset
+/// value (the placeholder below) or any non-point makes [`Ed25519Verifier`] license **nothing** →
+/// community tier, so a build that never set a real key fails **closed**, never open.
+///
+/// Regenerate with `cargo run --features license --example license_sign keygen`.
+#[cfg(feature = "license")]
+pub const LICENSE_PUBLIC_KEY: [u8; 32] = [0u8; 32];
+
+/// The signed-token payload: who, and until when. Compact-JSON + base64url is the token's first
+/// segment.
+#[cfg(feature = "license")]
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TokenPayload {
+    /// Licensee (organisation / deployment name) — surfaced in the audit log.
+    licensee: String,
+    /// Expiry, unix seconds. Absent = perpetual.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    exp: Option<u64>,
+}
+
+/// URL-safe base64 **without padding** (RFC 4648 §5: `-`/`_`, no `=`). Hand-rolled so the `license`
+/// feature's only new dependency is the ed25519 primitive — the same reason CCOS hand-rolls its hex.
+#[cfg(feature = "license")]
+fn b64url_encode(bytes: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(A[(n >> 18) as usize & 63] as char);
+        out.push(A[(n >> 12) as usize & 63] as char);
+        if chunk.len() > 1 {
+            out.push(A[(n >> 6) as usize & 63] as char);
+        }
+        if chunk.len() > 2 {
+            out.push(A[n as usize & 63] as char);
+        }
+    }
+    out
+}
+
+/// Inverse of [`b64url_encode`]. `None` on any non-alphabet byte or a truncated group.
+#[cfg(feature = "license")]
+fn b64url_decode(s: &str) -> Option<Vec<u8>> {
+    let val = |c: u8| -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => (c - b'A') as u32,
+            b'a'..=b'z' => (c - b'a' + 26) as u32,
+            b'0'..=b'9' => (c - b'0' + 52) as u32,
+            b'-' => 62,
+            b'_' => 63,
+            _ => return None,
+        })
+    };
+    let s = s.as_bytes();
+    let mut out = Vec::with_capacity(s.len() / 4 * 3 + 3);
+    for chunk in s.chunks(4) {
+        if chunk.len() < 2 {
+            return None; // a lone trailing char encodes no full byte
+        }
+        let mut n = 0u32;
+        for (i, &c) in chunk.iter().enumerate() {
+            n |= val(c)? << (18 - 6 * i);
+        }
+        out.push((n >> 16) as u8);
+        if chunk.len() > 2 {
+            out.push((n >> 8) as u8);
+        }
+        if chunk.len() > 3 {
+            out.push(n as u8);
+        }
+    }
+    Some(out)
+}
+
+/// Sign a license token with the 32-byte ed25519 **signing seed** (private key material): emits
+/// `base64url(payload).base64url(signature)`, the signature taken over the first segment's ASCII
+/// bytes (JWT convention). Vendor-side tooling and the tests use this; the engine only ever *verifies*.
+#[cfg(feature = "license")]
+pub fn sign_token(signing_seed: &[u8; 32], licensee: &str, exp: Option<u64>) -> String {
+    use ed25519_dalek::{Signer, SigningKey};
+    let payload = TokenPayload {
+        licensee: licensee.to_string(),
+        exp,
+    };
+    let json = serde_json::to_vec(&payload).expect("payload serialises");
+    let signing_input = b64url_encode(&json);
+    let sk = SigningKey::from_bytes(signing_seed);
+    let sig = sk.sign(signing_input.as_bytes());
+    format!("{signing_input}.{}", b64url_encode(&sig.to_bytes()))
+}
+
+/// The offline **ed25519 license verifier**: a pure signature + format check against a public key
+/// (the baked-in [`LICENSE_PUBLIC_KEY`] by default). No I/O, no clock, no network — the zero-knowledge
+/// contract that lets a customer run air-gapped. An unset / invalid embedded key licenses nothing.
+#[cfg(feature = "license")]
+#[derive(Clone)]
+pub struct Ed25519Verifier {
+    key: Option<ed25519_dalek::VerifyingKey>,
+}
+
+#[cfg(feature = "license")]
+impl Default for Ed25519Verifier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "license")]
+impl Ed25519Verifier {
+    /// Verifier bound to the baked-in vendor key ([`LICENSE_PUBLIC_KEY`]). The all-zero placeholder
+    /// shipped in this open tree means *no key was set* → it licenses nothing, so the default build is
+    /// **fail-closed**: a deployment must paste its own public key (via the `license_sign keygen` tool)
+    /// before any token can unlock Pro.
+    pub fn new() -> Self {
+        if LICENSE_PUBLIC_KEY == [0u8; 32] {
+            return Self { key: None };
+        }
+        Self::with_public_key(&LICENSE_PUBLIC_KEY)
+    }
+
+    /// Verifier bound to an explicit public key — the tests sign with a throwaway keypair and verify
+    /// against its public half, never the embedded vendor key.
+    pub fn with_public_key(public_key: &[u8; 32]) -> Self {
+        Self {
+            key: ed25519_dalek::VerifyingKey::from_bytes(public_key).ok(),
+        }
+    }
+}
+
+#[cfg(feature = "license")]
+impl LicenseVerifier for Ed25519Verifier {
+    /// Verify `blob` (a `payload.sig` token, tolerant of trailing whitespace from a file) and return
+    /// the encoded [`License`] on a good signature. Temporal validity is **not** checked here — a
+    /// signature-valid but expired token still parses, and [`Licensing::tier`] reports it as community
+    /// (so the CLI can say *expired on X* while keeping the licensee for the audit log). `now` is thus
+    /// unused; the check is pure signature + format.
+    fn verify(&self, blob: &[u8], _now: u64) -> Result<License, LicenseError> {
+        let key = self
+            .key
+            .as_ref()
+            .ok_or_else(|| LicenseError::Invalid("no embedded public key".into()))?;
+        let token = std::str::from_utf8(blob)
+            .map_err(|_| LicenseError::Invalid("token is not UTF-8".into()))?
+            .trim();
+        let (signing_input, sig_b64) = token
+            .split_once('.')
+            .ok_or_else(|| LicenseError::Invalid("token is not payload.signature".into()))?;
+        let sig_bytes = b64url_decode(sig_b64)
+            .filter(|s| s.len() == 64)
+            .ok_or_else(|| LicenseError::Invalid("signature is not 64 base64url bytes".into()))?;
+        let sig_array: [u8; 64] = sig_bytes.try_into().expect("length checked to be 64");
+        let sig = ed25519_dalek::Signature::from_bytes(&sig_array);
+        use ed25519_dalek::Verifier;
+        key.verify(signing_input.as_bytes(), &sig)
+            .map_err(|_| LicenseError::Invalid("bad signature".into()))?;
+        let json = b64url_decode(signing_input)
+            .ok_or_else(|| LicenseError::Invalid("payload is not base64url".into()))?;
+        let payload: TokenPayload = serde_json::from_slice(&json)
+            .map_err(|e| LicenseError::Invalid(format!("payload JSON: {e}")))?;
+        Ok(License {
+            licensee: payload.licensee,
+            expires_at: payload.exp,
+        })
+    }
+}
+
+/// Load a license token from the host — **the one explicit I/O entry point** (the gate and verifier
+/// are pure). Order: the `$CCOS_LICENSE` env var (the token text inline — handy in containers / CI),
+/// else the file at `$CCOS_LICENSE_FILE`, else the XDG default `$XDG_CONFIG_HOME/ccos/license` (or
+/// `~/.config/ccos/license`). Returns `None` when nothing is present → the community tier. Never
+/// fails: an unreadable or absent file is simply "no license".
+pub fn load_license_blob() -> Option<Vec<u8>> {
+    if let Ok(token) = std::env::var("CCOS_LICENSE") {
+        let token = token.trim();
+        if !token.is_empty() {
+            return Some(token.as_bytes().to_vec());
+        }
+    }
+    let path = std::env::var_os("CCOS_LICENSE_FILE")
+        .map(std::path::PathBuf::from)
+        .or_else(default_license_path)?;
+    std::fs::read(path).ok()
+}
+
+/// `$XDG_CONFIG_HOME/ccos/license`, else `$HOME/.config/ccos/license`.
+fn default_license_path() -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+        return Some(PathBuf::from(xdg).join("ccos").join("license"));
+    }
+    std::env::var_os("HOME").map(|home| {
+        PathBuf::from(home)
+            .join(".config")
+            .join("ccos")
+            .join("license")
+    })
 }
 
 /// Runtime license state and the **feature gate**. Holds an optional verified [`License`] and never
@@ -253,5 +462,124 @@ mod tests {
         // The default verifier holds no key and reaches no network — any blob is community.
         let s = Licensing::from_blob(&CommunityVerifier, b"any-token-at-all", NOW);
         assert_eq!(s.tier(NOW), Tier::Community);
+    }
+
+    // ── ed25519 verifier + token format (behind the `license` feature) ────────
+    // A throwaway TEST key: its public half is derived at runtime and passed to
+    // `with_public_key`, never the embedded vendor key — so no production private
+    // key lives in the tree.
+    #[cfg(feature = "license")]
+    const TEST_SEED: [u8; 32] = [7u8; 32];
+
+    #[cfg(feature = "license")]
+    fn test_verifier() -> Ed25519Verifier {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&TEST_SEED);
+        Ed25519Verifier::with_public_key(&sk.verifying_key().to_bytes())
+    }
+
+    #[cfg(feature = "license")]
+    #[test]
+    fn b64url_round_trips_without_padding() {
+        let cases: [&[u8]; 8] = [
+            b"",
+            b"f",
+            b"fo",
+            b"foo",
+            b"foob",
+            b"fooba",
+            b"foobar",
+            &[0, 255, 1, 254],
+        ];
+        for case in cases {
+            assert_eq!(b64url_decode(&b64url_encode(case)).as_deref(), Some(case));
+        }
+        assert!(!b64url_encode(b"any payload here").contains('='));
+    }
+
+    #[cfg(feature = "license")]
+    #[test]
+    fn signed_token_verifies_to_pro_and_unlocks_features() {
+        let token = sign_token(&TEST_SEED, "acme-corp", Some(NOW + 1000));
+        let s = Licensing::from_blob(&test_verifier(), token.as_bytes(), NOW);
+        assert_eq!(s.tier(NOW), Tier::Pro);
+        assert_eq!(s.licensee(), Some("acme-corp"));
+        for f in Feature::ALL {
+            assert!(s.require(f, NOW).is_ok());
+        }
+    }
+
+    #[cfg(feature = "license")]
+    #[test]
+    fn perpetual_signed_token_is_pro_forever() {
+        let token = sign_token(&TEST_SEED, "forever-inc", None);
+        let s = Licensing::from_blob(&test_verifier(), token.as_bytes(), NOW);
+        assert_eq!(s.tier(u64::MAX), Tier::Pro);
+    }
+
+    #[cfg(feature = "license")]
+    #[test]
+    fn trailing_whitespace_from_a_file_is_tolerated() {
+        let token = format!("{}\n", sign_token(&TEST_SEED, "acme", None));
+        assert!(test_verifier().verify(token.as_bytes(), NOW).is_ok());
+    }
+
+    #[cfg(feature = "license")]
+    #[test]
+    fn tampered_payload_is_rejected_and_falls_back_to_community() {
+        let token = sign_token(&TEST_SEED, "acme-corp", Some(NOW + 1000));
+        let mut bytes = token.into_bytes();
+        bytes[0] ^= 0b1; // flip a payload char → signature no longer matches
+        let v = test_verifier();
+        assert!(matches!(
+            v.verify(&bytes, NOW),
+            Err(LicenseError::Invalid(_))
+        ));
+        assert_eq!(
+            Licensing::from_blob(&v, &bytes, NOW).tier(NOW),
+            Tier::Community
+        );
+    }
+
+    #[cfg(feature = "license")]
+    #[test]
+    fn a_token_signed_by_another_key_is_rejected() {
+        let token = sign_token(&[9u8; 32], "impostor", None); // different seed
+        let v = test_verifier(); // expects TEST_SEED's public half
+        assert!(matches!(
+            v.verify(token.as_bytes(), NOW),
+            Err(LicenseError::Invalid(_))
+        ));
+    }
+
+    #[cfg(feature = "license")]
+    #[test]
+    fn malformed_tokens_are_invalid_and_never_panic() {
+        let v = test_verifier();
+        for bad in ["", "no-dot", "not.base64url-!!", "only.", ".only"] {
+            assert!(v.verify(bad.as_bytes(), NOW).is_err(), "rejects {bad:?}");
+        }
+    }
+
+    #[cfg(feature = "license")]
+    #[test]
+    fn unset_embedded_key_fails_closed_to_community() {
+        // The placeholder key shipped in this tree licenses nothing — even a well-formed token
+        // signed by some key is refused, so the default build is fail-closed (a vendor must paste
+        // their own public key). Holds while LICENSE_PUBLIC_KEY is the all-zero placeholder.
+        let token = sign_token(&TEST_SEED, "acme", None);
+        let s = Licensing::from_blob(&Ed25519Verifier::new(), token.as_bytes(), NOW);
+        assert_eq!(s.tier(NOW), Tier::Community);
+    }
+
+    #[cfg(feature = "license")]
+    #[test]
+    fn expired_signed_token_reads_community_but_keeps_licensee() {
+        let token = sign_token(&TEST_SEED, "lapsed-llc", Some(NOW - 1));
+        let s = Licensing::from_blob(&test_verifier(), token.as_bytes(), NOW);
+        // Valid signature (licensee retained for the audit log) but past expiry, so the
+        // tier is community — gated, never silently degraded.
+        assert_eq!(s.licensee(), Some("lapsed-llc"));
+        assert_eq!(s.tier(NOW), Tier::Community);
+        assert!(!s.allows(Feature::AuditReports, NOW));
     }
 }
