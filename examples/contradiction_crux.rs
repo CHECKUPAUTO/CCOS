@@ -193,7 +193,7 @@ fn main() {
     println!(
         "\nQ-PAGE — the `Contradicts` edge surfaces the dissent by construction, and qbelief makes \
          it a number:\n  belief {:.2}   conflict {:.2}   (support {:.0}, contradiction {:.0})\n  \
-         → belief is high (the claim is mostly confirmed) yet conflict {} 0: the claim is \
+         → belief is net-positive (support outweighs the lone dissent) yet conflict {} 0: the claim is \
          *contested*, the exact state a confirm-only retriever never reports.",
         q.belief,
         q.conflict,

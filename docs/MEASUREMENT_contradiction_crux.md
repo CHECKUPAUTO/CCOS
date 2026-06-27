@@ -43,8 +43,8 @@ The contradiction ranks #4 (cosine 0.31); the support cosines span [0.26, 0.77].
     that it is a refutation.
 
 Q-PAGE:
-  belief 0.71   conflict 0.40   (support 4, contradiction 1)
-  → belief is high (the claim is mostly confirmed) yet conflict > 0: the claim is *contested*.
+  belief 0.50   conflict 0.67   (support 4, contradiction 1)
+  → belief is net-positive (support outweighs the lone dissent) yet conflict 0.67: contested.
 ```
 
 ## Reading
@@ -60,9 +60,10 @@ slots against a crowd of confirmations with no signal of its outsized significan
 
 The Q-Page stores polarity as **structure**: support and contradiction are distinct edge types, so
 the refutation is surfaced *as* a refutation by construction, and `qbelief` turns the two surfaces
-into numbers — here **belief 0.71** (mostly confirmed) with **conflict 0.40** (genuinely contested).
-That `conflict > 0` is precisely the state a similarity index cannot represent: *near-certain and
-yet contested*, the claim a reasoning agent should pause on rather than accept.
+into numbers — here **belief +0.50** (net support, signed in `[−1, 1]`) with **conflict 0.67**
+(genuinely contested). That high `conflict` on a net-positive claim is precisely the state a
+similarity index cannot represent: *leaning true and yet contested*, the claim a reasoning agent
+should pause on rather than accept.
 
 ## What this does and does not claim
 

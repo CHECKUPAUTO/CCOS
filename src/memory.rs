@@ -150,7 +150,7 @@ const BELIEF_EPS: f64 = 1.0;
 /// bit-for-bit on replay.
 ///
 /// `belief` and `conflict` are deliberately **orthogonal axes** (a claim can be near-certain *and*
-/// contested, or uncertain *and* uncontested), with prior strength `ε =` [`BELIEF_EPS`]:
+/// contested, or uncertain *and* uncontested), with prior strength `ε = BELIEF_EPS` (a unit prior):
 /// * `belief` — the **signed** support fraction `(s − c) / (s + c + ε)` ∈ `[−1, 1]`: `0` at no (or
 ///   perfectly balanced) evidence, `→ +1` as one-sided support accumulates, `→ −1` for
 ///   contradiction. The **sign** is the direction (believed vs refuted), the **magnitude** the
