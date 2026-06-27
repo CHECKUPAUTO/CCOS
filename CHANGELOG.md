@@ -78,6 +78,18 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`spectral::temporal_profile` — the belief "fever curve" as a reusable primitive (#13).** The
+  `temporal_tensor_crux` measurement (sharp, exploitable signal) is now a core API: `temporal_profile(
+  graphs, claims, half_life)` returns the dynamic-profile tensor `Θ[claim, {Belief, Tension}, t]` —
+  each tracked claim's belief and tension (`QBelief.conflict`) across an ordered sequence of graph
+  states — with accessors `tension_series` / `belief_series` / `temperature` (the aggregate system
+  "fever curve") / `peak_temperature`. `AgentSession::belief_tension_timeline(claims, stride, half_life)`
+  builds it over the **real recorded timeline** (replay per sampled step, offline like
+  `retrieval_reward`). Pure, deterministic, ungated core — the conflict-resolution-oriented temporal
+  view (how belief & tension evolve under injected contradiction → propagation → decay), as opposed to
+  the flat structural-centrality reading. Tests cover the spike-on-contradiction trajectory and the
+  timeline path.
+
 - **Temporal-tensor measurement — the "fever curve" of belief (#13, design pass).** The
   spectral/centrality direction was found flat on CCOS's own small, densely-coupled graph, so the
   "temporal tensor" is re-aimed at what CCOS actually *is* — a conflict-resolution engine.

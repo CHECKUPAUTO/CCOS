@@ -250,6 +250,108 @@ fn l2_distance(a: &[f64], b: &[f64]) -> f64 {
         .sqrt()
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Temporal profile — Θ[claim, {Belief, Tension}, t] (the belief "fever curve")
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One claim's belief state at one time step — the two thermodynamic components CCOS tracks over
+/// time: the signed **belief** ∈ [−1, 1] (direction + strength) and the **tension**
+/// (`QBelief.conflict`) ∈ [0, 1] (how strongly and evenly the claim is contested).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BeliefTension {
+    /// Signed support fraction in `[−1, 1]`.
+    pub belief: f64,
+    /// Geometric evidence balance in `[0, 1]` — the contested-ness / "temperature" of the claim.
+    pub tension: f64,
+}
+
+/// The **temporal-profile tensor** `Θ[claim, {Belief, Tension}, t]`: for a set of claims, their
+/// belief/tension trajectory across an ordered sequence of graph states (time steps). This is the
+/// *dynamic*, conflict-resolution reading of the graph — how belief and tension **evolve** as
+/// evidence is injected, propagated, and decayed — rather than a static structural ranking. It is the
+/// productionized form of the `temporal_tensor_crux` measurement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TemporalProfile {
+    /// The tracked claims, in the order their columns appear within each frame.
+    pub claims: Vec<NodeId>,
+    /// `frames[t][i]` is claim `claims[i]`'s belief/tension at time step `t`.
+    pub frames: Vec<Vec<BeliefTension>>,
+}
+
+impl TemporalProfile {
+    /// Number of time steps recorded.
+    pub fn steps(&self) -> usize {
+        self.frames.len()
+    }
+
+    /// `claim`'s **tension** trajectory over time (empty when the claim is not tracked).
+    pub fn tension_series(&self, claim: &NodeId) -> Vec<f64> {
+        match self.claims.iter().position(|c| c == claim) {
+            Some(i) => self.frames.iter().map(|f| f[i].tension).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// `claim`'s **belief** trajectory over time (empty when the claim is not tracked).
+    pub fn belief_series(&self, claim: &NodeId) -> Vec<f64> {
+        match self.claims.iter().position(|c| c == claim) {
+            Some(i) => self.frames.iter().map(|f| f[i].belief).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// **System temperature** — the mean tension across all tracked claims at each time step, the
+    /// aggregate "fever curve" of the knowledge base. Empty when no claims are tracked.
+    pub fn temperature(&self) -> Vec<f64> {
+        if self.claims.is_empty() {
+            return Vec::new();
+        }
+        let n = self.claims.len() as f64;
+        self.frames
+            .iter()
+            .map(|f| f.iter().map(|bt| bt.tension).sum::<f64>() / n)
+            .collect()
+    }
+
+    /// The peak system temperature (max mean-tension over time); `0.0` when empty.
+    pub fn peak_temperature(&self) -> f64 {
+        self.temperature().into_iter().fold(0.0_f64, f64::max)
+    }
+}
+
+/// Build the [`TemporalProfile`] `Θ[claim, {Belief, Tension}, t]` for `claims` across an ordered
+/// sequence of graph states — one graph per time step (e.g. successive
+/// [`AgentSession::replay_to`](crate::agent_session::AgentSession::replay_to) states, or snapshots of
+/// a scripted scenario). Each cell is the claim's [`QBelief`](crate::memory::QBelief) at that step:
+/// `belief` and `conflict` (tension). `half_life > 0` applies the knowledge-half-life decay
+/// ([`qbelief_decayed`](MemoryGraph::qbelief_decayed)), so relaxation over time is captured;
+/// `half_life <= 0` uses the plain, undecayed belief. Pure and deterministic.
+pub fn temporal_profile<'a>(
+    graphs: impl IntoIterator<Item = &'a MemoryGraph>,
+    claims: &[NodeId],
+    half_life: f64,
+) -> TemporalProfile {
+    let frames = graphs
+        .into_iter()
+        .map(|g| {
+            claims
+                .iter()
+                .map(|c| {
+                    let q = g.qbelief_decayed(c, half_life);
+                    BeliefTension {
+                        belief: q.belief,
+                        tension: q.conflict,
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    TemporalProfile {
+        claims: claims.to_vec(),
+        frames,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,5 +512,38 @@ mod tests {
             );
         }
         assert!(c.values().all(|v| *v > 0.0));
+    }
+
+    #[test]
+    fn temporal_profile_tracks_belief_and_tension_over_time() {
+        // Two graph states: t0 one-sided support (believed, no tension); t1 a contradiction arrives
+        // (the claim becomes contested) — the profile must show tension rise and belief drop.
+        let claim: NodeId = "claim".into();
+        let mut g0 = MemoryGraph::new(0.0, usize::MAX);
+        for id in ["claim", "s0", "c0"] {
+            g0.upsert_node(id.into(), id.into(), String::new(), NodeType::ContextBlock);
+        }
+        g0.add_edge("s0".into(), "claim".into(), 1.0, EdgeType::Supports);
+        let mut g1 = g0.clone();
+        g1.add_edge("c0".into(), "claim".into(), 1.0, EdgeType::Contradicts);
+
+        let prof = temporal_profile([&g0, &g1], std::slice::from_ref(&claim), 0.0);
+        assert_eq!(prof.steps(), 2);
+        let tension = prof.tension_series(&claim);
+        let belief = prof.belief_series(&claim);
+        assert_eq!(tension[0], 0.0, "one-sided evidence ⇒ no tension at t0");
+        assert!(
+            tension[1] > tension[0],
+            "the contradiction raises tension at t1"
+        );
+        assert!(
+            belief[0] > belief[1],
+            "belief drops as the claim becomes contested"
+        );
+        // A single tracked claim ⇒ system temperature is its own tension series.
+        assert_eq!(prof.temperature(), tension);
+        assert!(prof.peak_temperature() > 0.0);
+        // An untracked claim yields an empty series (no panic).
+        assert!(prof.tension_series(&"absent".into()).is_empty());
     }
 }
