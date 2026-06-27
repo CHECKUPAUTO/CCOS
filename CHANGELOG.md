@@ -78,7 +78,20 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`ccos doctor` + deployment guide — frictionless server install (deployment-DX).** A read-only
+  self-check command (`ccos doctor [--json]`) reports the build profile (debug vs release), target
+  arch/os, compiled features (llm / license / syn-parser / learned-embed / mimalloc), active parser,
+  license tier + whether a real vendor key is baked in (vs the fail-closed placeholder) + token
+  presence, MCP readiness, and actionable **warnings** (debug build, missing feature, placeholder key,
+  unverified token) — the first thing to run on a new host. New `docs/DEPLOYMENT.md` (the
+  `--release --features llm,license` build, the install, the MCP config pointing at the *release*
+  binary, the Pro-key setup, the fsync-durability note) and `scripts/install.sh` (one-shot build →
+  install → doctor). Surfaces the real gotchas: the `ccos` bin **requires `llm`** (a bare
+  `cargo build` makes no binary), and Pro is fail-closed until a vendor key replaces the placeholder.
+  Adds `license::embedded_key_is_set`.
+
 - **`spectral::temporal_profile` — the belief "fever curve" as a reusable primitive (#13).** The
+  `temporal_tensor_crux` measurement (sharp, exploitable signal) is now a core API: `temporal_profile(
   `temporal_tensor_crux` measurement (sharp, exploitable signal) is now a core API: `temporal_profile(
   graphs, claims, half_life)` returns the dynamic-profile tensor `Θ[claim, {Belief, Tension}, t]` —
   each tracked claim's belief and tension (`QBelief.conflict`) across an ordered sequence of graph

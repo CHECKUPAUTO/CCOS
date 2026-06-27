@@ -105,6 +105,7 @@ async fn main() {
         "experiment" => run_experiment_cmd(rest),
         "eval" => run_eval_cmd(rest).await,
         "memory" => run_memory_cmd(rest),
+        "doctor" => run_doctor(&DoctorOpts::parse(rest)),
         "license" => run_license(rest),
         "tensions" => run_tensions(&TensionsOpts::parse(rest)),
         "audit" => run_audit(&AuditOpts::parse(rest)),
@@ -145,6 +146,170 @@ async fn main() {
         }
     };
     std::process::exit(code);
+}
+
+/// Options for `ccos doctor`.
+struct DoctorOpts {
+    json: bool,
+}
+
+impl DoctorOpts {
+    fn parse(args: &[String]) -> Self {
+        Self {
+            json: args.iter().any(|a| a == "--json"),
+        }
+    }
+}
+
+/// `ccos doctor [--json]` — a **deployment self-check**: version, build profile, target, compiled
+/// features, active parser, license tier / vendor-key status, MCP readiness, and actionable warnings
+/// (debug build, missing feature, placeholder key, unverified token). Pure and read-only — the first
+/// thing to run after installing on a server. See `docs/DEPLOYMENT.md`.
+fn run_doctor(opts: &DoctorOpts) -> CliResult {
+    let now = ccos::license::now_unix();
+    let licensing = ccos::license::Licensing::detect(now);
+    let pro = matches!(licensing.tier(now), ccos::license::Tier::Pro);
+    let key_set = ccos::license::embedded_key_is_set();
+    let token_present = ccos::license::load_license_blob().is_some();
+
+    let release = !cfg!(debug_assertions);
+    let f_llm = cfg!(feature = "llm");
+    let f_license = cfg!(feature = "license");
+    let f_syn = cfg!(feature = "syn-parser");
+    let f_learned = cfg!(feature = "learned-embed");
+    let f_mimalloc = cfg!(feature = "mimalloc");
+
+    // Actionable deployment warnings.
+    let mut warnings: Vec<String> = Vec::new();
+    if !release {
+        warnings.push(
+            "debug build — rebuild with --release for production (faster; debug asserts off)"
+                .into(),
+        );
+    }
+    if !f_syn {
+        warnings.push(
+            "syn AST parser not compiled — using the line heuristic (~36% less accurate); rebuild \
+             with default features"
+                .into(),
+        );
+    }
+    if !f_license {
+        warnings.push(
+            "license verifier not compiled — Pro features unavailable; rebuild with \
+             --features license"
+                .into(),
+        );
+    } else if !key_set {
+        warnings.push(
+            "embedded public key is the all-zero placeholder — Pro is fail-closed until a vendor \
+             key is set (see docs/DEPLOYMENT.md)"
+                .into(),
+        );
+    }
+    if f_license && key_set && !pro && token_present {
+        warnings.push("a license token was found but did not verify or is expired".into());
+    }
+
+    if opts.json {
+        let report = serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "build": if release { "release" } else { "debug" },
+            "target": { "arch": std::env::consts::ARCH, "os": std::env::consts::OS },
+            "features": {
+                "llm": f_llm, "license": f_license, "syn-parser": f_syn,
+                "learned-embed": f_learned, "mimalloc": f_mimalloc,
+            },
+            "parser": if f_syn { "syn-ast" } else { "line-heuristic" },
+            "license": {
+                "verifier": f_license,
+                "vendor_key_set": key_set,
+                "tier": if pro { "pro" } else { "community" },
+                "licensee": licensing.licensee(),
+                "token_present": token_present,
+            },
+            "mcp_ready": f_llm,
+            "warnings": warnings,
+        });
+        println!("{}", serde_json::to_string_pretty(&report).unwrap());
+        return Ok(());
+    }
+
+    let yn = |b: bool| if b { "yes" } else { "no" };
+    println!("ccos doctor — deployment self-check\n");
+    println!("  version      {}", env!("CARGO_PKG_VERSION"));
+    println!(
+        "  build        {}",
+        if release { "release" } else { "debug  ⚠" }
+    );
+    println!(
+        "  target       {}-{}",
+        std::env::consts::ARCH,
+        std::env::consts::OS
+    );
+    println!(
+        "  parser       {}",
+        if f_syn {
+            "syn AST (accurate)"
+        } else {
+            "line heuristic"
+        }
+    );
+    println!(
+        "  features     llm={} license={} syn-parser={} learned-embed={} mimalloc={}",
+        yn(f_llm),
+        yn(f_license),
+        yn(f_syn),
+        yn(f_learned),
+        yn(f_mimalloc)
+    );
+    println!(
+        "  mcp          {}",
+        if f_llm {
+            "ready  (ccos mcp <workspace>)"
+        } else {
+            "unavailable (needs --features llm)"
+        }
+    );
+    println!("\n  license");
+    println!(
+        "    verifier   {}",
+        if f_license {
+            "ed25519 (compiled in)"
+        } else {
+            "none (community only)"
+        }
+    );
+    println!(
+        "    vendor key {}",
+        if key_set {
+            "set"
+        } else {
+            "placeholder (fail-closed)"
+        }
+    );
+    println!("    tier       {}", if pro { "PRO" } else { "community" });
+    if let Some(who) = licensing.licensee() {
+        println!("    licensee   {who}");
+    }
+    println!(
+        "    token      {}",
+        if token_present { "present" } else { "none" }
+    );
+
+    if warnings.is_empty() {
+        println!("\n  ✓ no warnings — looks deployment-ready");
+    } else {
+        println!("\n  ⚠ {} warning(s):", warnings.len());
+        for w in &warnings {
+            println!("    - {w}");
+        }
+        println!(
+            "\n  see docs/DEPLOYMENT.md for the recommended build \
+             (`--release --features llm,license`)."
+        );
+    }
+    Ok(())
 }
 
 /// `ccos license` — report the active licensing tier (community / Pro), the licensee and expiry, and
