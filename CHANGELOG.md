@@ -78,6 +78,26 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **The three Pro license behaviors, built and gated through `require()` (license slice 29b —
+  completes #29).** Each gated feature now has a real implementation; the **core is never touched**,
+  only the advanced surface:
+  - **Custom per-source authority weights** — `AgentSession::set_custom_authorities` (a
+    `CustomAuthorityMap` of source → weight), gated by `Feature::CustomAuthorityWeights`. Gated at
+    **install-time**, not assert-time, so an unlicensed session is **never degraded**: assertions always
+    apply, just with their uniform per-call authority. The override is folded into the logged
+    `Op::Assert` weight, so **`replay == live` stays exact** with no map to persist.
+  - **Tension visualization** — `ccos tensions <snapshot> [--min N] [--limit N]`: the contested Q-Page
+    claims (`conflict ≥ min`) ranked by tension with a compact bar (`MemoryGraph::claim_beliefs` +
+    `memory::render_tension_bar`). Gated by `Feature::TensionVisualization`.
+  - **Audit reports** — `ccos audit <snapshot> [--json] [--min N]`: a belief / conflict / provenance
+    report per asserted claim (supporting + contradicting evidence) plus hash-chain integrity. Gated by
+    `Feature::AuditReports`.
+  `Licensing` is threaded onto `AgentSession` (loaded fresh at `open`, never serialized → replay-safe);
+  CLI commands obtain it via the new `Licensing::detect(now)`. A locked feature emits exactly the
+  announced `require()` refusal and the command exits 0 — **announced, never silently degraded**. Tests:
+  the community-refuses / Pro-applies / replay-matches gate, `claim_beliefs` conflict-ranking, and the
+  tension renderer; a CLI smoke confirms the locked path.
+
 - **Offline Pro-license verifier — ed25519, zero-knowledge, fail-closed (`src/license.rs`, the
   `license` feature; license slice 29a).** The gate scaffolding (tiers, the three Pro `Feature`s,
   `Licensing::require()` with explicit *no-silent-degradation* logging) gains its actual trust spine:

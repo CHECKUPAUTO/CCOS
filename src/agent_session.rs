@@ -39,6 +39,7 @@ use crate::compressor::{CausalCompressor, CcrRef};
 use crate::external_memory::{
     CcosMemory, ExternalMemory, IngestReport, MemoryError, Recall, RecallWindow,
 };
+use crate::license::{Feature, LicenseError, Licensing};
 use crate::memory::ScoringWeights;
 use crate::trace::parse_cargo_test_output;
 use serde::{Deserialize, Serialize};
@@ -137,6 +138,39 @@ struct PersistedTimeline {
     folded: usize,
 }
 
+/// Per-source **authority overrides** for assertions — the Pro `CustomAuthorityWeights` knob. Maps an
+/// evidence/source node id to the authority weight its assertions should carry, overriding the
+/// per-call weight. Empty is the default — and the only state a community session can reach, since
+/// [`AgentSession::set_custom_authorities`] is license-gated — so without Pro every source keeps its
+/// uniform per-call authority (today's behaviour, unchanged).
+#[derive(Debug, Clone, Default)]
+pub struct CustomAuthorityMap {
+    weights: std::collections::HashMap<String, f64>,
+}
+
+impl CustomAuthorityMap {
+    /// An empty map (no overrides).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Override `source`'s assertion authority with `weight` (clamped to `[0, 1]`). Chainable.
+    pub fn set(&mut self, source: impl Into<String>, weight: f64) -> &mut Self {
+        self.weights.insert(source.into(), weight.clamp(0.0, 1.0));
+        self
+    }
+
+    /// The override for `source`, if one was set.
+    pub fn get(&self, source: &str) -> Option<f64> {
+        self.weights.get(source).copied()
+    }
+
+    /// Whether no overrides are set (the community default).
+    pub fn is_empty(&self) -> bool {
+        self.weights.is_empty()
+    }
+}
+
 /// An event-sourced agent memory session: every operation is recorded so the
 /// state is replayable and auditable. See the [module docs](crate::agent_session).
 pub struct AgentSession {
@@ -161,6 +195,15 @@ pub struct AgentSession {
     /// originals cache so the host LLM can call `ccos_retrieve` across calls.
     /// See [`crate::compressor`].
     compressor: CausalCompressor,
+    /// Runtime licensing state — loaded fresh from the host on `open`, never
+    /// persisted (it is not part of the serialized timeline, so `replay == live`
+    /// is unaffected). Gates the Pro feature surface; the core is never touched.
+    licensing: Licensing,
+    /// Per-source authority overrides (the Pro `CustomAuthorityWeights` knob).
+    /// Empty unless installed via the license-gated
+    /// [`set_custom_authorities`](Self::set_custom_authorities). Its *effect* flows
+    /// into the logged `Op::Assert` weight, so it needs no persistence of its own.
+    custom_authorities: CustomAuthorityMap,
 }
 
 impl Default for AgentSession {
@@ -179,6 +222,8 @@ impl AgentSession {
             folded: 0,
             oplog_path: None,
             compressor: CausalCompressor::new(),
+            licensing: Licensing::community(),
+            custom_authorities: CustomAuthorityMap::new(),
         }
     }
 
@@ -207,6 +252,10 @@ impl AgentSession {
             .ok()
             .and_then(|s| serde_json::from_str::<PersistedTimeline>(&s).ok());
 
+        // Licensing is loaded fresh from the host (env / file), never from the timeline — so it is
+        // independent of replay, and a shared workspace runs correctly under any tier.
+        let licensing = Licensing::detect(crate::license::now_unix());
+
         let mut session = match restored {
             Some(t) => AgentSession {
                 live,
@@ -215,6 +264,8 @@ impl AgentSession {
                 folded: t.folded,
                 oplog_path: Some(oplog_path),
                 compressor: CausalCompressor::new(),
+                licensing,
+                custom_authorities: CustomAuthorityMap::new(),
             },
             None => {
                 let baseline = Some(live.to_json()?);
@@ -225,6 +276,8 @@ impl AgentSession {
                     folded: 0,
                     oplog_path: Some(oplog_path),
                     compressor: CausalCompressor::new(),
+                    licensing,
+                    custom_authorities: CustomAuthorityMap::new(),
                 }
             }
         };
@@ -346,10 +399,40 @@ impl AgentSession {
         reports
     }
 
+    /// Read-only access to the session's runtime licensing state (tier, licensee).
+    pub fn licensing(&self) -> &Licensing {
+        &self.licensing
+    }
+
+    /// Install an already-determined [`Licensing`] state — for an embedding host that ran its own
+    /// verifier, or for tests. This does not bypass verification: a
+    /// [`License`](crate::license::License) is only ever produced by a verifier or the explicit
+    /// `community` / `licensed` constructors.
+    pub fn set_licensing(&mut self, licensing: Licensing) {
+        self.licensing = licensing;
+    }
+
+    /// **Install per-source custom authority weights** — the Pro `CustomAuthorityWeights` feature.
+    /// Gated: returns [`LicenseError::FeatureLocked`] in the community tier and changes nothing, so
+    /// the core assertion path is never degraded — unlicensed assertions simply keep their uniform
+    /// per-call authority. With Pro, subsequent [`assert_support`](Self::assert_support) /
+    /// [`assert_contradiction`](Self::assert_contradiction) calls whose `evidence` is in `map` use the
+    /// mapped weight; the **final** weight is what gets logged as `Op::Assert`, so `replay == live`
+    /// holds with no need to persist the map itself.
+    pub fn set_custom_authorities(&mut self, map: CustomAuthorityMap) -> Result<(), LicenseError> {
+        self.licensing
+            .require(Feature::CustomAuthorityWeights, crate::license::now_unix())?;
+        self.custom_authorities = map;
+        Ok(())
+    }
+
     /// Record and apply a **support** assertion — `evidence` is evidence *for* `claim` (the
     /// affirmative surface of the claim's [Q-Page](crate::memory::MemoryGraph::qbelief)). Logged as
     /// an `Op::Assert` so it replays identically. Returns whether a new edge was added.
     pub fn assert_support(&mut self, evidence: &str, claim: &str, weight: f64) -> bool {
+        // Pro custom-authority override; a community session's map is always empty, so the input
+        // weight is used unchanged (today's behaviour).
+        let weight = self.custom_authorities.get(evidence).unwrap_or(weight);
         self.ops.push(Op::Assert {
             evidence: evidence.to_string(),
             claim: claim.to_string(),
@@ -363,6 +446,8 @@ impl AgentSession {
     /// (the negative surface). The dual of [`assert_support`](Self::assert_support); logged as an
     /// `Op::Assert` so `replay == live` holds for the contested-knowledge channel too.
     pub fn assert_contradiction(&mut self, evidence: &str, claim: &str, weight: f64) -> bool {
+        // Pro custom-authority override (see `assert_support`); community map is empty → unchanged.
+        let weight = self.custom_authorities.get(evidence).unwrap_or(weight);
         self.ops.push(Op::Assert {
             evidence: evidence.to_string(),
             claim: claim.to_string(),
@@ -1043,6 +1128,59 @@ mod tests {
             (live_q.support, live_q.contradiction),
             (2.0, 1.0),
             "two support + one contradiction asserted"
+        );
+    }
+
+    #[test]
+    fn custom_authorities_gate_in_community_and_apply_under_pro_with_replay() {
+        use crate::license::License;
+        let support_of = |s: &AgentSession, claim: &str| {
+            s.memory()
+                .graph()
+                .qbelief(&crate::memory::NodeId(claim.to_string()))
+                .support
+        };
+        let mut map = CustomAuthorityMap::new();
+        map.set("ev:trusted", 0.9);
+
+        // Community: the Pro setter is refused and changes nothing — the assertion keeps its input
+        // weight (0.2), so the core belief path is never degraded.
+        let mut community = AgentSession::new();
+        assert!(
+            community.set_custom_authorities(map.clone()).is_err(),
+            "community tier refuses the Pro custom-authority setter"
+        );
+        community.assert_support("ev:trusted", "file:c.rs", 0.2);
+        assert!(
+            (support_of(&community, "file:c.rs") - 0.2).abs() < 1e-9,
+            "community used the input weight 0.2, not the custom 0.9"
+        );
+
+        // Pro: install the map → the override applies, and replay reproduces it (replay == live),
+        // because the FINAL weight is what gets logged as Op::Assert.
+        let mut pro = AgentSession::new();
+        pro.set_licensing(Licensing::licensed(License {
+            licensee: "acme".into(),
+            expires_at: None,
+        }));
+        pro.set_custom_authorities(map)
+            .expect("Pro tier installs custom authorities");
+        pro.assert_support("ev:trusted", "file:p.rs", 0.2); // input 0.2 → overridden to 0.9
+        let live = pro
+            .memory()
+            .graph()
+            .qbelief(&crate::memory::NodeId("file:p.rs".to_string()));
+        assert!(
+            (live.support - 0.9).abs() < 1e-9,
+            "Pro applied the custom authority 0.9, not the input 0.2"
+        );
+        let replay = pro
+            .replay_to(pro.len())
+            .graph()
+            .qbelief(&crate::memory::NodeId("file:p.rs".to_string()));
+        assert_eq!(
+            live, replay,
+            "replay reproduces the custom-weighted belief (replay == live)"
         );
     }
 

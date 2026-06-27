@@ -182,6 +182,18 @@ impl QBelief {
     }
 }
 
+/// A compact unicode **tension bar** for a [`QBelief`]: the signed belief followed by a 10-cell bar of
+/// the `conflict` magnitude — `+0.80 ███░░░░░░░` reads "believed, lightly contested". Pure and
+/// deterministic; the renderer behind the Pro *tension visualization*. The underlying `conflict` is
+/// always computed in the core — only this rendering is gated.
+pub fn render_tension_bar(q: &QBelief) -> String {
+    let cells = 10usize;
+    let filled = ((q.conflict * cells as f64).round() as usize).min(cells);
+    let bar: String = "█".repeat(filled) + &"░".repeat(cells - filled);
+    let sign = if q.belief >= 0.0 { '+' } else { '-' };
+    format!("{sign}{:.2} {bar}", q.belief.abs())
+}
+
 /// Build a [`QBelief`] from already-summed (authority-weighted) support/contradiction evidence — the
 /// shared core of [`MemoryGraph::qbelief`] and [`MemoryGraph::qbelief_decayed`]. `belief` is the
 /// signed support fraction, `conflict` the geometric balance; see [`QBelief`] for the formulas. The
@@ -2340,6 +2352,35 @@ impl MemoryGraph {
         v
     }
 
+    /// Every claim node carrying at least one `Supports`/`Contradicts` assertion, paired with its
+    /// derived [`QBelief`], sorted by **descending conflict** then id (deterministic). The data behind
+    /// the Pro tension / audit surfaces — the belief computation itself is always available in the
+    /// core; only the *reporting* of it is gated.
+    pub fn claim_beliefs(&self) -> Vec<(NodeId, QBelief)> {
+        let mut claims: Vec<NodeId> = self
+            .edges
+            .iter()
+            .filter(|e| matches!(e.edge_type, EdgeType::Supports | EdgeType::Contradicts))
+            .map(|e| e.target.clone())
+            .collect();
+        claims.sort();
+        claims.dedup();
+        let mut out: Vec<(NodeId, QBelief)> = claims
+            .into_iter()
+            .map(|c| {
+                let q = self.qbelief(&c);
+                (c, q)
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            b.1.conflict
+                .partial_cmp(&a.1.conflict)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        out
+    }
+
     /// Count edges that violate `edges ⊆ nodes²` (an endpoint is missing),
     /// **without** modifying the graph — the read-only counterpart of
     /// [`prune_dangling_edges`](Self::prune_dangling_edges), used by integrity
@@ -3949,6 +3990,48 @@ mod tests {
         assert_eq!(q.contradiction, 1.0);
         assert!((q.belief - 0.4).abs() < 1e-12);
         assert!((q.conflict - 2.0 * 3.0_f64.sqrt() / 5.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn claim_beliefs_ranks_contested_claims_first() {
+        let mut g = MemoryGraph::new(0.0, usize::MAX);
+        for id in ["evA", "evB1", "evB2", "consensus", "contested"] {
+            g.upsert_node(id.into(), id.into(), String::new(), NodeType::ContextBlock);
+        }
+        // "consensus": one-sided support (conflict 0). "contested": balanced (high conflict).
+        g.add_edge("evA".into(), "consensus".into(), 1.0, EdgeType::Supports);
+        g.add_edge("evB1".into(), "contested".into(), 1.0, EdgeType::Supports);
+        g.add_edge(
+            "evB2".into(),
+            "contested".into(),
+            1.0,
+            EdgeType::Contradicts,
+        );
+
+        let beliefs = g.claim_beliefs();
+        assert_eq!(beliefs.len(), 2, "only the two claims carry assertions");
+        assert_eq!(
+            beliefs[0].0,
+            NodeId::from("contested"),
+            "contested claim ranks first (higher conflict)"
+        );
+        assert!(beliefs[0].1.conflict > beliefs[1].1.conflict);
+        assert_eq!(beliefs[1].0, NodeId::from("consensus"));
+        assert_eq!(
+            beliefs[1].1.conflict, 0.0,
+            "one-sided evidence ⇒ zero conflict"
+        );
+    }
+
+    #[test]
+    fn render_tension_bar_grows_with_conflict() {
+        let calm = render_tension_bar(&belief_from_sums(1.0, 0.0)); // conflict 0
+        let tense = render_tension_bar(&belief_from_sums(3.0, 3.0)); // high conflict
+        assert!(
+            tense.matches('█').count() > calm.matches('█').count(),
+            "more conflict ⇒ more filled cells: {calm:?} vs {tense:?}"
+        );
+        assert!(calm.starts_with('+'), "signed-belief prefix: {calm:?}");
     }
 
     #[test]
