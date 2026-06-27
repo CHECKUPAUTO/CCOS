@@ -310,6 +310,42 @@ impl AgentSession {
         self.live.ingest_source(uri, source)
     }
 
+    /// Ingest many files as one **deferred batch** — the bulk sibling of [`ingest`](Self::ingest).
+    /// Every file is recorded as an `Op::Ingest` (so the timeline, the hash chain, and the
+    /// `replay == live` invariant are exactly as if each had been [`ingest`](Self::ingest)ed one by
+    /// one) but applied with [`ingest_deferred`](CcosMemory::ingest_deferred); the three whole-graph
+    /// resolve passes (imports, calls, data-flow) then run **once** at the end instead of after
+    /// every file — O(N) over the batch instead of the O(N²) a per-file loop pays. Because
+    /// resolution is order-independent (B2-full: prune + rebuild from the final state), the
+    /// resulting graph is byte-identical to calling [`ingest`](Self::ingest) in a loop, and the live
+    /// memory is left fully resolved, so any following recall / serialise reads cross-file edges as
+    /// usual.
+    ///
+    /// Returns one [`IngestReport`] per file, in order. Each report's `edges_added` counts that
+    /// file's **direct** edges only; the cross-file (import / call / data-flow) edges are added by
+    /// the single final resolve, not attributed back to individual files.
+    pub fn ingest_batch<U, S>(
+        &mut self,
+        files: impl IntoIterator<Item = (U, S)>,
+    ) -> Vec<IngestReport>
+    where
+        U: AsRef<str>,
+        S: AsRef<str>,
+    {
+        let mut reports = Vec::new();
+        for (uri, source) in files {
+            let (uri, source) = (uri.as_ref(), source.as_ref());
+            self.ops.push(Op::Ingest {
+                uri: uri.to_string(),
+                source: source.to_string(),
+            });
+            reports.push(self.live.ingest_deferred(uri, source));
+        }
+        // One resolve for the whole batch — the live analogue of what `replay_to` now does.
+        self.live.resolve();
+        reports
+    }
+
     /// Record and apply a **support** assertion — `evidence` is evidence *for* `claim` (the
     /// affirmative surface of the claim's [Q-Page](crate::memory::MemoryGraph::qbelief)). Logged as
     /// an `Op::Assert` so it replays identically. Returns whether a new edge was added.
@@ -491,15 +527,34 @@ impl AgentSession {
         // Map the logical step onto the retained tail (everything <= folded is the
         // baseline already).
         let tail = step.min(self.len()).saturating_sub(self.folded);
+        // Batch the whole-graph resolution exactly as a bulk live ingest would: defer each
+        // `Ingest` (mark dirty) and run the three resolve passes **once** before the next op
+        // that reads cross-file edges — a recall page-in, a failure / page-fault propagation —
+        // and once at the end. B2-full made resolution order-independent (prune + rebuild from
+        // the final state), so this O(N)-over-the-run reconstruction yields the byte-identical
+        // graph the old resolve-after-every-ingest (O(N²)) path produced — `replay == live`
+        // still holds, now in linear time. Ingestion itself never demotes to COLD (only an
+        // explicit resident-cap change does, and none is logged), so deferring the resolve
+        // cannot reorder paging.
+        let mut dirty = false;
         for op in self.ops.iter().take(tail) {
             match op {
                 Op::Ingest { uri, source } => {
-                    m.ingest_source(uri, source);
+                    m.ingest_deferred(uri, source);
+                    dirty = true;
                 }
                 Op::Failure { node, depth } => {
+                    if dirty {
+                        m.resolve();
+                        dirty = false;
+                    }
                     let _ = m.signal_failure(node, *depth);
                 }
                 Op::PageFault { files, depth } => {
+                    if dirty {
+                        m.resolve();
+                        dirty = false;
+                    }
                     for f in files {
                         let _ = m.signal_failure(&format!("file:{f}"), *depth);
                     }
@@ -507,14 +562,20 @@ impl AgentSession {
                 Op::Recall { recall, .. } => {
                     // A recall is read-only for *selection*, but a recall *around*
                     // a demoted node pages it (and its cold neighbours) back from
-                    // the COLD tier — a side effect on the resident/cold partition.
-                    // Reproduce it so replay matches live (deterministic page-in).
+                    // the COLD tier — a side effect on the resident/cold partition
+                    // that reads edges. Resolve first so the page-in sees the same
+                    // graph live did (deterministic page-in, replay == live).
+                    if dirty {
+                        m.resolve();
+                        dirty = false;
+                    }
                     if let Recall::Around(uri) = recall {
                         m.ensure_resident(uri);
                     }
                 }
                 Op::Retune { weights } => {
-                    // Reproduce the learned-weights change so replay == live.
+                    // Reproduce the learned-weights change so replay == live. No edge
+                    // read, so it does not force a resolve of the deferred ingests.
                     m.set_scoring_weights(*weights);
                 }
                 Op::Assert {
@@ -525,6 +586,8 @@ impl AgentSession {
                 } => {
                     // Re-apply the dual-evidence assertion so the belief surfaces (and the
                     // QBelief derived from them) reconstruct identically — replay == live.
+                    // Belief edges are not resolution-owned (a later `resolve` never prunes
+                    // them) and the assert reads no cross-file edge, so it forces no resolve.
                     if *supports {
                         m.assert_support(evidence, claim, *weight);
                     } else {
@@ -532,6 +595,13 @@ impl AgentSession {
                     }
                 }
             }
+        }
+        // Resolve the trailing deferred ingests so the returned memory is fully resolved:
+        // every `&self` reader of it — `recall_what_if`, `stats`, `graph()`, and `compact`'s
+        // `to_json` — needs the cross-file edges, and a debug build asserts on an unresolved
+        // read.
+        if dirty {
+            m.resolve();
         }
         m
     }
@@ -565,18 +635,33 @@ impl AgentSession {
         m.set_scoring_weights(*weights);
         let mut pending: Option<RecallWindow> = None;
         let (mut hits, mut total) = (0usize, 0usize);
+        // Same deferred-resolution batching as `replay_to`: defer each ingest and resolve
+        // once before the next op that reads cross-file edges (a recall's selection, a
+        // failure / page-fault's propagation). The reward is a pure function of those same
+        // replayed states, so the number is byte-identical — only the per-ingest O(N²)
+        // resolution collapses to O(N) over the log.
+        let mut dirty = false;
         for op in &self.ops {
             match op {
                 Op::Ingest { uri, source } => {
-                    m.ingest_source(uri, source);
+                    m.ingest_deferred(uri, source);
+                    dirty = true;
                 }
                 Op::Recall { recall, budget } => {
+                    if dirty {
+                        m.resolve();
+                        dirty = false;
+                    }
                     if let Recall::Around(uri) = recall {
                         m.ensure_resident(uri);
                     }
                     pending = Some(m.recall(recall, *budget));
                 }
                 Op::Failure { node, depth } => {
+                    if dirty {
+                        m.resolve();
+                        dirty = false;
+                    }
                     if let Some(win) = pending.take() {
                         total += 1;
                         if window_holds(&win, node) {
@@ -586,6 +671,10 @@ impl AgentSession {
                     let _ = m.signal_failure(node, *depth);
                 }
                 Op::PageFault { files, depth } => {
+                    if dirty {
+                        m.resolve();
+                        dirty = false;
+                    }
                     if let Some(win) = pending.take() {
                         total += 1;
                         if files.iter().any(|f| window_holds(&win, f)) {
@@ -859,6 +948,70 @@ mod tests {
         assert_eq!(replayed.stats().edges, s.memory().stats().edges);
         // And replaying twice gives identical node counts (determinism).
         assert_eq!(replayed.stats().nodes, s.replay_to(s.len()).stats().nodes);
+    }
+
+    /// A structural fingerprint of a memory's resolved graph — sorted node ids + sorted
+    /// edges `(source, target, weight-bits)` — independent of map iteration order. Two
+    /// memories with the same fingerprint have the same resolved causal structure.
+    fn graph_fingerprint(mem: &CcosMemory) -> (Vec<String>, Vec<(String, String, u64)>) {
+        let g = mem.graph();
+        let mut nodes: Vec<String> = g.node_ids().map(|id| id.0.clone()).collect();
+        nodes.sort();
+        let mut edges: Vec<(String, String, u64)> = g
+            .edges()
+            .iter()
+            .map(|e| (e.source.0.clone(), e.target.0.clone(), e.weight.to_bits()))
+            .collect();
+        edges.sort();
+        (nodes, edges)
+    }
+
+    #[test]
+    fn ingest_batch_equals_ingest_loop_and_replays() {
+        // The batched deferred path must produce the byte-identical graph an eager per-file
+        // loop does (B2-full order-independence, lifted to the session API), and the batch's
+        // recorded timeline must still replay == live — through the new deferred `replay_to`.
+        let files = [
+            ("src/a.rs", "pub fn target() -> i32 { 1 }\n"),
+            (
+                "src/caller.rs",
+                "use crate::a::target;\npub fn run() -> i32 { target() + 1 }\n",
+            ),
+            (
+                "src/b.rs",
+                "pub const K: i32 = 7;\npub fn k() -> i32 { K + 1 }\n",
+            ),
+        ];
+
+        // Eager: one `ingest` per file (resolve after each).
+        let mut eager = AgentSession::new();
+        for (p, s) in &files {
+            eager.ingest(p, s);
+        }
+
+        // Batch: every file deferred, resolved exactly once at the end.
+        let mut batch = AgentSession::new();
+        let reports = batch.ingest_batch(files.iter().map(|(p, s)| (*p, *s)));
+        assert_eq!(reports.len(), files.len(), "one report per ingested file");
+
+        // 1) Batch ingest == eager loop, byte-for-byte over nodes + resolved edges.
+        assert_eq!(
+            graph_fingerprint(eager.memory()),
+            graph_fingerprint(batch.memory()),
+            "batch ingest yields the same resolved graph as an eager per-file loop"
+        );
+        // The cross-file call edge IS present (proves the single final resolve ran).
+        assert!(
+            batch.memory().graph().edges().len() > files.len(),
+            "the final resolve added cross-file edges, not just direct ones"
+        );
+
+        // 2) The batch session's timeline replays to the same graph (deferred replay path).
+        assert_eq!(
+            graph_fingerprint(batch.memory()),
+            graph_fingerprint(&batch.replay_to(batch.len())),
+            "batch timeline replays == live"
+        );
     }
 
     #[test]
