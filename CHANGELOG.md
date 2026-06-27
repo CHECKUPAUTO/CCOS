@@ -20,6 +20,21 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Cognitive distillation — the `Extractor` pipeline + Conflict-of-Origins resolution
+  (`src/extractor.rs`).** Turns raw text into Q-Page `Assertion`s (`{claim, source, stance,
+  authority}`) — the auto-detection of `Supports`/`Contradicts` edges that slice 1 left as manual
+  assertions. The `Extractor` trait keeps it **provider-agnostic**: a deterministic `MockExtractor`
+  drives the bench and tests with no model, and an `llm`-feature `LlmExtractor` distills the same shape
+  from text via the configurable LLM backend. Extraction is the only non-deterministic step and runs
+  once at ingest; its output is recorded as replayable `assert_*` / `Op::Assert` events, so a replay
+  never re-calls the model (`replay == live`). Each assertion carries a per-source **authority** in
+  `[0, 1]` (the evidence edge weight), and `QBelief::is_validated(min_belief, max_conflict)` is the
+  strategic gate — believed-enough AND not-too-contested. Measured by `examples/conflict_of_origins.rs`
+  / `docs/MEASUREMENT_conflict_of_origins.md`: as a dissenting source's authority `β` rises, the
+  claim's belief slides `+0.47 → −0.03` (the more credible origin wins the direction), `conflict`
+  climbs `0 → 0.65`, and validation flips off at `β = 0.30` — a defensible, inspectable resolution a
+  flat or majority store cannot express.
+
 - **Q-Page belief propagation — single deterministic hop (`MemoryGraph::propagate_beliefs`).** Belief
   revision across the causal graph: for every `Causes` edge `A → B` whose source claim `A` is
   *resolved* (`|qbelief.belief| ≥ resolve_threshold`), a derived, **attenuated** evidence edge is added

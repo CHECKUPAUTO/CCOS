@@ -172,6 +172,16 @@ pub struct QBelief {
     pub conflict: f64,
 }
 
+impl QBelief {
+    /// Whether this claim is **validated** as a confident, actionable fact: believed strongly enough
+    /// (`belief ≥ min_belief`) **and** not too contested (`conflict ≤ max_conflict`). The strategic
+    /// filter separating "facts I can act on" from claims still in dispute — the two gates are
+    /// orthogonal, so a strongly-believed *but contested* claim is (correctly) **not** validated.
+    pub fn is_validated(&self, min_belief: f64, max_conflict: f64) -> bool {
+        self.belief >= min_belief && self.conflict <= max_conflict
+    }
+}
+
 /// Build a [`QBelief`] from already-summed (authority-weighted) support/contradiction evidence — the
 /// shared core of [`MemoryGraph::qbelief`] and [`MemoryGraph::qbelief_decayed`]. `belief` is the
 /// signed support fraction, `conflict` the geometric balance; see [`QBelief`] for the formulas. The
