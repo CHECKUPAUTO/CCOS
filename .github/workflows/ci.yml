@@ -86,6 +86,6 @@ jobs:
           cargo run --locked --features llm -- regions src --metrics file:src/lib.rs --json
           cargo run --locked --features llm -- experiment --tasks 60
           cargo run --locked --features llm -- eval --tasks 4
-          printf '%s\n' '{"op":"ingest","uri":"src/x.rs","source":"pub fn x() {}"}' '{"op":"recall","strategy":"working_set","budget":512}' '{"op":"verify"}' | cargo run --locked --features llm -- memory --path /tmp/mem.ccos
+          printf '%s\n' '{"op":"ingest","uri":"src/x.rs","source":"pub fn x() {}"}' '{"op":"recall","strategy":"working_set","budget":512}' '{"op":"verify"}' | cargo run --locked --features llm -- stdin
           cargo run --locked --features llm -- chaos --iters 500
           cargo run --locked --features llm -- license

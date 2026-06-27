@@ -78,6 +78,23 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **SciRust fusion (#14a) — distilled incremental LSA: linear ingestion + contradiction-aware
+  retrieval.** After inspecting the SciRust repo, the verdict was **distill, not link** — its SVD is a
+  `nalgebra` wrapper with no incremental update, and depending on `scirust-core` pulls rayon-parallel
+  non-determinism that would break `replay == live`. The key insight: CCOS's LSA factors through the
+  Gram matrix `C = MᵀM` (fixed `dim × dim`), a **sum of per-document outer products** — so a batch just
+  *adds* its contributions. New `lsa::IncrementalLsa` folds a batch in **O(batch)** (vs the O(N) full
+  recompute) and is **bit-exact** versus a single batch over the same documents (so `replay == live`
+  holds); `lsa::weighted_lsa_projection` scales each document by its causal authority *before*
+  reduction. The judge `examples/scirust_vs_rag_crux.rs` measures both axes: **ingestion ~5.5× faster
+  at 600 docs** (incremental O(N) vs full O(N²), the gap growing with N), and **contradiction-aware
+  retrieval 2/2 vs blind 512-chunk RAG 1/2** on a Conflict of Origins (the refuted source crushed to the
+  bottom) — with the honest finding that the *retrieval-time* belief gate (`latent cosine × authority`),
+  not the pre-reduction weighting alone, is what suppresses the contradiction. Deterministic,
+  dependency-free, SciRust never modified. See `docs/MEASUREMENT_scirust_fusion.md`. Next (#14b): wire
+  `IncrementalLsa` into `CcosMemory::ingest_batch` + recall re-ranking with a full-session
+  `replay == live` property test.
+
 - **`ccos doctor` + deployment guide — frictionless server install (deployment-DX).** A read-only
   self-check command (`ccos doctor [--json]`) reports the build profile (debug vs release), target
   arch/os, compiled features (llm / license / syn-parser / learned-embed / mimalloc), active parser,
