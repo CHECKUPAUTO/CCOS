@@ -90,12 +90,34 @@ the same pending-ref-presence pattern as live — selective prune behaves identi
 graphs match. This is why the replayable path may now batch safely (the follow-up below). The full
 suite — including the `replay == live` and snapshot round-trip property tests — is green.
 
-## What's left: batching the replay/agent path
+## Batched replay/agent path (landed): O(N) time-travel
 
-The semantic blocker is gone, so the O(N) batch can now extend to the replayable path with no risk to
-`replay == live`: defer the ingests in `AgentSession::replay_to` / `retrieval_reward` and `resolve`
-once (turning O(N²) time-travel into O(N)), and add an `AgentSession::ingest_batch`. That is a
-mechanical follow-up on top of this order-independent core.
+The semantic blocker being gone, the O(N) batch now extends to the replayable path. `replay_to` (the
+engine behind time-travel debugging, `recall_what_if`, and the counterfactual `retrieval_reward`)
+used to call the eager `ingest_source` for **every** `Ingest` op — N resolutions of an O(N) graph,
+**O(N²)** per reconstruction. It now **defers** every ingest and runs the resolve passes **once**:
+before each op that reads cross-file edges (a recall page-in, a failure / page-fault propagation) and
+once at the end. `AgentSession::ingest_batch` does the same on the live ingest path. Ingestion never
+demotes to COLD (only an explicit resident-cap change does, and none is logged), so deferring the
+resolve cannot reorder paging — and B2-full makes the resolved edge set order-independent — so the
+reconstructed graph is byte-identical.
+
+`examples/replay_batch_crux.rs`, synthetic cross-referencing corpus sized under the resident cap so
+the timing isolates resolution from COLD-tier paging:
+
+```
+# Replay/time-travel reconstruction — eager (pre-#33) vs batched (#33)
+  files   eager replay(ms)   batched replay(ms)   speedup   batched ratio ×2
+    150              226.1                 18.9     12.0x       —
+    300              894.9                 38.2     23.4x      2.02   ← ×2 ⇒ O(N)
+    600             3689.2                 77.7     47.5x      2.03
+```
+
+Eager reconstruction is **quadratic** (~×4 per doubling — each of N ingests re-runs the O(N) resolve
+passes); batched is **linear** (~×2 — one resolve for the whole log), **47.5× faster at 600 ops** and
+widening with N. `tests/replay_equivalence_property.rs` proves the byte-for-byte `replay == live`
+equivalence still holds for *any* interleaving of ingests, failures, recalls and page-faults — the
+order-independent core (B2-full) is what makes deferring safe.
 
 **Bottom line:** measure first. The bottleneck was algorithmic (per-file whole-graph re-resolution),
 not cache layout — DOD/SoA would have shaved a constant factor off the wrong thing. Deferring the

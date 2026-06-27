@@ -51,6 +51,19 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `AgentSession::ingest_batch` is now a safe mechanical follow-up. See
   `docs/MEASUREMENT_batch_resolution.md`.
 
+- **B2-replay: the replayable/agent path now batches too — O(N) time-travel.** With resolution
+  order-independent (B2-full), `AgentSession::replay_to` and the counterfactual `retrieval_reward`
+  **defer** every `Ingest` op and run the resolve passes **once** — before each op that reads
+  cross-file edges (a recall page-in, a failure / page-fault propagation) and once at the end —
+  instead of resolving after every ingest, turning the O(N²) reconstruction into O(N). The new
+  `AgentSession::ingest_batch` applies the same single-resolve batch to the live ingest path.
+  `examples/replay_batch_crux.rs` measures a reconstruction speedup of **12× → 23× → 47.5× at
+  150/300/600 ops** (eager ~×4 per doubling = quadratic; batched ~×2 = linear), asserting both paths
+  rebuild the byte-identical graph. `replay == live` is preserved **exactly**: ingestion never demotes
+  to COLD (so deferring the resolve cannot reorder paging), and `tests/replay_equivalence_property.rs`
+  still passes byte-for-byte over any interleaving of ingests, failures, recalls and page-faults. See
+  `docs/MEASUREMENT_batch_resolution.md`.
+
 ### Changed
 
 - **The real `syn` AST parser is now the default ingestion path** (was opt-in behind
