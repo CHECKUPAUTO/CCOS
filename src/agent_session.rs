@@ -698,6 +698,26 @@ impl AgentSession {
         self.replay_to(step).recall(recall, budget)
     }
 
+    /// **Belief/tension timeline** — the dynamic, conflict-resolution view of this session's history:
+    /// replay to each step (every `stride` ops) and record each tracked claim's belief and tension,
+    /// yielding the temporal-profile tensor `Θ[claim, {Belief, Tension}, t]` over the *real* recorded
+    /// timeline (the productionized form of the `temporal_tensor_crux` measurement). `half_life > 0`
+    /// applies the knowledge-half-life decay. Like [`retrieval_reward`](Self::retrieval_reward) it
+    /// replays once per sampled step, so it is an **offline** analysis (≈ O(N²/stride)), not a hot path.
+    pub fn belief_tension_timeline(
+        &self,
+        claims: &[crate::memory::NodeId],
+        stride: usize,
+        half_life: f64,
+    ) -> crate::spectral::TemporalProfile {
+        let stride = stride.max(1);
+        let graphs: Vec<crate::memory::MemoryGraph> = (0..=self.len())
+            .step_by(stride)
+            .map(|t| self.replay_to(t).graph().clone())
+            .collect();
+        crate::spectral::temporal_profile(graphs.iter(), claims, half_life)
+    }
+
     // ── slice C: self-improving retrieval from the replayable log ─────────────
 
     /// Replay the timeline under candidate scoring `weights` and score how often
@@ -1182,6 +1202,27 @@ mod tests {
             live, replay,
             "replay reproduces the custom-weighted belief (replay == live)"
         );
+    }
+
+    #[test]
+    fn belief_tension_timeline_tracks_a_claim_over_the_log() {
+        // A claim believed at step 1, then contested at step 2 — the timeline must show tension rise.
+        let mut s = AgentSession::new();
+        s.assert_support("ev_s", "claim:x", 1.0);
+        s.assert_contradiction("ev_c", "claim:x", 1.0);
+        let claim = crate::memory::NodeId("claim:x".to_string());
+
+        let prof = s.belief_tension_timeline(std::slice::from_ref(&claim), 1, 0.0);
+        let tension = prof.tension_series(&claim);
+        assert!(tension.len() >= 3, "sampled replay_to(0..=len)");
+        assert_eq!(tension[0], 0.0, "t0 (empty replay) ⇒ no tension");
+        assert!(
+            *tension.last().unwrap() > 0.0,
+            "the contradiction makes the claim contested by the end"
+        );
+        // belief goes from positive (only support) toward 0 (balanced) as tension rises.
+        let belief = prof.belief_series(&claim);
+        assert!(belief[1] > *belief.last().unwrap());
     }
 
     #[test]
