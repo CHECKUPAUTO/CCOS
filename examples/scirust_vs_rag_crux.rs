@@ -15,6 +15,12 @@
 //!      axis, so a refuted contradiction that shares vocabulary outranks the authoritative source. We
 //!      measure retrieval precision on a "Conflict of Origins".
 //!
+//! Both halves are the **live engine path** as of #14b: `CcosMemory`'s semantic-recall re-ranking scales
+//! each document by exactly this causal weight — `(1 + λc·centrality)(1 + λa·belief)`, taken from the live
+//! graph (`spectral::eigenvector_centrality` × Q-Page `qbeliefs`) — before the same Gram reduction
+//! measured here. The authority column below is hand-set only to make the conflict legible; in the engine
+//! it is computed from the causal graph. See `docs/MEASUREMENT_scirust_fusion.md` §C.
+//!
 //! Run: `cargo run --release --example scirust_vs_rag_crux`
 
 use ccos::embeddings::{tokenize, TfidfEmbedder};
@@ -138,7 +144,9 @@ fn main() {
     println!(
         "\n  → incremental is ~O(N) (each batch folds only its own docs); full recompute is ~O(N²)\n\
          (each batch re-folds the whole corpus). The projection itself is a constant on-demand Jacobi\n\
-         sweep on the fixed {dim}×{dim} Gram, identical for both — so the gap above is pure ingestion."
+         sweep on the fixed {dim}×{dim} Gram, identical for both — so the gap above is pure ingestion.\n\
+         (Live `CcosMemory` recall re-folds per graph version for bit-exact `live == reload`; this\n\
+         as-of-ingest fold is the append-only streaming primitive — see MEASUREMENT §C.)"
     );
 
     // ─────────────────── PART B — contradiction-aware retrieval ───────────────────
@@ -219,6 +227,8 @@ fn main() {
          origin (authority 0.12) is crushed to the bottom while the authoritative one (0.95) holds #1.\n\
          A blind 512-chunk RAG has NO belief axis, so it structurally cannot make this distinction.\n\
          The fusion = SciRust-distilled latent algebra (semantic) × CCOS causal belief (trust).\n\
-         Deterministic, dependency-free, replay == live. See docs/MEASUREMENT_scirust_fusion.md."
+         This weighted space is CCOS's live recall re-ranking path (#14b: CcosMemory::set_lsa_rerank →\n\
+         lsa_region_scores), deterministic, dependency-free, replay == live AND live == reload.\n\
+         See docs/MEASUREMENT_scirust_fusion.md."
     );
 }

@@ -321,6 +321,19 @@ struct Persisted {
     sources: BTreeMap<String, String>,
 }
 
+/// Causal-topology LSA weighting (#14b SciRust fusion): a document's influence on the learned latent
+/// space is scaled by `(1 + λc·centrality)·(1 + λa·authority)`, where `λc` is the maximum centrality
+/// boost (the most central node gets `1 + λc`) and `λa` the maximum authority boost (a fully-believed
+/// node gets `1 + λa`). Both are measurement-derived (`examples/scirust_vs_rag_crux.rs`). At `λ = 0` the
+/// weighting collapses to the uniform LSA the old recall path used, so this is a strict generalisation —
+/// the latent space is shaped by what the causal graph deems important and the Q-Page deems trustworthy.
+const LSA_LAMBDA_CENTRALITY: f64 = 1.0;
+const LSA_LAMBDA_AUTHORITY: f64 = 1.0;
+
+/// `(graph version, fitted TF-IDF embedder, rank-R causally-weighted projection)` — the cached
+/// causally-weighted LSA model (see [`CcosMemory::weighted_lsa_cache`]).
+type WeightedLsaModel = (u64, crate::embeddings::TfidfEmbedder, Vec<Vec<f32>>);
+
 /// The in-process [`ExternalMemory`] implementation backed by the CCOS kernel.
 pub struct CcosMemory {
     graph: MemoryGraph,
@@ -366,6 +379,14 @@ pub struct CcosMemory {
     /// selection where it does not. `None` (default) ⇒ off; a runtime knob, so it
     /// never touches the deterministic graph state (recall is read-only).
     lsa_rerank_rank: Option<usize>,
+    /// Cached **causally-weighted LSA model** `(version, fitted TF-IDF embedder, rank-R weighted
+    /// projection)` for semantic-recall re-ranking (#14b SciRust fusion). Each document row is scaled by
+    /// `(1 + λc·centrality)·(1 + λa·authority)` (eigenvector centrality × Q-Page belief) *before* the LSA
+    /// reduction, so the latent space is shaped by causal importance and trust, not raw term frequency.
+    /// A pure function of the current graph ⇒ identical live and on reload; never serialised (rebuilt on
+    /// the first semantic recall after a load). Replaces the full LSA recompute the old path paid on
+    /// *every* query (now an `O(1)` version-cache hit between graph mutations).
+    weighted_lsa_cache: RefCell<Option<WeightedLsaModel>>,
 }
 
 impl Default for CcosMemory {
@@ -389,6 +410,7 @@ impl CcosMemory {
             region_cache: RefCell::new(None),
             embed_cache: RefCell::new(None),
             lsa_rerank_rank: None,
+            weighted_lsa_cache: RefCell::new(None),
         }
     }
 
@@ -521,6 +543,7 @@ impl CcosMemory {
             region_cache: RefCell::new(None),
             embed_cache: RefCell::new(None),
             lsa_rerank_rank: None,
+            weighted_lsa_cache: RefCell::new(None),
         })
     }
 
@@ -1061,35 +1084,25 @@ impl CcosMemory {
         self.lsa_rerank_rank = rank;
     }
 
-    /// LSA re-ranking signal for `region_ids`: cosine similarity of each region node
-    /// to `query` in a rank-`rank` latent-semantic space fitted on the whole corpus.
-    /// Deterministic (the corpus is taken in id-sorted order and the LSA eigensolve
-    /// is deterministic), so a recall stays replayable. Empty on an empty graph.
+    /// LSA re-ranking signal for `region_ids`: cosine similarity of each region node to `query` in a
+    /// rank-`rank` **causally-weighted** latent-semantic space (#14b SciRust fusion). Each document is
+    /// scaled by `(1 + λc·centrality)·(1 + λa·authority)` *before* the LSA reduction (see
+    /// [`Self::weighted_lsa_model`]), so the latent space is shaped by what the causal graph deems
+    /// important (eigenvector centrality) and the Q-Page deems trustworthy (belief), not by raw term
+    /// frequency. Deterministic and version-cached (a pure function of the graph ⇒ identical live and on
+    /// reload, replayable), replacing the full LSA recompute the old path paid on every query. Empty on
+    /// an empty graph.
     fn lsa_region_scores(
         &self,
         query: &str,
         region_ids: &[NodeId],
         rank: usize,
     ) -> HashMap<NodeId, f64> {
-        use crate::embeddings::{tokenize, TfidfEmbedder};
-        let mut corpus: Vec<(String, String)> = self
-            .graph
-            .nodes
-            .values()
-            .map(|n| (n.id.0.clone(), format!("{} {}", n.label, n.content)))
-            .collect();
-        corpus.sort_by(|a, b| a.0.cmp(&b.0));
-        if corpus.is_empty() {
-            return HashMap::new();
-        }
-        let mut embedder = TfidfEmbedder::new(128);
-        let tokenized: Vec<Vec<String>> = corpus.iter().map(|(_, t)| tokenize(t)).collect();
-        embedder.fit(&tokenized);
-        let rows: Vec<Vec<f32>> = corpus.iter().map(|(_, t)| embedder.embed_str(t)).collect();
-        let projection = crate::lsa::lsa_projection(&rows, rank);
-        if projection.is_empty() {
-            return HashMap::new();
-        }
+        use crate::embeddings::TfidfEmbedder;
+        let (embedder, projection) = match self.weighted_lsa_model(rank) {
+            Some(model) => model,
+            None => return HashMap::new(),
+        };
         let q_proj = crate::lsa::project(&embedder.embed_str(query), &projection);
         region_ids
             .iter()
@@ -1098,6 +1111,73 @@ impl CcosMemory {
                 let v = embedder.embed_str(&format!("{} {}", n.label, n.content));
                 let p = crate::lsa::project(&v, &projection);
                 Some((id.clone(), TfidfEmbedder::cosine(&p, &q_proj)))
+            })
+            .collect()
+    }
+
+    /// Build — or reuse the version-cached — the **causally-weighted LSA model**: the TF-IDF embedder
+    /// fitted on the whole graph (id-sorted) and the rank-`rank` projection of its
+    /// [`Self::causal_weights`]-scaled document matrix. The projection is a pure, deterministic function
+    /// of the graph, so it is identical live and on reload (and across eager vs batch ingestion, which
+    /// converge on the same graph), and never needs serialising. `None` on an empty graph or a
+    /// degenerate (rank-0 / empty) projection. The single full re-fold per graph version is the price of
+    /// a bit-exact `live == reload` latent space; the `O(batch)` incremental fold (`lsa::IncrementalLsa`)
+    /// is the append-only streaming primitive, measured in `examples/scirust_vs_rag_crux.rs`.
+    fn weighted_lsa_model(
+        &self,
+        rank: usize,
+    ) -> Option<(crate::embeddings::TfidfEmbedder, Vec<Vec<f32>>)> {
+        if let Some((v, embedder, projection)) = self.weighted_lsa_cache.borrow().as_ref() {
+            if *v == self.version {
+                return Some((embedder.clone(), projection.clone()));
+            }
+        }
+        use crate::embeddings::{tokenize, TfidfEmbedder};
+        let mut corpus: Vec<(NodeId, String)> = self
+            .graph
+            .nodes
+            .values()
+            .map(|n| (n.id.clone(), format!("{} {}", n.label, n.content)))
+            .collect();
+        corpus.sort_by(|a, b| a.0.cmp(&b.0));
+        if corpus.is_empty() {
+            return None;
+        }
+        let mut embedder = TfidfEmbedder::new(128);
+        let tokenized: Vec<Vec<String>> = corpus.iter().map(|(_, t)| tokenize(t)).collect();
+        embedder.fit(&tokenized);
+        let rows: Vec<Vec<f32>> = tokenized.iter().map(|t| embedder.embed(t)).collect();
+        let ids: Vec<&NodeId> = corpus.iter().map(|(id, _)| id).collect();
+        let weights = self.causal_weights(&ids);
+        let projection = crate::lsa::weighted_lsa_projection(&rows, &weights, rank);
+        if projection.is_empty() {
+            return None;
+        }
+        *self.weighted_lsa_cache.borrow_mut() =
+            Some((self.version, embedder.clone(), projection.clone()));
+        Some((embedder, projection))
+    }
+
+    /// Per-document **causal weight** `(1 + λc·centrality)·(1 + λa·authority)` for `ids`, in order.
+    /// `centrality` is the eigenvector centrality (max-normalised to `[0,1]`, so the weight is invariant
+    /// to graph size); `authority` is the node's Q-Page net belief clamped to `[0,1]` (only genuine net
+    /// support *amplifies* a document — a refuted node gets no boost, since the retrieval-time belief
+    /// gate is what actively *suppresses* it). Both are batched (`spectral::eigenvector_centrality`,
+    /// `MemoryGraph::qbeliefs`) so this is `O(edges + nodes)`, not `O(N·edges)`, and a pure deterministic
+    /// function of the graph structure and the belief edges.
+    fn causal_weights(&self, ids: &[&NodeId]) -> Vec<f32> {
+        let centrality = crate::spectral::eigenvector_centrality(&self.graph);
+        let cmax = centrality
+            .values()
+            .copied()
+            .fold(0.0_f64, f64::max)
+            .max(1e-12);
+        let beliefs = self.graph.qbeliefs();
+        ids.iter()
+            .map(|id| {
+                let c = centrality.get(*id).copied().unwrap_or(0.0) / cmax;
+                let a = beliefs.get(*id).map(|q| q.belief.max(0.0)).unwrap_or(0.0);
+                ((1.0 + LSA_LAMBDA_CENTRALITY * c) * (1.0 + LSA_LAMBDA_AUTHORITY * a)) as f32
             })
             .collect()
     }
@@ -1581,6 +1661,114 @@ mod tests {
             .iter()
             .filter(|e| e.edge_type == crate::memory::EdgeType::Calls)
             .count()
+    }
+
+    // ── #14b: causally-weighted incremental LSA (SciRust fusion) ──────────────────
+    // The moat properties of the weighted latent space: it is a *pure deterministic
+    // function of the final graph*, so it (1) is identical across ingestion orders
+    // (eager ≡ batch), (2) survives a checkpoint round-trip bit-for-bit (live ≡
+    // reload, so an audit replay's recall ranking never diverges), and (3) rises with
+    // a node's causal evidence (centrality × belief). The latent-algebra mechanism
+    // itself is unit-tested in `lsa.rs`; here we prove the *engine wiring* upholds it.
+    fn db_repo() -> [(&'static str, &'static str); 2] {
+        [
+            ("src/db.rs", "pub fn connect() -> i32 { 1 }\n"),
+            (
+                "src/repo.rs",
+                "use crate::db;\npub fn load() -> i32 { db::connect() }\n",
+            ),
+        ]
+    }
+    fn node_id(m: &CcosMemory, uri: &str) -> NodeId {
+        m.graph()
+            .nodes
+            .values()
+            .map(|n| n.id.clone())
+            .find(|id| id.0 == uri)
+            .unwrap_or_else(|| panic!("node {uri} exists"))
+    }
+
+    #[test]
+    fn weighted_lsa_model_is_order_independent() {
+        // Eager (resolve-per-file) and batch (one resolve) ingest of the same unambiguous corpus
+        // converge on the identical graph, and the weighted projection is a pure function of that
+        // graph — so the latent space is bit-identical across the two paths (#14b keeps eager ≡ batch).
+        let files = [
+            ("src/db.rs", "pub fn connect() -> i32 { 1 }\n"),
+            (
+                "src/repo.rs",
+                "use crate::db;\npub fn load() -> i32 { db::connect() }\n",
+            ),
+            ("src/cache.rs", "pub fn warm() -> i32 { 2 }\n"),
+        ];
+        let (_, eager) = eager_build(&files)
+            .weighted_lsa_model(8)
+            .expect("eager projection");
+        let (_, batch) = batch_build(&files)
+            .weighted_lsa_model(8)
+            .expect("batch projection");
+        assert_eq!(
+            eager, batch,
+            "weighted LSA projection is bit-identical eager vs batch (order-independent)"
+        );
+    }
+
+    #[test]
+    fn weighted_lsa_model_survives_a_reload() {
+        // The projection is never serialised; on reload it is rebuilt from the graph. Because it is a
+        // pure function of the graph (incl. the belief edges, which DO persist), the rebuilt projection
+        // is bit-identical to the live one — replay/audit recall can never diverge from the live run.
+        let mut m = eager_build(&db_repo());
+        m.assert_support("file:src/repo.rs", "file:src/db.rs", 1.0); // a real belief on the persisted graph
+        assert!(
+            !m.graph().qbeliefs().is_empty(),
+            "the assertion registered an authority signal"
+        );
+        let (_, live) = m.weighted_lsa_model(8).expect("live projection");
+        let reloaded = CcosMemory::from_json(&m.to_json().expect("serialise")).expect("reload");
+        let (_, after) = reloaded.weighted_lsa_model(8).expect("reloaded projection");
+        assert_eq!(
+            live, after,
+            "weighted LSA projection is bit-identical live and on reload"
+        );
+    }
+
+    #[test]
+    fn causal_weights_are_deterministic_and_rise_with_evidence() {
+        let mut m = eager_build(&db_repo());
+        let db = node_id(&m, "file:src/db.rs");
+        let before = m.causal_weights(&[&db]);
+        assert_eq!(
+            before,
+            m.causal_weights(&[&db]),
+            "causal weights are a deterministic function of the graph"
+        );
+        // Asserting support for `db` adds an incoming Supports edge: both its authority (belief > 0) and
+        // its centrality rise, so its causal weight — its pull on the latent space — strictly increases.
+        m.assert_support("file:src/repo.rs", "file:src/db.rs", 1.0);
+        let after = m.causal_weights(&[&db]);
+        assert!(
+            after[0] > before[0],
+            "causal evidence raises the document's weight: {} > {}",
+            after[0],
+            before[0]
+        );
+    }
+
+    #[test]
+    fn semantic_recall_with_weighted_rerank_returns_a_window() {
+        // End-to-end through the public recall API: enabling the rerank routes recall through
+        // `lsa_region_scores → weighted_lsa_model → causal_weights` and must return a non-empty window.
+        let mut m = eager_build(&[
+            ("src/db.rs", "pub fn connect_timeout() -> i32 { 30 }\n"),
+            ("src/cache.rs", "pub fn warm_cache() -> i32 { 2 }\n"),
+        ]);
+        m.set_lsa_rerank(Some(8));
+        let w = m.recall(&Recall::Semantic("database connection timeout".into()), 512);
+        assert!(
+            !w.items.is_empty(),
+            "weighted-rerank semantic recall returns a window"
+        );
     }
 
     #[test]
