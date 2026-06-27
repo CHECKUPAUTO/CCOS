@@ -137,16 +137,15 @@ fn main() {
     }
 
     println!(
-        "\nFinding: parse (syn) is cheap (~5%); the cost is the whole-graph **resolve passes** —\n\
-         data-flow ~49%, calls ~23%. Worse, `ingest_source` re-runs them after EVERY file, and\n\
-         `add_edge` checks for a duplicate with a LINEAR SCAN of all edges — so the measured cost is\n\
-         ~**cubic** (resolve time grows ~8-15x when the file count doubles; 600 files = ~216 s).\n\
-         Two algorithmic fixes, both far above any cache work:\n\
-           (1) make `add_edge`'s dedup O(1) — a membership set, not an O(E) scan over self.edges;\n\
-           (2) incremental resolution — resolve only the new file's pending refs against a maintained\n\
-               index, instead of re-resolving the whole graph after every file.\n\
-         Together they turn ~O(N^3) into ~O(N). Data-oriented layout (SoA / cache alignment) would\n\
-         only shave a constant factor — premature before this. THIS is why we measure first: the\n\
-         profile redirected the work from a speculative SoA rewrite to the real bottleneck."
+        "\nFinding: parse (syn) is cheap (~5%); the cost is the whole-graph **resolve passes**\n\
+         (data-flow ~49%, calls ~23%) — never the parser, never cache layout.\n\
+         B1 (applied): `add_edge` originally deduped with an O(E) LINEAR SCAN of all edges, which made\n\
+         ingestion ~CUBIC (600 files = ~216 s). Replacing it with an O(1) membership-set dedup dropped\n\
+         the single pass ~11x (resolve-data-flow ~70x) and the scaling to a clean ~O(N²) (×~4.3 per\n\
+         file-count doubling; 600 files ≈ 11 s). The remaining quadratic is the second cause —\n\
+         `ingest_source` re-runs the whole-graph passes after EVERY file.\n\
+         B2 (next): incremental resolution — resolve only the new file's pending refs against a\n\
+         maintained index — removes it, → ~O(N). DOD/SoA would only shave a constant factor and was\n\
+         never the bottleneck. THIS is why we measure first."
     );
 }

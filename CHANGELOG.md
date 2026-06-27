@@ -6,6 +6,20 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Performance
+
+- **Ingestion is no longer ~O(N³): O(1) `add_edge` de-duplication + the `ingest_profile` profiler.**
+  Profiling (`examples/ingest_profile.rs`) found the ingestion hot spot is the whole-graph **resolve
+  passes** (data-flow ~49%, calls ~23%; parse is only ~5%) — *not* cache layout — and that `add_edge`
+  de-duplicated with an **O(E) linear scan of every edge**. Since the resolve passes re-run after each
+  ingested file and add an edge per ref, that made ingesting N files roughly **cubic** (600 files ≈
+  216 s of resolution). Replacing the scan with an **O(1) membership-set index** (`edge_set`, a
+  `serde(skip)` `HashSet<(source, target, type)>` rebuilt lazily on a length mismatch) cut a single
+  ingest pass **~11×** (the data-flow pass ~70×) and dropped scaling to a clean **O(N²)** (×~4.3 per
+  file-count doubling; 600 files ≈ 11 s). The remaining quadratic — the per-file whole-graph
+  re-resolution — is the next slice (incremental resolution → O(N)). Measuring first redirected the
+  work from a speculative SoA/cache rewrite to the real bottleneck.
+
 ### Changed
 
 - **The real `syn` AST parser is now the default ingestion path** (was opt-in behind

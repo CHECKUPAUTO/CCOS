@@ -8,7 +8,7 @@ use crate::util::{hex32, sha256_bytes};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::path::PathBuf;
 
 /// Memtable size (husks buffered before flushing to a segment) and read-cache
@@ -99,7 +99,7 @@ pub struct GraphEdge {
     pub created_at: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum EdgeType {
     DependsOn,
     Contains,
@@ -484,6 +484,13 @@ pub struct MemoryGraph {
     /// -only; rebuilt on the replay re-ingest, and filtered to still-resident nodes at resolve time.
     #[serde(skip)]
     data_symbols: std::collections::BTreeSet<NodeId>,
+    /// O(1) duplicate-edge index: the `(source, target, edge_type)` triples already present in
+    /// `edges`. Consulted by [`add_edge`](Self::add_edge) instead of a linear scan — the whole-graph
+    /// resolve passes add an edge per ref, so the old O(E) scan made ingestion ~O(N³)
+    /// (`examples/ingest_profile.rs`). Runtime-only (`#[serde(skip)]`): rebuilt lazily from `edges`
+    /// whenever the two fall out of length-sync (just deserialized, or after a bulk edge removal).
+    #[serde(skip)]
+    edge_set: HashSet<(NodeId, NodeId, EdgeType)>,
 }
 
 /// Cache value behind [`MemoryGraph::node_eigencentrality`]: the centrality vector keyed
@@ -721,6 +728,7 @@ impl MemoryGraph {
             pending_data_refs: BTreeMap::new(),
             pending_aliases: BTreeMap::new(),
             data_symbols: std::collections::BTreeSet::new(),
+            edge_set: HashSet::new(),
         }
     }
 
@@ -829,15 +837,25 @@ impl MemoryGraph {
         if !self.nodes.contains_key(&source) || !self.nodes.contains_key(&target) {
             return false;
         }
-        let now = self.clock;
-        // Avoid duplicate edges
-        let already_exists = self
-            .edges
-            .iter()
-            .any(|e| e.source == source && e.target == target && e.edge_type == edge_type);
-        if already_exists {
-            return false;
+        // O(1) duplicate check via `edge_set` (the `(source, target, type)` membership index) — the
+        // hot path: the whole-graph resolve passes call `add_edge` per ref, so the old linear scan of
+        // `self.edges` made ingestion ~O(N³) (see `examples/ingest_profile.rs`). The index is
+        // `serde(skip)`, so rebuild it lazily whenever it has fallen out of length-sync with `edges`
+        // (just deserialized, or after a bulk edge removal).
+        if self.edge_set.len() != self.edges.len() {
+            self.edge_set = self
+                .edges
+                .iter()
+                .map(|e| (e.source.clone(), e.target.clone(), e.edge_type.clone()))
+                .collect();
         }
+        if !self
+            .edge_set
+            .insert((source.clone(), target.clone(), edge_type.clone()))
+        {
+            return false; // an identical edge already exists
+        }
+        let now = self.clock;
         self.edges.push(GraphEdge {
             source,
             target,
@@ -3750,6 +3768,55 @@ mod tests {
             g.dead_symbols(),
             vec![NodeId("sym:src/api.rs:run".into())],
             "only the unreferenced symbol is flagged"
+        );
+    }
+
+    #[test]
+    fn add_edge_dedup_index_stays_correct_across_remove_and_serde() {
+        // The O(1) `edge_set` dedup index must mirror `edges` through every path: a duplicate is
+        // rejected, a different edge type between the same pair is *not* a duplicate, a removed edge
+        // becomes re-addable (the index rebuilds after the bulk remove), and a serde reload (which
+        // drops the runtime index) still dedups (it rebuilds lazily).
+        let mut g = MemoryGraph::new(0.0, usize::MAX);
+        for id in ["a", "b"] {
+            g.upsert_node(id.into(), id.into(), String::new(), NodeType::ContextBlock);
+        }
+        assert!(g.add_edge("a".into(), "b".into(), 1.0, EdgeType::DependsOn));
+        assert!(
+            !g.add_edge("a".into(), "b".into(), 1.0, EdgeType::DependsOn),
+            "exact duplicate rejected"
+        );
+        assert!(
+            g.add_edge("a".into(), "b".into(), 1.0, EdgeType::References),
+            "a different edge type between the same pair is not a duplicate"
+        );
+        assert_eq!(g.edges().len(), 2);
+
+        // Remove an endpoint → its edges go; the (now length-stale) index must let the edge re-add.
+        g.remove_node(&"b".into());
+        g.upsert_node(
+            "b".into(),
+            "b".into(),
+            String::new(),
+            NodeType::ContextBlock,
+        );
+        assert!(
+            g.add_edge("a".into(), "b".into(), 1.0, EdgeType::DependsOn),
+            "edge is re-addable after its endpoint was removed"
+        );
+
+        // Serde reload drops the `#[serde(skip)]` index; dedup must still hold (lazy rebuild).
+        let json = serde_json::to_string(&g).unwrap();
+        let mut back: MemoryGraph = serde_json::from_str(&json).unwrap();
+        let before = back.edges().len();
+        assert!(
+            !back.add_edge("a".into(), "b".into(), 1.0, EdgeType::DependsOn),
+            "dedup survives a reload"
+        );
+        assert_eq!(
+            back.edges().len(),
+            before,
+            "no duplicate added after reload"
         );
     }
 
