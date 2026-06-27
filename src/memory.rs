@@ -2781,17 +2781,21 @@ impl MemoryGraph {
         // Slice 3 — the `(type_name, method) → method symbol` index for `x.bar()` / `Type::assoc()`
         // resolution, built from the impl-block facts the parser handed over (`pending_methods`).
         // `tm_count` carries each bucket's cardinality so a type name shared by two impls (a cross-file
-        // / cross-crate homonym) is **ambiguous and skipped**, never resolved last-writer-wins. Built
-        // over the sorted `pending_methods` from resident symbol nodes only ⇒ deterministic and a pure
-        // function of the final graph (the same contract as `defs`/`name_count`).
+        // / cross-crate homonym) is **ambiguous and skipped**, never resolved last-writer-wins.
+        // Cardinality is counted over **all** ingested method defs (NOT just resident ones), so a
+        // homonym whose one definition is paged COLD is still seen as ambiguous → skipped, rather than
+        // resolved to the surviving twin (a false edge a resident-only count could mint). Only a
+        // **resident** symbol can be the link *target* (you cannot point a fresh edge at a paged node);
+        // a unique method whose symbol is COLD therefore drops the edge — precision-safe. Built over the
+        // sorted `pending_methods` ⇒ deterministic and a pure function of the ingested op-stream.
         let mut type_method: HashMap<(String, String), NodeId> = HashMap::new();
         let mut tm_count: HashMap<(String, String), u32> = HashMap::new();
         for (file, methods) in &self.pending_methods {
             for (ty, method) in methods {
+                let key = (ty.clone(), method.clone());
+                *tm_count.entry(key.clone()).or_default() += 1;
                 let sym = NodeId(format!("sym:{file}:{method}"));
                 if self.nodes.contains_key(&sym) {
-                    let key = (ty.clone(), method.clone());
-                    *tm_count.entry(key.clone()).or_default() += 1;
                     type_method.entry(key).or_insert(sym);
                 }
             }
@@ -3803,6 +3807,26 @@ mod tests {
         assert!(
             calls_of(&g).is_empty(),
             "a type-name homonym makes Foo::bar ambiguous — skip, never guess: {:?}",
+            calls_of(&g)
+        );
+    }
+
+    #[test]
+    fn resolve_type_method_paged_out_homonym_still_skips() {
+        // A genuine (Foo, bar) homonym where ONE method symbol is absent from the resident set (paged
+        // COLD): cardinality is counted over ALL ingested method defs, not just resident ones, so the
+        // homonym is still detected → skip. A resident-only count would under-count to 1 and mint a
+        // false edge to the surviving resident twin. (Adversarial-review regression.)
+        let mut g = graph_with_defs(&[("src/a.rs", "bar"), ("src/c.rs", "run")]);
+        // src/b.rs:bar is a real second definition, but its symbol node is NOT resident — we register
+        // the method-ownership fact without creating the sym node (simulating a paged-COLD twin).
+        g.set_pending_methods("src/a.rs", vec![("Foo".into(), "bar".into())]);
+        g.set_pending_methods("src/b.rs", vec![("Foo".into(), "bar".into())]);
+        g.set_pending_calls("src/c.rs", vec![("run".into(), "Foo::bar".into(), 1)]);
+        g.resolve_symbol_calls();
+        assert!(
+            calls_of(&g).is_empty(),
+            "a paged-out homonym still makes Foo::bar ambiguous — no false edge to the resident twin: {:?}",
             calls_of(&g)
         );
     }
