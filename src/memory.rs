@@ -2234,6 +2234,65 @@ impl MemoryGraph {
         belief_from_sums(support, contradiction)
     }
 
+    /// **Belief propagation** along causal edges — a single deterministic hop. For every
+    /// [`EdgeType::Causes`] edge `A → B` whose source claim `A` is **resolved** — its
+    /// [`qbelief`](Self::qbelief) `belief` is at least `resolve_threshold` (believed) or at most
+    /// `1 - resolve_threshold` (disbelieved) — emit a *derived* evidence edge on the effect `B`: a
+    /// [`Supports`](EdgeType::Supports) edge when the cause is believed, a
+    /// [`Contradicts`](EdgeType::Contradicts) edge when it is disbelieved. So a claim with no direct
+    /// evidence of its own still acquires a belief from the causes it depends on — belief revision
+    /// across the causal graph, which a static evidence store cannot do. The derived weight is
+    /// **attenuated** — `edge.weight · damping · 2·|belief − 0.5|` — so a barely-resolved or weakly-
+    /// causal link contributes little and `B`'s induced belief is always weaker than `A`'s. Self-loops
+    /// and unresolved causes (`belief` near `0.5`) are skipped.
+    ///
+    /// **One hop only** in this slice: the derived edges are not themselves propagated onward — a
+    /// chain `A → B → C` needs a second call. Multi-hop propagation with damping-to-convergence and a
+    /// scheduler (to bound the cascade) is a later slice, as is recording it as a replayable op when
+    /// wired into the agent loop. Deterministic: candidates are collected read-only, **sorted**, then
+    /// added (so iteration order cannot leak in) and [`add_edge`](Self::add_edge) dedups, so the pass
+    /// is **idempotent**. Returns the number of derived edges added. `resolve_threshold` is clamped to
+    /// `[0.5, 1.0]`, `damping` to `[0.0, 1.0]`.
+    pub fn propagate_beliefs(&mut self, resolve_threshold: f64, damping: f64) -> usize {
+        let resolve_threshold = resolve_threshold.clamp(0.5, 1.0);
+        let damping = damping.clamp(0.0, 1.0);
+        // Phase 1 (read-only): collect a derived edge for every resolved cause. `(source, target,
+        // supports, weight)`; the weight is not part of the dedup key.
+        let mut to_add: Vec<(NodeId, NodeId, bool, f64)> = Vec::new();
+        for e in &self.edges {
+            if e.edge_type != EdgeType::Causes || e.source == e.target {
+                continue;
+            }
+            let belief = self.qbelief(&e.source).belief;
+            let supports = if belief >= resolve_threshold {
+                true
+            } else if belief <= 1.0 - resolve_threshold {
+                false
+            } else {
+                continue; // cause not resolved ⇒ no propagation
+            };
+            let certainty = 2.0 * (belief - 0.5).abs(); // in [0, 1]
+            let weight = e.weight * damping * certainty;
+            to_add.push((e.source.clone(), e.target.clone(), supports, weight));
+        }
+        // Deterministic add order; dedup on (source, target, polarity) — weight is not a key.
+        to_add.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+        to_add.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1 && a.2 == b.2);
+        // Phase 2 (mutate): add the derived edges. `add_edge` dedups against existing edges too.
+        let mut added = 0;
+        for (src, tgt, supports, weight) in to_add {
+            let et = if supports {
+                EdgeType::Supports
+            } else {
+                EdgeType::Contradicts
+            };
+            if self.add_edge(src, tgt, weight, et) {
+                added += 1;
+            }
+        }
+        added
+    }
+
     /// The evidence nodes pointing at `claim` with a given **polarity** —
     /// [`EdgeType::Supports`] for the affirmative surface, [`EdgeType::Contradicts`] for the
     /// negative one. Returned **sorted and deduped**, so the surface is deterministic. A
@@ -3908,6 +3967,141 @@ mod tests {
             build(),
             "same timed construction ⇒ identical decayed belief"
         );
+    }
+
+    // ── Q-Page belief propagation (single hop) ──────────────────────────────────────────────────
+
+    /// Give `claim` `n_sup` support + `n_con` contradiction evidence edges (fresh nodes, weight 1.0).
+    fn add_evidence(g: &mut MemoryGraph, claim: &str, n_sup: usize, n_con: usize) {
+        let c = NodeId(claim.into());
+        g.upsert_node(
+            c.clone(),
+            claim.into(),
+            String::new(),
+            NodeType::ContextBlock,
+        );
+        for i in 0..n_sup {
+            let id = NodeId(format!("{claim}_s{i}"));
+            g.upsert_node(
+                id.clone(),
+                "s".into(),
+                String::new(),
+                NodeType::ContextBlock,
+            );
+            g.add_edge(id, c.clone(), 1.0, EdgeType::Supports);
+        }
+        for i in 0..n_con {
+            let id = NodeId(format!("{claim}_c{i}"));
+            g.upsert_node(
+                id.clone(),
+                "c".into(),
+                String::new(),
+                NodeType::ContextBlock,
+            );
+            g.add_edge(id, c.clone(), 1.0, EdgeType::Contradicts);
+        }
+    }
+
+    #[test]
+    fn propagate_resolved_cause_supports_effect_with_no_evidence() {
+        // A is resolved-true (3 supports ⇒ belief 0.8); A causes B; B has no direct evidence (0.5).
+        // Propagation gives B a derived, attenuated support, so its belief rises — but stays weaker
+        // than its cause's.
+        let mut g = MemoryGraph::new(0.0, usize::MAX);
+        add_evidence(&mut g, "A", 3, 0);
+        g.upsert_node(
+            "B".into(),
+            "B".into(),
+            String::new(),
+            NodeType::ContextBlock,
+        );
+        g.add_edge("A".into(), "B".into(), 1.0, EdgeType::Causes);
+        let (a, b): (NodeId, NodeId) = ("A".into(), "B".into());
+        assert_eq!(g.qbelief(&b).belief, 0.5, "B starts unknown");
+        assert_eq!(g.propagate_beliefs(0.7, 0.6), 1);
+        let a_belief = g.qbelief(&a).belief;
+        let b_belief = g.qbelief(&b).belief;
+        assert!((a_belief - 0.8).abs() < 1e-9, "cause unchanged at 0.8");
+        assert!(
+            b_belief > 0.5 && b_belief < a_belief,
+            "effect inherits a weaker belief from its resolved cause: {b_belief}"
+        );
+    }
+
+    #[test]
+    fn propagate_disbelieved_cause_contradicts_effect() {
+        // A resolved-false (3 contradictions ⇒ belief 0.2) ⇒ a derived Contradicts on its effect.
+        let mut g = MemoryGraph::new(0.0, usize::MAX);
+        add_evidence(&mut g, "A", 0, 3);
+        g.upsert_node(
+            "B".into(),
+            "B".into(),
+            String::new(),
+            NodeType::ContextBlock,
+        );
+        g.add_edge("A".into(), "B".into(), 1.0, EdgeType::Causes);
+        assert_eq!(g.propagate_beliefs(0.7, 0.6), 1);
+        assert!(
+            g.qbelief(&"B".into()).belief < 0.5,
+            "a disbelieved cause pushes its effect below the prior"
+        );
+    }
+
+    #[test]
+    fn propagate_unresolved_cause_does_not_propagate() {
+        // A balanced (2 support + 2 contradiction ⇒ belief 0.5) is not resolved ⇒ no propagation.
+        let mut g = MemoryGraph::new(0.0, usize::MAX);
+        add_evidence(&mut g, "A", 2, 2);
+        g.upsert_node(
+            "B".into(),
+            "B".into(),
+            String::new(),
+            NodeType::ContextBlock,
+        );
+        g.add_edge("A".into(), "B".into(), 1.0, EdgeType::Causes);
+        assert_eq!(g.propagate_beliefs(0.7, 0.6), 0);
+        assert_eq!(g.qbelief(&"B".into()).belief, 0.5, "B stays unknown");
+    }
+
+    #[test]
+    fn propagate_skips_self_causes() {
+        // A self-cause (A causes A) must never derive self-evidence.
+        let mut g = MemoryGraph::new(0.0, usize::MAX);
+        add_evidence(&mut g, "A", 3, 0);
+        g.add_edge("A".into(), "A".into(), 1.0, EdgeType::Causes);
+        let before = g.qbelief(&"A".into());
+        assert_eq!(g.propagate_beliefs(0.7, 0.6), 0);
+        assert_eq!(
+            g.qbelief(&"A".into()),
+            before,
+            "self-cause adds no evidence"
+        );
+    }
+
+    #[test]
+    fn propagate_is_idempotent_and_deterministic() {
+        let build = || {
+            let mut g = MemoryGraph::new(0.0, usize::MAX);
+            add_evidence(&mut g, "A", 3, 0);
+            g.upsert_node(
+                "B".into(),
+                "B".into(),
+                String::new(),
+                NodeType::ContextBlock,
+            );
+            g.add_edge("A".into(), "B".into(), 1.0, EdgeType::Causes);
+            let first = g.propagate_beliefs(0.7, 0.6);
+            let second = g.propagate_beliefs(0.7, 0.6); // already-derived edge is deduped
+            (first, second, g.qbelief(&"B".into()))
+        };
+        let (first, second, belief) = build();
+        assert_eq!(
+            (first, second),
+            (1, 0),
+            "idempotent: re-propagation adds nothing"
+        );
+        let (_, _, belief2) = build();
+        assert_eq!(belief, belief2, "deterministic across rebuilds");
     }
 
     #[test]
