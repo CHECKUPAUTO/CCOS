@@ -20,6 +20,22 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   re-resolution — is the next slice (incremental resolution → O(N)). Measuring first redirected the
   work from a speculative SoA/cache rewrite to the real bottleneck.
 
+- **B2-batch: deferred whole-graph resolution — ~174× faster batch ingestion (O(N²)→O(N)).** The
+  three resolve passes are order-independent pure functions of the *final* node + pending-ref set, so
+  running them **once at the batch boundary** instead of after every file collapses the remaining
+  quadratic to a single linear pass. The new `CcosMemory::ingest_deferred` (record a file, mark
+  resolution pending) + `CcosMemory::resolve` (run the passes once, idempotent/near-free when clean)
+  expose this; the profiler's new `# B2-batch` table measures **15,596 ms → 89.5 ms at 600 files**,
+  scaling ~×2.5 per doubling (linear) instead of ~×4.9 (quadratic). The eager `ingest_source` is
+  unchanged — it is now literally `ingest_deferred` + `resolve`, so a single ingest still leaves a
+  fully-resolved graph (a `debug_assert` in `recall`/`to_json`/`checkpoint` guards the deferred
+  contract). Surfaced and **measured** an honest semantic subtlety: eager (incremental, add-only)
+  resolution keeps an order-dependent `Calls` edge that batch (final-state, resolve-uniquely-or-skip)
+  correctly drops under late-arriving name ambiguity — so the **replayable `AgentSession` path stays
+  eager** and `replay == live` is exact. Order-independent resolution (prune resolution-owned edges
+  before each rebuild → eager ≡ batch everywhere, replay can batch too; edge ownership mapped) is the
+  scoped follow-up. See `docs/MEASUREMENT_batch_resolution.md`.
+
 ### Changed
 
 - **The real `syn` AST parser is now the default ingestion path** (was opt-in behind
