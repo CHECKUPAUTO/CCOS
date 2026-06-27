@@ -1354,13 +1354,11 @@ impl CcosMemory {
         if !self.needs_resolution {
             return 0;
         }
-        // Resolve intra-crate imports into file→file edges so recall, failure
-        // propagation and regions see the real cross-file causal structure.
-        let cross_edges = self.graph.link_module_imports();
-        // Caller→callee `Calls` edges (fn→fn structure import edges miss), then
-        // reader→item `DataFlow` edges (shared-global state call/import edges miss).
-        let _ = self.graph.resolve_symbol_calls();
-        let _ = self.graph.resolve_data_flow();
+        // Order-independent rebuild: prune the resolution-owned edges, then re-run the
+        // three passes over the final state (imports → calls → data-flow). This makes
+        // eager (per-file) and batch (deferred) ingestion — and a replay re-ingest —
+        // converge on the same graph, with no order-dependent stale edges.
+        let cross_edges = self.graph.resolve_all();
         self.needs_resolution = false;
         self.bump_version();
         cross_edges
@@ -1656,20 +1654,18 @@ mod tests {
     }
 
     // Calls edges only exist with the real `syn` AST parser (the line-heuristic
-    // fallback does not extract in-body call-sites), so this divergence is syn-only.
+    // fallback does not extract in-body call-sites), so this is syn-only.
     #[cfg(feature = "syn-parser")]
     #[test]
-    fn eager_keeps_stale_edge_that_batch_drops_under_late_ambiguity() {
-        // Documented semantic difference (measured, not papered over). Eager per-file
-        // resolution adds `run -> a::target` while `target` is still globally-unique
-        // and never removes it once `b::target` makes the call ambiguous (resolution
-        // is add-only). The deferred batch resolves against the FINAL state, sees the
-        // ambiguity, and skips the edge (resolve-uniquely-or-skip). So: batch =
-        // order-independent final-state semantics; eager = order-dependent
-        // incremental. Making the two identical by pruning resolution-owned edges
-        // before each rebuild is the order-independent-resolution follow-up
-        // (ownership mapped in docs/MEASUREMENT_batch_resolution.md). Until then the
-        // replayable AgentSession path stays eager, so `replay == live` is exact.
+    fn eager_and_batch_agree_under_late_ambiguity() {
+        // B2-full (order-independent resolution) makes eager ≡ batch even in the case
+        // that used to diverge. `caller` calls `target` while it is globally-unique;
+        // `b::target` then makes the call ambiguous. The old add-only resolution kept
+        // the order-dependent `run -> a::target` edge on the eager path (and only the
+        // batch dropped it). Now `resolve_all` prunes the resolution-owned edges and
+        // rebuilds from the final state, so BOTH paths see the ambiguity and skip the
+        // call (resolve-uniquely-or-skip). Identical, order-independent graphs — which
+        // is exactly what lets the replayable path batch without breaking replay==live.
         let files = [
             ("src/a.rs", "pub fn target() -> i32 { 1 }\n"),
             ("src/caller.rs", "pub fn run() -> i32 { target() }\n"),
@@ -1677,13 +1673,67 @@ mod tests {
         ];
         assert_eq!(
             count_calls(&eager_build(&files)),
-            1,
-            "eager keeps the order-dependent Calls edge resolved while target was unique"
+            0,
+            "eager now drops the now-ambiguous call (no order-dependent stale edge)"
         );
         assert_eq!(
             count_calls(&batch_build(&files)),
             0,
-            "batch drops the now-ambiguous call — cleaner final-state semantics"
+            "batch drops it too — the two paths agree"
+        );
+        assert_eq!(
+            edge_fp(&eager_build(&files)),
+            edge_fp(&batch_build(&files)),
+            "eager and batch produce the identical graph under late ambiguity"
+        );
+    }
+
+    // The selective-prune correctness property: a checkpoint-loaded file's Calls /
+    // DataFlow edges must survive a later ingest+resolve. Their pending refs are
+    // serde(skip) (gone after load), so pruning them would lose them irrecoverably.
+    #[cfg(feature = "syn-parser")]
+    #[test]
+    fn checkpoint_load_then_ingest_keeps_loaded_call_edges() {
+        let mut mem = CcosMemory::new();
+        mem.ingest_source("src/db.rs", "pub fn connect() -> i32 { 1 }\n");
+        mem.ingest_source(
+            "src/repo.rs",
+            "use crate::db;\npub fn load() -> i32 { db::connect() }\n",
+        );
+        let loaded_calls = count_calls(&mem);
+        assert!(
+            loaded_calls >= 1,
+            "the original graph has the repo->db call edge"
+        );
+
+        // Round-trip through JSON: pending_calls/data_refs are serde(skip), so the
+        // reloaded graph keeps the resolved edges but NOT the inputs that produced them.
+        let mut reloaded = CcosMemory::from_json(&mem.to_json().unwrap()).unwrap();
+        assert_eq!(
+            count_calls(&reloaded),
+            loaded_calls,
+            "reload preserves the resolved call edge"
+        );
+
+        // Ingest a NEW file (its own cross-file call) and resolve. The loaded repo->db
+        // edge must survive (repo.rs has no pending refs now → not pruned), and the new
+        // api->repo edge is resolved.
+        reloaded.ingest_source(
+            "src/api.rs",
+            "use crate::repo;\npub fn handler() -> i32 { repo::load() }\n",
+        );
+        let has_loaded_edge = reloaded.graph().edges().iter().any(|e| {
+            e.edge_type == crate::memory::EdgeType::Calls
+                && e.source.0 == "sym:src/repo.rs:load"
+                && e.target.0 == "sym:src/db.rs:connect"
+        });
+        assert!(
+            has_loaded_edge,
+            "selective prune keeps the loaded file's call edge (it cannot be rebuilt post-load)"
+        );
+        assert!(
+            count_calls(&reloaded) > loaded_calls,
+            "and the newly-ingested file's call edge was resolved on top"
         );
     }
 

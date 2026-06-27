@@ -36,6 +36,21 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   before each rebuild → eager ≡ batch everywhere, replay can batch too; edge ownership mapped) is the
   scoped follow-up. See `docs/MEASUREMENT_batch_resolution.md`.
 
+- **B2-full: order-independent resolution — eager ≡ batch, the divergence is gone.** Made resolution
+  *idempotent-with-removal* via `MemoryGraph::resolve_all` (now behind `CcosMemory::resolve`): it
+  **prunes the resolution-owned edges, then rebuilds from the final state**, so a name that became
+  ambiguous after a caller was linked is no longer left as an order-dependent stale `Calls` edge. The
+  prune is **selective** to respect the `serde(skip)` pending-ref indices (empty after a checkpoint
+  load): `file:→file:` import / hierarchy edges always rebuild from the durable node set, while
+  `Calls`/`DataFlow` are pruned only for files whose pending refs are present (this session / a replay
+  re-ingest) — a loaded file with no pending refs keeps its edges (they can't be rebuilt). So eager
+  (per-file), batch (deferred) and a replay re-ingest now converge on the **identical** graph, **and
+  `replay == live` stays exact** (replay sees the same pending-presence pattern as live). New tests:
+  `eager_and_batch_agree_under_late_ambiguity`, `checkpoint_load_then_ingest_keeps_loaded_call_edges`.
+  This removes the semantic blocker, so batching the replayable path (O(N) time-travel) +
+  `AgentSession::ingest_batch` is now a safe mechanical follow-up. See
+  `docs/MEASUREMENT_batch_resolution.md`.
+
 ### Changed
 
 - **The real `syn` AST parser is now the default ingestion path** (was opt-in behind

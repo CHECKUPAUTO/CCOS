@@ -46,12 +46,12 @@ flag (idempotent and near-free when clean). The eager `CcosMemory::ingest_source
 on). A `debug_assert` in `recall`/`to_json`/`checkpoint` turns any future "deferred ingest, then read
 without resolve" into a loud failure.
 
-## The honest subtlety — eager and batch are *not* always the same graph
+## B2-full — order-independent resolution (landed): eager ≡ batch
 
-Deferring resolution is **not** a pure speedup: it changes *when* resolution sees the graph, and the
-two answers can differ. Resolution is **resolve-uniquely-or-skip** but **add-only** (it never removes
-an edge). Consider a name that is globally-unique when a caller is ingested, then made ambiguous by a
-later file:
+Deferring resolution *used to* change the answer, not just the speed. Resolution is
+**resolve-uniquely-or-skip**, and the original passes were **add-only** (they never removed an edge),
+so a name globally-unique when a caller is ingested, then made ambiguous by a later file, left an
+order-dependent stale edge:
 
 ```
 src/a.rs       pub fn target() -> i32 { 1 }      // defines target
@@ -59,55 +59,46 @@ src/caller.rs  pub fn run() -> i32 { target() }  // calls target — unique *now
 src/b.rs       pub fn target() -> i32 { 2 }      // a SECOND target — now ambiguous
 ```
 
-- **Eager (per-file, incremental):** at `caller.rs`, `target` is globally-unique, so
-  `resolve_symbol_calls` adds `run → a::target` (`Calls`). At `b.rs` the name is ambiguous, so it adds
-  nothing — but **the earlier edge stays**. Final graph: `run → a::target` exists. The edge is an
-  artefact of *ingestion order* (a.rs happened to arrive before b.rs).
-- **Batch (resolve once, final-state):** the single pass sees two `target`s, the call is ambiguous,
-  resolve-uniquely-or-skip declines. Final graph: **no** `run → target` edge.
+Old eager (per-file, add-only) kept `run → a::target` (resolved while `target` was unique, never
+removed); only the batch saw the final ambiguity and dropped it. The two graphs differed.
 
-This is verified in `external_memory.rs`:
-`eager_keeps_stale_edge_that_batch_drops_under_late_ambiguity`. The batch answer is the **cleaner**
-one — the call genuinely *is* ambiguous in the complete program, and inventing a particular target
-from arrival order is exactly what resolve-uniquely-or-skip exists to avoid. The batch path is also
-**order-independent** (`deferred_batch_is_order_independent`): any ingest order yields the identical
-graph, because it is a pure function of the final state. On an **unambiguous** corpus (the common
-case) the two paths are identical (`deferred_batch_equals_eager_on_unambiguous_corpus`).
+**The fix** (`MemoryGraph::resolve_all`): *prune the resolution-owned edges, then rebuild from the
+final state* on every resolve. A name that became ambiguous is simply not re-linked, so eager
+(per-file) and batch (deferred) — and a replay that re-ingests the same files — all converge on the
+**same** graph. `eager_and_batch_agree_under_late_ambiguity` verifies eager now drops the edge too.
 
-## Why the replayable path stays eager (for now)
+**Selective prune — the `serde(skip)` constraint.** `pending_calls`/`pending_data_refs` are runtime-
+only, so they are **empty after a checkpoint load**: a `Calls`/`DataFlow` edge of a loaded file can
+*not* be rebuilt. So the prune has two tiers:
 
-CCOS's sacred invariant is `replay == live`: replaying the op log must reconstruct the identical
-graph. Live ingestion via `AgentSession::ingest` is **eager** (incremental), and `replay_to` replays
-those ops **eagerly**, op by op — so replay reproduces live's exact incremental sequence, *including*
-any order-dependent stale edge. If the replay path were switched to batch (final-state) while live
-stayed eager, the two would diverge under late-arriving ambiguity and break `replay == live` — a
-violation the current property tests would *not* catch, because their generators don't produce
-colliding names. So this change keeps the `AgentSession` path **eager and unchanged**; the batch
-primitive is for callers without a replay log (one-shot analysis, bulk loaders, the profiler).
+| Edge type           | Created by                                   | Pruned by `resolve_all`?                         |
+|---------------------|----------------------------------------------|--------------------------------------------------|
+| `Calls`             | `resolve_symbol_calls` only                  | only if the source file has pending refs (rebuildable) |
+| `DataFlow`          | `resolve_data_flow` only                     | only if the source file has pending refs (rebuildable) |
+| `DependsOn`         | parser (`file:→use:`, `use:→dep:`) + imports | always, but only `file:→file:` (rebuilt from durable nodes) |
+| `Contains`          | parser (`file:→mod:/sym:`) + module hierarchy| always, but only `file:→file:` (rebuilt from durable nodes) |
+| `Supports`/`Contradicts` | assertion path                          | never                                            |
 
-## The follow-up — order-independent resolution (makes eager ≡ batch everywhere)
+Import/hierarchy edges rebuild from the **durable** `file:`/`use:` node set, so they are always pruned
+and re-derived (loss-free even after load). `Calls`/`DataFlow` are pruned **only** for files whose
+pending refs are present (this session, or a replay re-ingest); a loaded file with no pending refs
+keeps its edges. `checkpoint_load_then_ingest_keeps_loaded_call_edges` proves a loaded call edge
+survives a later ingest+resolve.
 
-The clean way to get the batch speedup on *every* path (including replay) is to make resolution itself
-**order-independent**: prune the resolution-owned edges and rebuild from the final state on each run,
-so eager and batch always agree and replay can batch safely. The edge ownership is already mapped and
-is clean enough to make this tractable:
+**`replay == live` stays exact.** Replay loads the same baseline and replays the same ops, so it has
+the same pending-ref-presence pattern as live — selective prune behaves identically, and the converged
+graphs match. This is why the replayable path may now batch safely (the follow-up below). The full
+suite — including the `replay == live` and snapshot round-trip property tests — is green.
 
-| Edge type           | Created by                                   | Resolution-owned?                    |
-|---------------------|----------------------------------------------|--------------------------------------|
-| `Calls`             | `resolve_symbol_calls` only                  | **yes** (all)                        |
-| `DataFlow`          | `resolve_data_flow` only                     | **yes** (all)                        |
-| `DependsOn`         | parser (`file:→use:`, `use:→dep:`) + imports | only `file:→file:` (import edges)    |
-| `Contains`          | parser (`file:→mod:/sym:`) + module hierarchy| only `file:→file:` (hierarchy edges) |
-| `Supports`/`Contradicts` | assertion path                          | no                                   |
+## What's left: batching the replay/agent path
 
-So a prune step removes `Calls`, `DataFlow`, and the `file:→file:` `DependsOn`/`Contains` edges (then
-the three passes rebuild), leaving every parser/assertion edge untouched. That also *fixes* the stale
-edge above (eager would then drop it too). It is a behaviour change to a long-stable subsystem, so it
-is deferred to its own focused, full-suite-validated change (B2-full), rather than riding along with
-this perf work.
+The semantic blocker is gone, so the O(N) batch can now extend to the replayable path with no risk to
+`replay == live`: defer the ingests in `AgentSession::replay_to` / `retrieval_reward` and `resolve`
+once (turning O(N²) time-travel into O(N)), and add an `AgentSession::ingest_batch`. That is a
+mechanical follow-up on top of this order-independent core.
 
 **Bottom line:** measure first. The bottleneck was algorithmic (per-file whole-graph re-resolution),
 not cache layout — DOD/SoA would have shaved a constant factor off the wrong thing. Deferring the
-passes to the batch boundary is ~174× at 600 files, and surfaced a real semantic distinction
-(incremental vs final-state resolution) that we now measure, test, and document instead of papering
-over.
+passes to the batch boundary is ~174× at 600 files (B2-batch); making resolution prune-and-rebuild
+(B2-full) then removed the eager-vs-batch divergence entirely, so the speedup is now also *correct*
+and order-independent everywhere — measured, tested, and documented rather than papered over.
