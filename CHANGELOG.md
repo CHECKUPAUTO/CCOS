@@ -20,6 +20,18 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Q-Page belief propagation — single deterministic hop (`MemoryGraph::propagate_beliefs`).** Belief
+  revision across the causal graph: for every `Causes` edge `A → B` whose source claim `A` is
+  *resolved* (`|qbelief.belief| ≥ resolve_threshold`), a derived, **attenuated** evidence edge is added
+  on the effect `B` — `Supports` from a believed cause, `Contradicts` from a refuted one, weight
+  `edge.weight · damping · |belief|`. So a claim with no direct evidence inherits a weaker,
+  correctly-signed belief from the causes it depends on — something a flat evidence store cannot do.
+  Deterministic (collect read-only, sort, add; `add_edge` dedups ⇒ idempotent); self-loops and
+  unresolved causes are skipped. **One hop:** the signal attenuates below the threshold, so the
+  wavefront stops rather than cascading (measured in `docs/MEASUREMENT_propagation_crux.md`: an effect
+  inherits `±0.31` from a `±0.75` cause, while a 2-hop claim stays `0`). Multi-hop accumulation with a
+  scheduler, and an `Op::Propagate` for replay, are the next slice.
+
 - **Q-Page decay — knowledge half-life (`MemoryGraph::qbelief_decayed`).** A time-decayed view of a
   claim's belief: each evidence edge's weight is scaled by `0.5^(age / half_life)`, where `age` is the
   clock ticks since the edge was asserted (`created_at` vs the current `clock`). Lazy and pure
@@ -28,18 +40,21 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (re-)assertion carries full weight, so recent evidence outweighs an ageing one: a stale,
   never-reaffirmed dissent that plain `qbelief` would treat as an eternal deadlock resolves on its own
   as it ages. Measured in `docs/MEASUREMENT_decay_crux.md`: with a one-off objection aged against a
-  fresh support, `conflict` collapses `1.00 → 0.01` (and `belief` climbs `0.50 → 0.67`) as the
-  objection ages, versus a frozen `1.00` under plain `qbelief`. `half_life` is a caller parameter
+  fresh support, `conflict` collapses `0.67 → 0.06` (and `belief` climbs `0 → +0.50`) as the
+  objection ages, versus a frozen `0.67` under plain `qbelief`. `half_life` is a caller parameter
   (domain-dependent); per-class half-life and retrieval-path decay are follow-ups.
 
 - **Q-Page dual-evidence belief layer — contested-knowledge memory (`EdgeType::Supports` /
   `EdgeType::Contradicts`).** A claim node carries two opposing, explicitly-asserted evidence
   surfaces — the affirmative `S_A` (`Supports`) and the negative `S_¬A` (`Contradicts`) — and
   `MemoryGraph::qbelief` derives `{support, contradiction, belief, conflict}` from a claim's incoming
-  edges. It is **pure and derived** (no stored state, so snapshots are unchanged and `replay == live`
-  holds): `belief` is the Laplace-smoothed support fraction (`0.5` with no evidence), `conflict` the
-  evidence balance `2·min(s,c)/(s+c)` — high *only* when both surfaces carry weight, the resolution
-  signal a similarity index cannot represent (relatedness has no polarity). The two `EdgeType`
+  edges (each edge's weight is the asserting **source authority**, clamped to `[0, 1]`). It is **pure
+  and derived** (no stored state, so snapshots are unchanged and `replay == live` holds): `belief` is
+  the **signed** support fraction `(s − c)/(s + c + ε)` ∈ `[−1, 1]` (`0` at no/balanced evidence; sign
+  = direction, magnitude = strength), `conflict` the **geometric** balance `2·√(s·c)/(s + c + ε)` ∈
+  `[0, 1]` — high *only* when both surfaces carry weight, the resolution signal a similarity index
+  cannot represent (relatedness has no polarity); `ε = 1` is a unit prior (sparse evidence stays near
+  neutral). The two `EdgeType`
   variants are appended additively (old snapshots never contain them). Contradictions are **explicit
   cognitive events** — `CcosMemory::assert_support` / `assert_contradiction` (agent API, recorded in
   the hash-chained audit) and an `AgentSession` `Op::Assert` replayed in `replay_to`, so an

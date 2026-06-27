@@ -389,7 +389,8 @@ impl CcosMemory {
     /// [Q-Page](crate::memory::MemoryGraph::qbelief). An explicit cognitive event (an agent/tool
     /// recording a fact *for* a claim, not something derived from source). Both endpoints are
     /// created as empty `ContextBlock`s if absent; an existing node keeps its content. Idempotent
-    /// (a duplicate edge is rejected). Returns whether a new edge was added.
+    /// (a duplicate edge is rejected). `weight` is the **source authority** in `[0, 1]` (clamped) —
+    /// it scales this assertion's pull on the claim's `qbelief`. Returns whether a new edge was added.
     pub fn assert_support(&mut self, evidence: &str, claim: &str, weight: f64) -> bool {
         self.assert_evidence(evidence, claim, true, weight)
     }
@@ -423,13 +424,15 @@ impl CcosMemory {
         } else {
             EdgeType::Contradicts
         };
+        // The edge weight is the source **authority** — clamp to the documented [0, 1] range.
+        let authority = weight.clamp(0.0, 1.0);
         let added = self
             .graph
-            .add_edge(evidence.clone(), claim.clone(), weight, polarity);
+            .add_edge(evidence.clone(), claim.clone(), authority, polarity);
         // Audit trail ("why does the system believe this?") in the hash chain — no derived state.
         let tag = if supports { "support" } else { "contradict" };
         self.dist_log.append(
-            sha256_hex(&format!("{tag}:{}->{}:{weight}", evidence.0, claim.0)),
+            sha256_hex(&format!("{tag}:{}->{}:{authority}", evidence.0, claim.0)),
             "assertion".to_string(),
         );
         added

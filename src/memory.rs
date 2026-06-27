@@ -132,49 +132,55 @@ pub enum EdgeType {
     Contradicts,
 }
 
-/// Laplace smoothing prior for [`QBelief`]: one pseudo-count on each side, so a claim with no
-/// evidence either way sits at the neutral `belief` of `0.5`.
-const BELIEF_PRIOR: f64 = 1.0;
+/// Prior strength `ε` in the [`QBelief`] formulas — a pseudo-count that keeps a claim with little
+/// evidence near the neutral `belief` of `0`. Deliberately a **unit prior, not a tiny div-by-zero
+/// guard**: as `ε → 0` the ratios become scale-invariant (a single faint assertion would read as
+/// fully resolved, `belief ≈ ±1`), which would defeat decay; at `ε = 1`, sparse evidence stays near
+/// neutral and only *accumulated* evidence approaches the `±1` / `1` extremes.
+const BELIEF_EPS: f64 = 1.0;
 
 /// The derived dual-evidence belief state of a claim node — the **Q-Page** primitive.
 ///
 /// A claim accumulates two opposing evidence surfaces: incoming [`Supports`](EdgeType::Supports)
 /// edges (the affirmative surface `S_A`) and incoming [`Contradicts`](EdgeType::Contradicts) edges
-/// (the negative surface `S_¬A`). [`MemoryGraph::qbelief`] folds those edges into this summary. It
-/// is **derived, never stored** — recomputed from the edge set, so it adds no snapshot state and is
-/// reconstructed bit-for-bit on replay.
+/// (the negative surface `S_¬A`). Each edge's weight is the **authority** of that assertion (the
+/// reliability of its source, in `[0, 1]`), so `support` / `contradiction` are authority-weighted
+/// sums. [`MemoryGraph::qbelief`] folds those edges into this summary. It is **derived, never
+/// stored** — recomputed from the edge set, so it adds no snapshot state and is reconstructed
+/// bit-for-bit on replay.
 ///
 /// `belief` and `conflict` are deliberately **orthogonal axes** (a claim can be near-certain *and*
-/// contested, or uncertain *and* uncontested):
-/// * `belief` — Laplace-smoothed support fraction `(s + α) / (s + c + 2α)` with `α = BELIEF_PRIOR`,
-///   so no evidence ⇒ `0.5`, all-support ⇒ →`1`, all-contradiction ⇒ →`0`.
-/// * `conflict` — the evidence balance `2·min(s, c) / (s + c)` ∈ `[0, 1]`: `0` when the evidence is
-///   one-sided (consensus, nothing to resolve), `1` when support and contradiction are evenly
-///   matched (genuine tension). High *only* when both surfaces carry weight — the resolution signal
-///   that similarity-only retrieval can never report, because relatedness has no notion of polarity.
+/// contested, or uncertain *and* uncontested), with prior strength `ε = BELIEF_EPS` (a unit prior):
+/// * `belief` — the **signed** support fraction `(s − c) / (s + c + ε)` ∈ `[−1, 1]`: `0` at no (or
+///   perfectly balanced) evidence, `→ +1` as one-sided support accumulates, `→ −1` for
+///   contradiction. The **sign** is the direction (believed vs refuted), the **magnitude** the
+///   strength.
+/// * `conflict` — the **geometric** evidence balance `2·√(s·c) / (s + c + ε)` ∈ `[0, 1]`: `0` when
+///   the evidence is one-sided (consensus, nothing to resolve), `→ 1` when support and contradiction
+///   are both strong and matched (genuine tension). High *only* when both surfaces carry weight —
+///   the resolution signal similarity-only retrieval can never report, because relatedness has no
+///   notion of polarity.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct QBelief {
-    /// Summed weight of incoming `Supports` edges (the `S_A` surface).
+    /// Authority-weighted sum of incoming `Supports` edges (the `S_A` surface).
     pub support: f64,
-    /// Summed weight of incoming `Contradicts` edges (the `S_¬A` surface).
+    /// Authority-weighted sum of incoming `Contradicts` edges (the `S_¬A` surface).
     pub contradiction: f64,
-    /// Laplace-smoothed support fraction in `[0, 1]` (`0.5` ⇔ no evidence).
+    /// Signed support fraction in `[−1, 1]` (`0` ⇔ no / balanced evidence; sign = direction).
     pub belief: f64,
-    /// Evidence balance in `[0, 1]`: `0` one-sided, `1` evenly contested.
+    /// Geometric evidence balance in `[0, 1]`: `0` one-sided, `→ 1` strong and evenly contested.
     pub conflict: f64,
 }
 
-/// Build a [`QBelief`] from already-summed support/contradiction evidence weights — the shared core
-/// of [`MemoryGraph::qbelief`] and [`MemoryGraph::qbelief_decayed`]. `belief` is the Laplace-smoothed
-/// support fraction and `conflict` the evidence balance; see [`QBelief`] for the formulas.
+/// Build a [`QBelief`] from already-summed (authority-weighted) support/contradiction evidence — the
+/// shared core of [`MemoryGraph::qbelief`] and [`MemoryGraph::qbelief_decayed`]. `belief` is the
+/// signed support fraction, `conflict` the geometric balance; see [`QBelief`] for the formulas. The
+/// denominator is `s + c + ε ≥ ε > 0`, so it never divides by zero, and `s, c ≥ 0` keeps the `√`
+/// real.
 fn belief_from_sums(support: f64, contradiction: f64) -> QBelief {
-    let belief = (support + BELIEF_PRIOR) / (support + contradiction + 2.0 * BELIEF_PRIOR);
-    let total = support + contradiction;
-    let conflict = if total > 0.0 {
-        2.0 * support.min(contradiction) / total
-    } else {
-        0.0
-    };
+    let denom = support + contradiction + BELIEF_EPS;
+    let belief = (support - contradiction) / denom;
+    let conflict = 2.0 * (support * contradiction).sqrt() / denom;
     QBelief {
         support,
         contradiction,
@@ -2174,8 +2180,8 @@ impl MemoryGraph {
     /// The [`QBelief`] of a claim node — its dual-evidence belief state derived from the incoming
     /// [`Supports`](EdgeType::Supports) / [`Contradicts`](EdgeType::Contradicts) edges. A pure,
     /// deterministic fold over the resident edge set (no stored state, so `replay == live` holds and
-    /// it costs nothing in the snapshot). A node with no such edges returns the neutral prior
-    /// (`belief 0.5`, `conflict 0`). See [`QBelief`] for the `belief`/`conflict` formulas.
+    /// it costs nothing in the snapshot). A node with no such edges returns the neutral
+    /// (`belief 0`, `conflict 0`). See [`QBelief`] for the `belief`/`conflict` formulas.
     pub fn qbelief(&self, claim: &NodeId) -> QBelief {
         let mut support = 0.0_f64;
         let mut contradiction = 0.0_f64;
@@ -2197,13 +2203,11 @@ impl MemoryGraph {
     /// (its `created_at` vs the current [`clock`](Self::clock)) and `half_life` is the ticks an
     /// unreinforced piece of evidence takes to count for half. Stale evidence fades, so a claim
     /// whose evidence has all aged sees its support/contradiction **magnitudes** shrink toward 0, so
-    /// `belief` relaxes to the neutral prior `0.5` (the Laplace smoothing dominates once little
-    /// evidence remains) — the "knowledge half-life". A freshly (re-)asserted edge keeps full weight,
-    /// so re-assertion **reinforces**: a fresh assertion on one side also tips the balance, driving
-    /// `conflict` down, so recent evidence resolves a stale, never-reaffirmed dissent that plain
-    /// [`qbelief`](Self::qbelief) would keep treating as fully contested forever. (`conflict` is a
-    /// scale-free balance, so *equally*-aged evidence leaves it unchanged — decay moves it only when
-    /// the two surfaces age differently.)
+    /// both `belief` and `conflict` relax toward the neutral `0` (with the `ε` prior, faint evidence
+    /// is both neutral *and* uncontested) — the "knowledge half-life". A freshly (re-)asserted edge
+    /// keeps full weight, so re-assertion **reinforces**: recent one-sided evidence tips `belief` back
+    /// up and drives `conflict` down, so it resolves a stale, never-reaffirmed dissent that plain
+    /// [`qbelief`](Self::qbelief) would keep treating as fully contested forever.
     /// Lazy and pure: `O(edges)`, computed on demand from `created_at`/`clock` with no stored decay
     /// state, so it is deterministic and `replay == live` holds (replay reproduces the same clock and
     /// edges). `half_life <= 0` ⇒ no decay (identical to [`qbelief`](Self::qbelief)).
@@ -2236,15 +2240,16 @@ impl MemoryGraph {
 
     /// **Belief propagation** along causal edges — a single deterministic hop. For every
     /// [`EdgeType::Causes`] edge `A → B` whose source claim `A` is **resolved** — its
-    /// [`qbelief`](Self::qbelief) `belief` is at least `resolve_threshold` (believed) or at most
-    /// `1 - resolve_threshold` (disbelieved) — emit a *derived* evidence edge on the effect `B`: a
+    /// [`qbelief`](Self::qbelief) `belief` (signed, in `[−1, 1]`) has magnitude at least
+    /// `resolve_threshold`: strongly believed (`belief ≥ resolve_threshold`) or strongly refuted
+    /// (`belief ≤ −resolve_threshold`) — emit a *derived* evidence edge on the effect `B`: a
     /// [`Supports`](EdgeType::Supports) edge when the cause is believed, a
-    /// [`Contradicts`](EdgeType::Contradicts) edge when it is disbelieved. So a claim with no direct
+    /// [`Contradicts`](EdgeType::Contradicts) edge when it is refuted. So a claim with no direct
     /// evidence of its own still acquires a belief from the causes it depends on — belief revision
     /// across the causal graph, which a static evidence store cannot do. The derived weight is
-    /// **attenuated** — `edge.weight · damping · 2·|belief − 0.5|` — so a barely-resolved or weakly-
-    /// causal link contributes little and `B`'s induced belief is always weaker than `A`'s. Self-loops
-    /// and unresolved causes (`belief` near `0.5`) are skipped.
+    /// **attenuated** — `edge.weight · damping · |belief|` — so a barely-resolved or weakly-causal
+    /// link contributes little and `B`'s induced belief is always weaker than `A`'s. Self-loops and
+    /// unresolved causes (`belief` near `0`) are skipped.
     ///
     /// **One hop only** in this slice: the derived edges are not themselves propagated onward — a
     /// chain `A → B → C` needs a second call. Multi-hop propagation with damping-to-convergence and a
@@ -2252,9 +2257,9 @@ impl MemoryGraph {
     /// wired into the agent loop. Deterministic: candidates are collected read-only, **sorted**, then
     /// added (so iteration order cannot leak in) and [`add_edge`](Self::add_edge) dedups, so the pass
     /// is **idempotent**. Returns the number of derived edges added. `resolve_threshold` is clamped to
-    /// `[0.5, 1.0]`, `damping` to `[0.0, 1.0]`.
+    /// `[0.0, 1.0]` (a distance from the neutral `0`), `damping` to `[0.0, 1.0]`.
     pub fn propagate_beliefs(&mut self, resolve_threshold: f64, damping: f64) -> usize {
-        let resolve_threshold = resolve_threshold.clamp(0.5, 1.0);
+        let resolve_threshold = resolve_threshold.clamp(0.0, 1.0);
         let damping = damping.clamp(0.0, 1.0);
         // Phase 1 (read-only): collect a derived edge for every resolved cause. `(source, target,
         // supports, weight)`; the weight is not part of the dedup key.
@@ -2263,15 +2268,12 @@ impl MemoryGraph {
             if e.edge_type != EdgeType::Causes || e.source == e.target {
                 continue;
             }
-            let belief = self.qbelief(&e.source).belief;
-            let supports = if belief >= resolve_threshold {
-                true
-            } else if belief <= 1.0 - resolve_threshold {
-                false
-            } else {
-                continue; // cause not resolved ⇒ no propagation
-            };
-            let certainty = 2.0 * (belief - 0.5).abs(); // in [0, 1]
+            let belief = self.qbelief(&e.source).belief; // signed, in [-1, 1]
+            if belief.abs() < resolve_threshold {
+                continue; // cause not resolved (near neutral 0) ⇒ no propagation
+            }
+            let supports = belief > 0.0; // sign of the resolved belief is the polarity
+            let certainty = belief.abs(); // in [0, 1]
             let weight = e.weight * damping * certainty;
             to_add.push((e.source.clone(), e.target.clone(), supports, weight));
         }
@@ -3790,34 +3792,38 @@ mod tests {
         let q = g.qbelief(&claim);
         assert_eq!(q.support, 0.0);
         assert_eq!(q.contradiction, 0.0);
-        assert_eq!(q.belief, 0.5, "no evidence ⇒ neutral prior 0.5");
+        assert_eq!(q.belief, 0.0, "no evidence ⇒ neutral 0");
         assert_eq!(q.conflict, 0.0, "no evidence ⇒ no conflict");
     }
 
     #[test]
     fn qbelief_support_and_contradiction_math() {
-        // 3 support, 1 contradiction at weight 1.0: belief = (3+1)/(3+1+2) = 2/3; conflict =
-        // 2·min(3,1)/4 = 0.5.
+        // 3 support, 1 contradiction at weight 1.0: belief = (3-1)/(3+1+1) = 0.4; conflict =
+        // 2·sqrt(3)/5 ≈ 0.6928.
         let q = graph_with_evidence(3, 1).qbelief(&"claim".into());
         assert_eq!(q.support, 3.0);
         assert_eq!(q.contradiction, 1.0);
-        assert!((q.belief - 2.0 / 3.0).abs() < 1e-12);
-        assert!((q.conflict - 0.5).abs() < 1e-12);
+        assert!((q.belief - 0.4).abs() < 1e-12);
+        assert!((q.conflict - 2.0 * 3.0_f64.sqrt() / 5.0).abs() < 1e-12);
     }
 
     #[test]
-    fn qbelief_conflict_zero_when_one_sided_and_one_when_balanced() {
-        // All-support: no conflict, belief above the prior toward 1.
+    fn qbelief_conflict_zero_when_one_sided_and_high_when_balanced() {
+        // All-support: no conflict, strong positive belief (4/(4+1) = 0.8).
         let one_sided = graph_with_evidence(4, 0).qbelief(&"claim".into());
         assert_eq!(one_sided.conflict, 0.0);
-        assert!(one_sided.belief > 0.5);
-        // Evenly matched: maximal conflict, and smoothing holds belief back at the neutral 0.5.
-        let balanced = graph_with_evidence(3, 3).qbelief(&"claim".into());
         assert!(
-            (balanced.conflict - 1.0).abs() < 1e-12,
-            "balanced evidence ⇒ max conflict"
+            (one_sided.belief - 0.8).abs() < 1e-12,
+            "4 support ⇒ belief 0.8"
         );
-        assert!((balanced.belief - 0.5).abs() < 1e-12);
+        // Evenly matched: belief nets to 0; conflict is high — it → 1 only as evidence accumulates,
+        // so at 3-vs-3 with the unit prior it is 2·3/(6+1) = 6/7.
+        let balanced = graph_with_evidence(3, 3).qbelief(&"claim".into());
+        assert!(balanced.belief.abs() < 1e-12, "balanced ⇒ belief 0");
+        assert!(
+            (balanced.conflict - 6.0 / 7.0).abs() < 1e-12,
+            "balanced ⇒ high conflict 6/7"
+        );
     }
 
     #[test]
@@ -3880,8 +3886,8 @@ mod tests {
 
     #[test]
     fn qbelief_decayed_relaxes_belief_toward_prior_as_evidence_ages() {
-        // A strongly-supported claim, then a long silence: the decayed belief relaxes from 0.8 back
-        // toward the neutral prior 0.5 (the support mass faded), while plain qbelief stays frozen.
+        // A strongly-supported claim, then a long silence: the decayed belief relaxes from 0.75 back
+        // toward the neutral 0 (the support mass faded), while plain qbelief stays frozen.
         let mut g = graph_with_evidence(3, 0);
         for _ in 0..100 {
             g.tick();
@@ -3890,12 +3896,12 @@ mod tests {
         let plain = g.qbelief(&claim);
         let decayed = g.qbelief_decayed(&claim, 10.0);
         assert!(
-            (plain.belief - 0.8).abs() < 1e-9,
-            "plain belief frozen at 0.8"
+            (plain.belief - 0.75).abs() < 1e-9,
+            "plain belief frozen at 0.75"
         );
         assert!(
-            decayed.belief < 0.55 && decayed.belief >= 0.5,
-            "decayed belief relaxes toward the prior, got {}",
+            decayed.belief < 0.05 && decayed.belief >= 0.0,
+            "decayed belief relaxes toward the neutral 0, got {}",
             decayed.belief
         );
         assert_eq!(decayed.conflict, 0.0, "one-sided ⇒ no conflict either way");
@@ -3925,20 +3931,19 @@ mod tests {
         let plain = g.qbelief(&claim);
         let decayed = g.qbelief_decayed(&claim, 10.0); // dissent aged 4 half-lives ⇒ ×0.0625
         assert!(
-            (plain.conflict - 1.0).abs() < 1e-9,
-            "plain view: still fully contested"
+            (plain.conflict - 2.0 / 3.0).abs() < 1e-9,
+            "plain view: still contested (1 vs 1 ⇒ conflict 2/3)"
         );
-        assert!((plain.belief - 0.5).abs() < 1e-9);
+        assert!(plain.belief.abs() < 1e-9, "plain belief nets to 0");
         assert!(
-            decayed.conflict < 0.2,
-            "decay lets fresh support resolve the stale dissent, conflict {}",
+            decayed.conflict < 0.3,
+            "decay lets fresh support resolve the stale dissent, conflict {} (was 2/3)",
             decayed.conflict
         );
         assert!(
-            decayed.belief > plain.belief,
-            "decayed belief rises above the contested 0.5 ({} > {})",
-            decayed.belief,
-            plain.belief
+            decayed.belief > 0.3,
+            "decayed belief rises well above the contested 0, got {}",
+            decayed.belief
         );
     }
 
@@ -4004,7 +4009,7 @@ mod tests {
 
     #[test]
     fn propagate_resolved_cause_supports_effect_with_no_evidence() {
-        // A is resolved-true (3 supports ⇒ belief 0.8); A causes B; B has no direct evidence (0.5).
+        // A is resolved-true (3 supports ⇒ belief 0.75); A causes B; B has no direct evidence (0).
         // Propagation gives B a derived, attenuated support, so its belief rises — but stays weaker
         // than its cause's.
         let mut g = MemoryGraph::new(0.0, usize::MAX);
@@ -4017,20 +4022,20 @@ mod tests {
         );
         g.add_edge("A".into(), "B".into(), 1.0, EdgeType::Causes);
         let (a, b): (NodeId, NodeId) = ("A".into(), "B".into());
-        assert_eq!(g.qbelief(&b).belief, 0.5, "B starts unknown");
+        assert_eq!(g.qbelief(&b).belief, 0.0, "B starts unknown");
         assert_eq!(g.propagate_beliefs(0.7, 0.6), 1);
         let a_belief = g.qbelief(&a).belief;
         let b_belief = g.qbelief(&b).belief;
-        assert!((a_belief - 0.8).abs() < 1e-9, "cause unchanged at 0.8");
+        assert!((a_belief - 0.75).abs() < 1e-9, "cause unchanged at 0.75");
         assert!(
-            b_belief > 0.5 && b_belief < a_belief,
+            b_belief > 0.0 && b_belief < a_belief,
             "effect inherits a weaker belief from its resolved cause: {b_belief}"
         );
     }
 
     #[test]
     fn propagate_disbelieved_cause_contradicts_effect() {
-        // A resolved-false (3 contradictions ⇒ belief 0.2) ⇒ a derived Contradicts on its effect.
+        // A resolved-false (3 contradictions ⇒ belief −0.75) ⇒ a derived Contradicts on its effect.
         let mut g = MemoryGraph::new(0.0, usize::MAX);
         add_evidence(&mut g, "A", 0, 3);
         g.upsert_node(
@@ -4042,14 +4047,14 @@ mod tests {
         g.add_edge("A".into(), "B".into(), 1.0, EdgeType::Causes);
         assert_eq!(g.propagate_beliefs(0.7, 0.6), 1);
         assert!(
-            g.qbelief(&"B".into()).belief < 0.5,
-            "a disbelieved cause pushes its effect below the prior"
+            g.qbelief(&"B".into()).belief < 0.0,
+            "a disbelieved cause pushes its effect below the neutral 0"
         );
     }
 
     #[test]
     fn propagate_unresolved_cause_does_not_propagate() {
-        // A balanced (2 support + 2 contradiction ⇒ belief 0.5) is not resolved ⇒ no propagation.
+        // A balanced (2 support + 2 contradiction ⇒ belief 0) is not resolved ⇒ no propagation.
         let mut g = MemoryGraph::new(0.0, usize::MAX);
         add_evidence(&mut g, "A", 2, 2);
         g.upsert_node(
@@ -4060,7 +4065,7 @@ mod tests {
         );
         g.add_edge("A".into(), "B".into(), 1.0, EdgeType::Causes);
         assert_eq!(g.propagate_beliefs(0.7, 0.6), 0);
-        assert_eq!(g.qbelief(&"B".into()).belief, 0.5, "B stays unknown");
+        assert_eq!(g.qbelief(&"B".into()).belief, 0.0, "B stays unknown");
     }
 
     #[test]

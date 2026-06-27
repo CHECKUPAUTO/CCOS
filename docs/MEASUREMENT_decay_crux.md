@@ -24,33 +24,33 @@ ticks and compare plain vs decayed belief.
 ```
     T      PLAIN qbelief         DECAYED qbelief
          belief  conflict      belief  conflict   (objection age = T)
-    0      0.50     1.00       0.50     1.00
-    5      0.50     1.00       0.54     0.83
-   10      0.50     1.00       0.57     0.67
-   20      0.50     1.00       0.62     0.40
-   40      0.50     1.00       0.65     0.12
-   80      0.50     1.00       0.67     0.01
+    0      0.00     0.67       0.00     0.67
+    5      0.00     0.67       0.11     0.62
+   10      0.00     0.67       0.20     0.57
+   20      0.00     0.67       0.33     0.44
+   40      0.00     0.67       0.45     0.24
+   80      0.00     0.67       0.50     0.06
 ```
 
 ## Reading
 
 **Plain `qbelief` is frozen.** One un-reaffirmed objection counts as much as the fresh support
-forever, so the claim reads as a *permanent deadlock* — `conflict 1.00`, `belief 0.50` — no matter
-how stale the objection is. An agent relying on it would keep flagging this claim for resolution
+forever, so the claim reads as a *permanent deadlock* — `conflict 0.67`, `belief 0` — no matter how
+stale the objection is. An agent relying on it would keep flagging this claim for resolution
 indefinitely, even though the only thing keeping it contested is a single ancient objection nobody
 stood behind.
 
 **With decay, the claim resolves on its own.** The objection's weight halves every 10 ticks, so as
-its age `T` grows the fresh support wins: `conflict` collapses `1.00 → 0.01` and `belief` climbs
-`0.50 → 0.67`. This is the **knowledge half-life** — recent evidence outweighs stale, unrefreshed
+its age `T` grows the fresh support wins: `conflict` collapses `0.67 → 0.06` and `belief` climbs
+`0 → +0.50`. This is the **knowledge half-life** — recent evidence outweighs stale, unrefreshed
 evidence, so memory is not held hostage by old objections. Reinforcement is just re-assertion: a
 fresh edge restores full weight.
 
-Note that `conflict` moves here **only because the two surfaces age differently** (the support is
-fresh, the contradiction is old). `conflict` is a scale-free *balance*, so equally-aged evidence
-would leave it unchanged — decay relaxes `belief` toward the prior (the magnitudes shrink) and tips
-`conflict` only when one side is fresher than the other. The measurement isolates exactly that
-asymmetry, which is where decay earns its keep.
+With the signed belief and the geometric/`ε`-prior tension, both axes move the right way: `belief`
+swings from the deadlocked `0` toward the fresh support, and `conflict` falls as the stale surface
+loses mass (faint evidence is both neutral *and* uncontested). Here it is the *freshness asymmetry*
+that drives it — the support is fresh, the lone objection old — exactly the case where an
+append-only store that cannot forget stays stuck.
 
 ## What this does and does not claim
 

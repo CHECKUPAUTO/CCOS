@@ -66,7 +66,7 @@ fn main() {
     }
     println!(
         "\nReading: PLAIN qbelief is frozen — one un-reaffirmed objection counts as much as the fresh\n\
-         support forever, so the claim reads as a permanent deadlock (conflict 1.00, belief 0.50) no\n\
+         support forever, so the claim reads as a permanent deadlock (conflict 0.67, belief 0) no\n\
          matter how stale the objection is. With decay, the objection's weight halves every {half_life:.0}\n\
          ticks, so as T grows the fresh support wins: conflict collapses toward 0 and belief climbs.\n\
          The claim *resolves on its own* once the dissent is old enough and unrefreshed — the\n\

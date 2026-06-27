@@ -373,19 +373,27 @@ honesty code↔docs↔paper, tests/API). **Fixed in this pass:**
      `A x = λ x` brick for the deferred spectral-regions / temporal-tensor / `scirust` work.
    - ✅ **Q-Page dual-evidence belief layer (slice 1) — *contested knowledge*.** A claim node carries
      two typed evidence surfaces, `EdgeType::Supports` (`S_A`) and `EdgeType::Contradicts` (`S_¬A`),
-     and `MemoryGraph::qbelief` derives `{belief, conflict}` from them — pure, no stored state,
-     `replay == live`. `conflict` flags a *contested* claim, the state similarity-only retrieval
+     and `MemoryGraph::qbelief` derives a **signed** `belief ∈ [−1, 1]` = `(s−c)/(s+c+ε)` and a
+     **geometric** `conflict`, each edge weighted by its source **authority** — pure, no stored
+     state, `replay == live`. `conflict` flags a *contested* claim, the state similarity-only retrieval
      cannot represent (`docs/MEASUREMENT_contradiction_crux.md`: a refutation's cosine sits *inside*
      the support band, so no threshold separates support from refutation; the typed edge does).
      Contradictions are explicit, replayable assertions (`CcosMemory::assert_contradiction` /
-     `Op::Assert`). Auto-detection (rules / NLI) and resolution propagation are later slices.
+     `Op::Assert`). Auto-detection (rules / NLI) is a later slice.
    - ✅ **Q-Page decay — knowledge half-life (slice 2).** `MemoryGraph::qbelief_decayed(claim, half_life)`
      fades each evidence edge by `0.5^(age / half_life)` (age from its `created_at` vs the current
      `clock`) — lazy, pure, deterministic (`replay == live`), with no history mutated. A fresh
      assertion outweighs an ageing one, so recent evidence *resolves* a stale, never-reaffirmed
      dissent that plain `qbelief` deadlocks forever (`docs/MEASUREMENT_decay_crux.md`: conflict
-     `1.00 → 0.01` as the objection ages, vs a frozen `1.00`). Per-class half-life and decay on the
+     `0.67 → 0.06` as the objection ages, vs a frozen `0.67`). Per-class half-life and decay on the
      retrieval path are follow-ups.
+   - ✅ **Q-Page belief propagation — single hop (slice 3).** `MemoryGraph::propagate_beliefs(threshold,
+     damping)`: for each `Causes` edge `A → B` whose source is *resolved* (`|belief| ≥ threshold`), add
+     a derived, attenuated `Supports`/`Contradicts` on `B` (`edge.weight · damping · |belief|`), so a
+     claim with no direct evidence inherits a weaker, signed belief from its causes — belief revision
+     across the causal graph (`docs/MEASUREMENT_propagation_crux.md`: an effect inherits `±0.31` from a
+     `±0.75` cause; the wavefront stops at one hop, no cascade). Deterministic, idempotent. Multi-hop +
+     scheduler + an `Op::Propagate` for replay are the next slice.
 
 ### P2 — Ergonomics
 
