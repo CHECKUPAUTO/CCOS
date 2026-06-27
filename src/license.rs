@@ -342,6 +342,37 @@ fn default_license_path() -> Option<std::path::PathBuf> {
     })
 }
 
+/// Current unix time in seconds — a convenience for callers that gate features (the verifier itself
+/// never reads a clock; `now` is always passed in). Saturates to 0 before the epoch.
+pub fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+impl Licensing {
+    /// Determine the active licensing from the host: load any local token ([`load_license_blob`]) and
+    /// verify it with the compiled-in verifier. With the `license` feature that is the offline
+    /// [`Ed25519Verifier`]; without it there is no verifier, so the result is always the community
+    /// tier (the core is never gated). Pure beyond the single [`load_license_blob`] read; the one
+    /// place CLI commands and the session obtain their licensing.
+    pub fn detect(now: u64) -> Self {
+        let Some(blob) = load_license_blob() else {
+            return Self::community();
+        };
+        #[cfg(feature = "license")]
+        {
+            Self::from_blob(&Ed25519Verifier::new(), &blob, now)
+        }
+        #[cfg(not(feature = "license"))]
+        {
+            let _ = (blob, now);
+            Self::community()
+        }
+    }
+}
+
 /// Runtime license state and the **feature gate**. Holds an optional verified [`License`] and never
 /// performs I/O itself. Cloneable and cheap; a single instance is threaded through the engine.
 #[derive(Debug, Clone, Default)]

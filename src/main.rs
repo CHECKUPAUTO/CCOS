@@ -106,6 +106,8 @@ async fn main() {
         "eval" => run_eval_cmd(rest).await,
         "memory" => run_memory_cmd(rest),
         "license" => run_license(rest),
+        "tensions" => run_tensions(&TensionsOpts::parse(rest)),
+        "audit" => run_audit(&AuditOpts::parse(rest)),
         "trace" => run_trace_cmd(),
         "mcp" => {
             // Optional positional workspace path (else $CCOS_MCP_WORKSPACE, else
@@ -150,20 +152,10 @@ async fn main() {
 /// license file) and verifies it against the baked-in public key. Without the `license` feature there
 /// is no embedded verifier, so it always reports community — the core is never gated or degraded.
 fn run_license(_args: &[String]) -> CliResult {
-    use ccos::license::{Feature, Licensing, Tier};
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    use ccos::license::{Feature, Tier};
+    let now = ccos::license::now_unix();
     let blob = ccos::license::load_license_blob();
-
-    #[cfg(feature = "license")]
-    let licensing = match blob.as_deref() {
-        Some(b) => Licensing::from_blob(&ccos::license::Ed25519Verifier::new(), b, now),
-        None => Licensing::community(),
-    };
-    #[cfg(not(feature = "license"))]
-    let licensing = Licensing::community();
+    let licensing = ccos::license::Licensing::detect(now);
 
     match licensing.tier(now) {
         Tier::Pro => {
@@ -196,6 +188,235 @@ fn run_license(_args: &[String]) -> CliResult {
             );
         }
     }
+    Ok(())
+}
+
+/// Load the host licensing and gate `feature`. Returns the licensing when **unlocked**; on the
+/// community tier `Licensing::require` has already logged the announced refusal, and this returns
+/// `None` — the caller prints a one-line note and exits 0 (announced, never an error, never a degraded
+/// core). The shared front door for the Pro CLI commands.
+fn gate_pro(feature: ccos::license::Feature) -> Option<ccos::license::Licensing> {
+    let now = ccos::license::now_unix();
+    let licensing = ccos::license::Licensing::detect(now);
+    licensing.require(feature, now).is_ok().then_some(licensing)
+}
+
+/// Options for `ccos tensions`.
+struct TensionsOpts {
+    snapshot: Option<String>,
+    min: f64,
+    limit: usize,
+}
+
+impl TensionsOpts {
+    fn parse(args: &[String]) -> Self {
+        let mut o = Self {
+            snapshot: None,
+            min: 0.15,
+            limit: 20,
+        };
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--min" => {
+                    i += 1;
+                    if let Some(v) = args.get(i).and_then(|v| v.parse().ok()) {
+                        o.min = v;
+                    }
+                }
+                "--limit" => {
+                    i += 1;
+                    if let Some(v) = args.get(i).and_then(|v| v.parse().ok()) {
+                        o.limit = v;
+                    }
+                }
+                s if !s.starts_with("--") => o.snapshot = Some(s.to_string()),
+                other => eprintln!("ccos: ignoring unknown flag '{other}'"),
+            }
+            i += 1;
+        }
+        o
+    }
+}
+
+/// `ccos tensions <snapshot.json> [--min N] [--limit N]` — **Pro**: render the contested Q-Page
+/// claims (those whose `conflict ≥ --min`) ranked by tension, as a compact bar. Locked in the
+/// community tier (the announced refusal is logged; the core is untouched).
+fn run_tensions(opts: &TensionsOpts) -> CliResult {
+    let Some(file) = opts.snapshot.as_deref() else {
+        return Err(CliError::usage(
+            "usage: ccos tensions <snapshot.json> [--min N] [--limit N]",
+        ));
+    };
+    if gate_pro(ccos::license::Feature::TensionVisualization).is_none() {
+        println!(
+            "ccos tensions: locked — run `ccos license` to see how to unlock (core unaffected)."
+        );
+        return Ok(());
+    }
+    let snapshot = match KernelSnapshot::load(file) {
+        Ok(s) => s,
+        Err(e) => return Err(CliError::fail(format!("ccos: cannot load '{file}': {e}"))),
+    };
+    let claims: Vec<_> = snapshot
+        .graph
+        .claim_beliefs()
+        .into_iter()
+        .filter(|(_, q)| q.conflict >= opts.min)
+        .collect();
+
+    println!(
+        "─── Cognitive tensions — contested claims (conflict ≥ {:.2}) ───\n",
+        opts.min
+    );
+    if claims.is_empty() {
+        println!("  none (no contested Q-Page claims in this snapshot)");
+        return Ok(());
+    }
+    for (id, q) in claims.iter().take(opts.limit) {
+        println!(
+            "  {}  {}",
+            ccos::memory::render_tension_bar(q),
+            truncate(&id.0, 48)
+        );
+    }
+    if claims.len() > opts.limit {
+        println!("  … (+{} more)", claims.len() - opts.limit);
+    }
+    Ok(())
+}
+
+/// Options for `ccos audit`.
+struct AuditOpts {
+    snapshot: Option<String>,
+    json: bool,
+    min: f64,
+}
+
+impl AuditOpts {
+    fn parse(args: &[String]) -> Self {
+        let mut o = Self {
+            snapshot: None,
+            json: false,
+            min: 0.0,
+        };
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--json" => o.json = true,
+                "--min" => {
+                    i += 1;
+                    if let Some(v) = args.get(i).and_then(|v| v.parse().ok()) {
+                        o.min = v;
+                    }
+                }
+                s if !s.starts_with("--") => o.snapshot = Some(s.to_string()),
+                other => eprintln!("ccos: ignoring unknown flag '{other}'"),
+            }
+            i += 1;
+        }
+        o
+    }
+}
+
+/// `ccos audit <snapshot.json> [--json] [--min N]` — **Pro**: a belief / conflict / provenance report
+/// over every asserted Q-Page claim (belief, conflict, supporting & contradicting evidence) plus the
+/// hash-chain integrity. Locked in the community tier (announced refusal; core untouched).
+fn run_audit(opts: &AuditOpts) -> CliResult {
+    use ccos::memory::EdgeType;
+    let Some(file) = opts.snapshot.as_deref() else {
+        return Err(CliError::usage(
+            "usage: ccos audit <snapshot.json> [--json] [--min N]",
+        ));
+    };
+    let Some(licensing) = gate_pro(ccos::license::Feature::AuditReports) else {
+        println!("ccos audit: locked — run `ccos license` to see how to unlock (core unaffected).");
+        return Ok(());
+    };
+    let snapshot = match KernelSnapshot::load(file) {
+        Ok(s) => s,
+        Err(e) => return Err(CliError::fail(format!("ccos: cannot load '{file}': {e}"))),
+    };
+    let graph = &snapshot.graph;
+    let claims: Vec<_> = graph
+        .claim_beliefs()
+        .into_iter()
+        .filter(|(_, q)| q.conflict >= opts.min)
+        .collect();
+    let el = snapshot.event_log.verify_integrity();
+    let dl = snapshot.dist_log.verify_integrity();
+
+    if opts.json {
+        let rows: Vec<_> = claims
+            .iter()
+            .map(|(id, q)| {
+                let supports: Vec<String> = graph
+                    .evidence_of(id, EdgeType::Supports)
+                    .iter()
+                    .map(|n| n.0.clone())
+                    .collect();
+                let contradicts: Vec<String> = graph
+                    .evidence_of(id, EdgeType::Contradicts)
+                    .iter()
+                    .map(|n| n.0.clone())
+                    .collect();
+                serde_json::json!({
+                    "claim": id.0,
+                    "belief": q.belief,
+                    "conflict": q.conflict,
+                    "support_sum": q.support,
+                    "contradiction_sum": q.contradiction,
+                    "supports": supports,
+                    "contradicts": contradicts,
+                })
+            })
+            .collect();
+        let report = serde_json::json!({
+            "licensee": licensing.licensee(),
+            "claims": rows,
+            "integrity": { "event_log_valid": el.valid, "dist_log_valid": dl.valid },
+        });
+        println!("{}", serde_json::to_string_pretty(&report).unwrap());
+        return Ok(());
+    }
+
+    println!("╔══════════════════════════════════════════════╗");
+    println!("║  CCOS audit — belief / conflict / provenance ║");
+    println!("╚══════════════════════════════════════════════╝\n");
+    if let Some(who) = licensing.licensee() {
+        println!("  licensee: {who}");
+    }
+    println!("  claims with assertions: {}\n", claims.len());
+    for (id, q) in &claims {
+        let marker = if q.belief > 0.5 {
+            '✓'
+        } else if q.belief < -0.5 {
+            '✗'
+        } else {
+            '?'
+        };
+        println!("  {marker} {}", truncate(&id.0, 50));
+        println!(
+            "      belief {:+.3}   conflict {:.3}   (support {:.2} / contra {:.2})",
+            q.belief, q.conflict, q.support, q.contradiction
+        );
+        for ev in graph.evidence_of(id, EdgeType::Supports) {
+            println!("      + {}", truncate(&ev.0, 46));
+        }
+        for ev in graph.evidence_of(id, EdgeType::Contradicts) {
+            println!("      - {}", truncate(&ev.0, 46));
+        }
+    }
+    println!("\n  ── provenance / integrity ──");
+    println!(
+        "  event-log chain: {} events, valid: {}",
+        snapshot.event_log.event_count(),
+        el.valid
+    );
+    println!(
+        "  dist-log chain:  {} links, valid: {}",
+        dl.verified_events, dl.valid
+    );
     Ok(())
 }
 
