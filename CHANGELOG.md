@@ -97,9 +97,25 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   retrieval 2/2 vs blind 512-chunk RAG 1/2** on a Conflict of Origins (the refuted source crushed to the
   bottom) — with the honest finding that the *retrieval-time* belief gate (`latent cosine × authority`),
   not the pre-reduction weighting alone, is what suppresses the contradiction. Deterministic,
-  dependency-free, SciRust never modified. See `docs/MEASUREMENT_scirust_fusion.md`. Next (#14b): wire
-  `IncrementalLsa` into `CcosMemory::ingest_batch` + recall re-ranking with a full-session
-  `replay == live` property test.
+  dependency-free, SciRust never modified. See `docs/MEASUREMENT_scirust_fusion.md`. The live wiring lands
+  in **#14b** (below).
+
+- **SciRust fusion (#14b) — the causally-weighted latent space, wired into live recall.** `CcosMemory`'s
+  semantic-recall re-ranking now builds its LSA projection from a **causal-topology-weighted** Gram: each
+  document is scaled by `(1 + λc·centrality)·(1 + λa·authority)` — `spectral::eigenvector_centrality`
+  (max-normalised to `[0,1]`) × the node's Q-Page net belief (new batched `MemoryGraph::qbeliefs`, one
+  `O(edges + nodes)` pass instead of `O(N·edges)`) — *before* the reduction, so the latent space is shaped
+  by what the causal graph deems important and the Q-Page deems trustworthy, not raw term frequency. It is
+  **version-cached** (an `O(1)` hit between graph mutations, replacing the full per-query LSA recompute the
+  old path paid). The honest design call: a *global*-weight Gram cannot be both ingest-order-incremental
+  *and* bit-exact-rebuildable from a snapshot (adding a doc changes every doc's centrality, and an `f64`
+  sum is order-sensitive), so live recall **re-folds in canonical id order per version** — buying bit-exact
+  **`live == reload`** and **eager ≡ batch** (both property-tested), while the `O(batch)` as-of-ingest
+  `IncrementalLsa` stays the append-only **streaming** primitive. Four tests pin the moat
+  (`weighted_lsa_model_is_order_independent`, `…survives_a_reload`,
+  `causal_weights_are_deterministic_and_rise_with_evidence`, and a recall-path integration); the refined
+  `examples/scirust_vs_rag_crux.rs` + `docs/MEASUREMENT_scirust_fusion.md` §C document it. Always-on (no
+  new feature gate), deterministic, dependency-free, SciRust never modified.
 
 - **`ccos doctor` + deployment guide — frictionless server install (deployment-DX).** A read-only
   self-check command (`ccos doctor [--json]`) reports the build profile (debug vs release), target

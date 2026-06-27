@@ -2238,6 +2238,28 @@ impl MemoryGraph {
         belief_from_sums(support, contradiction)
     }
 
+    /// Every claim's [`QBelief`] in a **single** `O(edges + claims)` pass — the batch companion to the
+    /// per-claim [`qbelief`](Self::qbelief) (which scans all edges each call, so `N` calls are
+    /// `O(N·edges)`). Only nodes that are the target of at least one `Supports`/`Contradicts` edge
+    /// appear; any other node has the neutral belief (`belief == 0`) by definition, so a caller treats a
+    /// missing entry as neutral. Uses the same `belief_from_sums` formula as `qbelief`, so the two agree
+    /// node-for-node, and accumulates in the graph's stable edge order so it is deterministic
+    /// (`replay == live`). The causal-topology LSA weighting (`external_memory`) reads it to scale each
+    /// document by its authority without paying the `O(N·edges)` of per-node `qbelief`.
+    pub fn qbeliefs(&self) -> BTreeMap<NodeId, QBelief> {
+        let mut sums: BTreeMap<NodeId, (f64, f64)> = BTreeMap::new();
+        for e in &self.edges {
+            match e.edge_type {
+                EdgeType::Supports => sums.entry(e.target.clone()).or_default().0 += e.weight,
+                EdgeType::Contradicts => sums.entry(e.target.clone()).or_default().1 += e.weight,
+                _ => {}
+            }
+        }
+        sums.into_iter()
+            .map(|(id, (s, c))| (id, belief_from_sums(s, c)))
+            .collect()
+    }
+
     /// A **time-decayed** [`QBelief`]: each evidence edge's weight is scaled by
     /// `0.5^(age / half_life)`, where `age` is the clock ticks elapsed since the edge was asserted
     /// (its `created_at` vs the current [`clock`](Self::clock)) and `half_life` is the ticks an

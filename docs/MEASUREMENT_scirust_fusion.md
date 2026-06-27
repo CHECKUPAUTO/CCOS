@@ -102,18 +102,61 @@ So the fusion is two-sided: **SciRust-distilled latent algebra (semantic) × CCO
 (trust)**. The semantic latent space finds the topically-relevant documents; the causal belief axis
 decides which *origin* to trust when they conflict.
 
-## Verdict & what's next
+## C. Live wiring (#14b) — the causally-weighted latent space in the engine
 
-- ✅ **Ingestion**: distilled incremental Gram fold is linear and ~5.5× faster at 600 docs (growing) vs
-  full recompute, **bit-exact** so `replay == live` holds.
+#14a proved the primitives; #14b threads them into the live `CcosMemory` semantic-recall path. Each
+node's document row is now scaled by a **causal weight computed from the live graph**
+
+```
+w_node = (1 + λc · centrality_norm) · (1 + λa · authority)
+```
+
+*before* the LSA reduction, where `centrality_norm` is `spectral::eigenvector_centrality` (max-normalised
+to `[0,1]`, so the weight is invariant to graph size) and `authority` is the node's Q-Page net belief
+`qbeliefs()[node].belief.max(0)` — only genuine net support *amplifies* a document; a refuted node gets no
+boost (the retrieval-time gate is what *suppresses* it). The recall path (`lsa_region_scores`) reads this
+weighted projection, **version-cached**, instead of recomputing a uniform LSA on every query.
+
+### The honest design choice: re-fold, not stream
+
+There is a real tension here, and #14b resolves it on the side of the moat. A causally-weighted Gram with
+**global** weights cannot be *both* ingest-order-incremental *and* bit-exact-rebuildable from a snapshot:
+adding one document changes the eigencentrality — hence the weight, hence the outer product — of **every**
+other document, and an `f64` sum is only bit-identical when re-added in the **same order**. A snapshot
+stores the graph, not the ingest history, so the only order it can re-fold in is the canonical (id-sorted)
+one.
+
+So the live recall projection is a **pure function of the current graph**: rebuilt by re-folding all nodes
+in id-sorted order with their *final* weights, cached by graph version. That buys three moat properties,
+each a test in `external_memory::tests`:
+
+- **`live == reload`** — the reloaded projection is bit-identical to the live one, so an audit replay's
+  recall ranking can never diverge (`weighted_lsa_model_survives_a_reload`).
+- **eager ≡ batch** — the projection is identical however the corpus was ingested
+  (`weighted_lsa_model_is_order_independent`), preserving the B2 order-independence invariant.
+- **causal monotonicity** — asserting evidence for a node raises its pull on the latent space
+  (`causal_weights_are_deterministic_and_rise_with_evidence`).
+
+The `O(batch)` **as-of-ingest** `IncrementalLsa` fold (Part A) keeps its place as the **append-only
+streaming** primitive — correct when you accept that the latent space reflects each document *as it
+arrived* (replay-exact by ingest order, but not snapshot-rebuildable). Live recall trades that streaming
+speed for bit-exact reload determinism; both share the one Gram code path (`lsa::accumulate`), so they can
+never silently drift apart.
+
+## Verdict
+
+- ✅ **Ingestion**: the distilled incremental Gram fold is linear and ~5.5× faster at 600 docs (growing)
+  vs full recompute, **bit-exact** so `replay == live` holds (#14a).
 - ✅ **Retrieval**: the full fusion is contradiction-aware (2/2 vs RAG 1/2) where blind RAG cannot be —
   with the honest caveat that the *retrieval-time* belief gate, not the pre-reduction weighting alone,
   is what does it.
-- ▶ **Next (#14b — live wiring)**: thread `IncrementalLsa` into `CcosMemory::ingest_batch` (fold each
-  batch's documents, weights from real Q-Page authority × `spectral::eigenvector_centrality`) and into
-  the recall re-ranking, with a full-session `replay == live` property test. The primitives and the
-  measured wins land here (#14a); the integration into the live batch/recall path is the follow-up.
+- ✅ **Live wiring (#14b)**: the recall latent space is now causally weighted (centrality × belief) from
+  the live graph, version-cached (an `O(1)` hit between mutations, replacing a full per-query recompute),
+  and proven `live == reload` / eager ≡ batch / deterministic. The `learned-embed` rerank earns its keep
+  on ranking (recall@k); the causal weighting shapes *which* documents that ranking trusts.
 
 **Bottom line:** measure first. The Gram matrix was already incremental — distilling that (rather than
 linking SciRust's heavyweight, rayon-parallel SVD) bought linear ingestion *and* kept the determinism
-moat intact, while the causal-belief gate is what actually beats RAG on contradictions.
+moat intact. #14b lands the causal weighting in the live engine on the moat-preserving side of the
+incremental-vs-rebuildable tension, and the causal-belief gate is what actually beats RAG on
+contradictions.
