@@ -78,6 +78,24 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Offline Pro-license verifier — ed25519, zero-knowledge, fail-closed (`src/license.rs`, the
+  `license` feature; license slice 29a).** The gate scaffolding (tiers, the three Pro `Feature`s,
+  `Licensing::require()` with explicit *no-silent-degradation* logging) gains its actual trust spine:
+  an `Ed25519Verifier` that checks a locally-signed token against a **baked-in public key** — no
+  network, no telemetry, nothing leaves the host (a customer can run air-gapped). The token is a
+  JWT-like `base64url(payload).base64url(signature)` over `{licensee, exp}` (base64url hand-rolled, so
+  the only new dependency is `ed25519-dalek`, optional and absent from the default build). A single
+  `load_license_blob` loader reads `$CCOS_LICENSE` (inline token) or the license file
+  (`$CCOS_LICENSE_FILE` / `~/.config/ccos/license`); a new `ccos license` command reports the active
+  tier, licensee and expiry. The public key shipped in this tree is an **all-zero placeholder, so the
+  default build licenses nothing (fail-closed)**; a deployment pastes its own key with the
+  `examples/license_sign` keygen/sign tool (the private seed never lives in this tree). A
+  signature-valid but expired token reads as community while keeping the licensee for the audit log —
+  gated, never silently degraded. Tested (CI runs the `license` feature): sign→verify→Pro,
+  tamper / wrong-key / malformed → rejected, expiry, base64url round-trip, fail-closed placeholder.
+  **Next (slice 29b):** build + gate the three Pro behaviors (custom authority weights, tension
+  visualization, audit reports) through `require()`.
+
 - **Cognitive distillation — the `Extractor` pipeline + Conflict-of-Origins resolution
   (`src/extractor.rs`).** Turns raw text into Q-Page `Assertion`s (`{claim, source, stance,
   authority}`) — the auto-detection of `Supports`/`Contradicts` edges that slice 1 left as manual
