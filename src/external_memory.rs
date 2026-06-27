@@ -1574,6 +1574,9 @@ mod tests {
         m.resolve(); // …run them once, at the batch boundary
         m
     }
+    // Only used by the syn-only stale-edge test below; gated so it isn't dead code
+    // under `--no-default-features` (where `-D warnings` would reject it).
+    #[cfg(feature = "syn-parser")]
     fn count_calls(m: &CcosMemory) -> usize {
         m.graph()
             .edges()
@@ -1584,20 +1587,18 @@ mod tests {
 
     #[test]
     fn resolve_is_idempotent_and_noop_when_clean() {
+        // Use a cross-file *import* edge (extracted by both the syn and line-heuristic
+        // parsers) so this runs under every feature config — the point is resolve()'s
+        // idempotency, not a parser-specific edge kind.
         let mut m = CcosMemory::new();
+        m.ingest_deferred("src/db.rs", "pub fn connect() -> i32 { 1 }\n");
         m.ingest_deferred(
-            "src/a.rs",
-            "pub const K: i32 = 1;\npub fn f() -> i32 { K }\n",
+            "src/repo.rs",
+            "use crate::db;\npub fn load() -> i32 { db::connect() }\n",
         );
-        m.resolve();
+        let cross = m.resolve();
+        assert!(cross >= 1, "resolution added the cross-file import edge");
         let resolved = m.graph().edge_count();
-        assert!(
-            m.graph()
-                .edges()
-                .iter()
-                .any(|e| e.edge_type == crate::memory::EdgeType::DataFlow),
-            "resolution added the f -> K data-flow edge"
-        );
         assert_eq!(
             m.resolve(),
             0,
@@ -1654,6 +1655,9 @@ mod tests {
         );
     }
 
+    // Calls edges only exist with the real `syn` AST parser (the line-heuristic
+    // fallback does not extract in-body call-sites), so this divergence is syn-only.
+    #[cfg(feature = "syn-parser")]
     #[test]
     fn eager_keeps_stale_edge_that_batch_drops_under_late_ambiguity() {
         // Documented semantic difference (measured, not papered over). Eager per-file
