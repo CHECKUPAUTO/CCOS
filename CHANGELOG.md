@@ -20,6 +20,18 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Q-Page decay — knowledge half-life (`MemoryGraph::qbelief_decayed`).** A time-decayed view of a
+  claim's belief: each evidence edge's weight is scaled by `0.5^(age / half_life)`, where `age` is the
+  clock ticks since the edge was asserted (`created_at` vs the current `clock`). Lazy and pure
+  (computed on demand, no stored decay state), so it stays deterministic and `replay == live` holds,
+  and it never mutates or deletes history — only the *current* weight of an old edge fades. A fresh
+  (re-)assertion carries full weight, so recent evidence outweighs an ageing one: a stale,
+  never-reaffirmed dissent that plain `qbelief` would treat as an eternal deadlock resolves on its own
+  as it ages. Measured in `docs/MEASUREMENT_decay_crux.md`: with a one-off objection aged against a
+  fresh support, `conflict` collapses `1.00 → 0.01` (and `belief` climbs `0.50 → 0.67`) as the
+  objection ages, versus a frozen `1.00` under plain `qbelief`. `half_life` is a caller parameter
+  (domain-dependent); per-class half-life and retrieval-path decay are follow-ups.
+
 - **Q-Page dual-evidence belief layer — contested-knowledge memory (`EdgeType::Supports` /
   `EdgeType::Contradicts`).** A claim node carries two opposing, explicitly-asserted evidence
   surfaces — the affirmative `S_A` (`Supports`) and the negative `S_¬A` (`Contradicts`) — and

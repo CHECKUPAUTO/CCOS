@@ -378,7 +378,14 @@ honesty code↔docs↔paper, tests/API). **Fixed in this pass:**
      cannot represent (`docs/MEASUREMENT_contradiction_crux.md`: a refutation's cosine sits *inside*
      the support band, so no threshold separates support from refutation; the typed edge does).
      Contradictions are explicit, replayable assertions (`CcosMemory::assert_contradiction` /
-     `Op::Assert`). Auto-detection (rules / NLI), resolution propagation, and decay are later slices.
+     `Op::Assert`). Auto-detection (rules / NLI) and resolution propagation are later slices.
+   - ✅ **Q-Page decay — knowledge half-life (slice 2).** `MemoryGraph::qbelief_decayed(claim, half_life)`
+     fades each evidence edge by `0.5^(age / half_life)` (age from its `created_at` vs the current
+     `clock`) — lazy, pure, deterministic (`replay == live`), with no history mutated. A fresh
+     assertion outweighs an ageing one, so recent evidence *resolves* a stale, never-reaffirmed
+     dissent that plain `qbelief` deadlocks forever (`docs/MEASUREMENT_decay_crux.md`: conflict
+     `1.00 → 0.01` as the objection ages, vs a frozen `1.00`). Per-class half-life and decay on the
+     retrieval path are follow-ups.
 
 ### P2 — Ergonomics
 
