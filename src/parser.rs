@@ -25,6 +25,13 @@ pub struct ParseResult {
     /// `call_sites`/`data_refs`, so the common no-alias case serializes unchanged).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub import_aliases: Vec<ImportAlias>,
+    /// Per-impl-block method ownership facts — one `(type_name, method)` per `impl Foo { fn bar }`
+    /// whose Self type is a concrete name (Slice 3, `x.bar()` receiver-type inference). They are the
+    /// inputs to the `(type, method) → symbol` index that
+    /// [`crate::memory::MemoryGraph::resolve_symbol_calls`] uses to resolve a `Foo::bar` callee minted
+    /// from an inferred receiver type. Only the `syn` path emits them (same skip-if-empty contract).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub method_defs: Vec<MethodDef>,
     pub generated_nodes: usize,
     pub generated_edges: usize,
 }
@@ -91,6 +98,19 @@ pub struct ImportAlias {
     pub target: String,
 }
 
+/// A **method-ownership fact**: `type_name` (the concrete Self type of an `impl` block, e.g. `Foo`)
+/// defines method `method` (e.g. `bar`). Recorded once per `impl Foo { fn bar }` so
+/// [`crate::memory::MemoryGraph::resolve_symbol_calls`] can build a `(type, method) → symbol` index and
+/// resolve a `Foo::bar` callee — minted by receiver-type inference for `x.bar()` (where `x: Foo`) or by
+/// an explicit `Foo::bar()` associated call — to the right method, **resolve-uniquely-or-skip** (a type
+/// name shared by two impls makes the pair ambiguous, so it is dropped rather than guessed). Only the
+/// `syn` (real-AST) path emits these; the heuristic fallback leaves them empty.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MethodDef {
+    pub type_name: String,
+    pub method: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum SymbolKind {
     Function,
@@ -115,7 +135,7 @@ impl ASTParser {
 
     pub fn parse_source(&self, file_path: &str, source_code: &str) -> ParseResult {
         let hash = Self::compute_hash(source_code);
-        let (modules, use_statements, symbols, call_sites, data_refs, import_aliases) =
+        let (modules, use_statements, symbols, call_sites, data_refs, import_aliases, method_defs) =
             Self::extract_all(source_code);
 
         ParseResult {
@@ -129,6 +149,7 @@ impl ASTParser {
             call_sites,
             data_refs,
             import_aliases,
+            method_defs,
         }
     }
 
@@ -148,6 +169,7 @@ impl ASTParser {
         Vec<CallSite>,
         Vec<DataRef>,
         Vec<ImportAlias>,
+        Vec<MethodDef>,
     ) {
         #[cfg(feature = "syn-parser")]
         {
@@ -155,13 +177,14 @@ impl ASTParser {
                 return parsed;
             }
         }
-        // Heuristic fallback emits no call-sites, data-refs, or import aliases (it does not parse
-        // expression trees or `use`-tree renames), so the call/data-flow graphs simply stay empty
-        // on that path — a build can only ever *omit* those edges.
+        // Heuristic fallback emits no call-sites, data-refs, import aliases, or method-defs (it does
+        // not parse expression trees, `use`-tree renames, or impl blocks), so the call/data-flow
+        // graphs simply stay empty on that path — a build can only ever *omit* those edges.
         (
             Self::extract_modules(source),
             Self::extract_uses(source),
             Self::extract_symbols(source),
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -309,6 +332,17 @@ impl ASTParser {
                 .import_aliases
                 .iter()
                 .map(|a| (a.local.clone(), a.target.clone()))
+                .collect(),
+        );
+        // And this file's impl-block method-ownership facts (`impl Foo { fn bar }` ⇒ `("Foo","bar")`),
+        // the inputs `resolve_symbol_calls` uses to build the `(type, method) → symbol` index that
+        // resolves a `Foo::bar` callee (Slice 3, `x.bar()` receiver-type inference).
+        graph.set_pending_methods(
+            &result.file_path,
+            result
+                .method_defs
+                .iter()
+                .map(|m| (m.type_name.clone(), m.method.clone()))
                 .collect(),
         );
     }
@@ -778,7 +812,9 @@ fn symbol_span(lines: &[&str], start_line: usize) -> (usize, usize) {
 /// natively. Returns `None` on a syntax error so the caller can fall back.
 #[cfg(feature = "syn-parser")]
 mod syn_ast {
-    use super::{CallSite, DataRef, ImportAlias, ModuleDecl, Symbol, SymbolKind, UseStatement};
+    use super::{
+        CallSite, DataRef, ImportAlias, MethodDef, ModuleDecl, Symbol, SymbolKind, UseStatement,
+    };
     use proc_macro2::Span;
     use std::collections::HashSet;
     use syn::spanned::Spanned;
@@ -794,6 +830,7 @@ mod syn_ast {
         Vec<CallSite>,
         Vec<DataRef>,
         Vec<ImportAlias>,
+        Vec<MethodDef>,
     )> {
         let file = syn::parse_file(source).ok()?;
         let mut out = Collected::default();
@@ -805,6 +842,7 @@ mod syn_ast {
             out.calls,
             out.data_refs,
             out.aliases,
+            out.method_defs,
         ))
     }
 
@@ -816,6 +854,7 @@ mod syn_ast {
         calls: Vec<CallSite>,
         data_refs: Vec<DataRef>,
         aliases: Vec<ImportAlias>,
+        method_defs: Vec<MethodDef>,
     }
 
     /// Collects single-segment free-function call-sites from a function body, in source
@@ -832,6 +871,9 @@ mod syn_ast {
         /// denotes the local (invisible as a graph symbol), not a same-named module-level
         /// `static`/`const`, so resolving it global-unique would be a false edge.
         local_bound: &'a std::collections::HashSet<String>,
+        /// Local name → concrete receiver type (Slice 3 `x.bar()` inference; see
+        /// [`local_receiver_types`]). A bare-ident receiver found here emits a `Type::method` callee.
+        local_types: &'a std::collections::BTreeMap<String, String>,
         calls: Vec<CallSite>,
         data_refs: Vec<DataRef>,
     }
@@ -865,20 +907,39 @@ mod syn_ast {
             syn::visit::visit_expr_call(self, node);
         }
         fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
-            // Slice 3 — `self.method()`: the receiver type is the enclosing impl. Capture as
-            // `Self::method` ONLY when `method` is defined on this type here, so a Deref/blanket
-            // method (absent from `own_methods`) is skipped, not mislinked to a same-named free fn.
-            // Only a bare `self` receiver; `self.field.m()` / `x.m()` have an unknown receiver type.
+            // Slice 3 — a **bare-ident receiver** `recv.method()`. Two cases, both resolve-or-skip:
+            //   * `self.method()` → `Self::method`, captured ONLY when `method` is on this type
+            //     (`own_methods`), so a Deref/blanket method is never mislinked to a same-named free fn.
+            //   * `x.method()` where `x`'s concrete type is known (`local_types`, from receiver-type
+            //     inference) → `Type::method`, resolved by the `(type, method)` index (unique-or-skip).
+            //     A `Self`-typed local routes through the same `Self::` same-module gate as `self`.
+            // `self.field.m()` / `x.y().m()` / a `let`-less-typed `x` have an unknown receiver → drop.
             if let syn::Expr::Path(p) = &*node.receiver {
-                if p.qself.is_none()
-                    && p.path.is_ident("self")
-                    && self.own_methods.contains(&node.method.to_string())
-                {
-                    self.calls.push(CallSite {
-                        caller: self.caller.clone(),
-                        callee: format!("Self::{}", node.method),
-                        line: line_of(node.method.span()),
-                    });
+                if p.qself.is_none() {
+                    if let Some(recv) = p.path.get_ident() {
+                        let method = node.method.to_string();
+                        let callee = if recv == "self" {
+                            self.own_methods
+                                .contains(&method)
+                                .then(|| format!("Self::{method}"))
+                        } else {
+                            match self.local_types.get(&recv.to_string()).map(String::as_str) {
+                                Some("Self") => self
+                                    .own_methods
+                                    .contains(&method)
+                                    .then(|| format!("Self::{method}")),
+                                Some(ty) => Some(format!("{ty}::{method}")),
+                                None => None,
+                            }
+                        };
+                        if let Some(callee) = callee {
+                            self.calls.push(CallSite {
+                                caller: self.caller.clone(),
+                                callee,
+                                line: line_of(node.method.span()),
+                            });
+                        }
+                    }
                 }
             }
             syn::visit::visit_expr_method_call(self, node);
@@ -1000,6 +1061,194 @@ mod syn_ast {
         map
     }
 
+    /// Std container/smart-pointer type names we never treat as a method receiver's concrete type:
+    /// `x.bar()` on a `Box<Foo>` / `Vec<Foo>` / … dispatches to the wrapper's (or auto-deref'd) method,
+    /// not to a local `impl`, so inferring the wrapper — or unwrapping its argument — could only
+    /// mislead the `(type, method)` index. Skipping them keeps receiver-type inference precise.
+    const NON_RECEIVER_WRAPPERS: &[&str] = &[
+        "Box", "Rc", "Arc", "Option", "Result", "Vec", "VecDeque", "RefCell", "Cell", "Mutex",
+        "RwLock", "Cow", "Pin", "Weak", "HashMap", "BTreeMap", "HashSet", "BTreeSet",
+    ];
+
+    /// The generic **type-parameter** names declared by `generics` (`<T, U, const N: usize>` ⇒
+    /// `{T, U}`). A receiver whose type names one of these is a type variable, not a concrete graph
+    /// symbol, so it must never be inferred (it would cross-link to a same-named concrete type).
+    fn generic_type_params(generics: &syn::Generics) -> HashSet<String> {
+        generics
+            .params
+            .iter()
+            .filter_map(|p| match p {
+                syn::GenericParam::Type(t) => Some(t.ident.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Accept `name` as a concrete receiver type only when it is **type-like** (PascalCase head — the
+    /// Rust convention that separates a type `Foo` from a module `foo`, closing the `Foo::new()`
+    /// type-constructor vs `foo::new()` module-function ambiguity), is **not a generic param**, and is
+    /// **not a std wrapper**. `Self` passes (PascalCase) and is resolved same-module by the existing
+    /// `Self::` path. Precision-first: anything else yields `None` (no inference, never a guess).
+    fn receiver_type_name(name: String, generics: &HashSet<String>) -> Option<String> {
+        let type_like = name.chars().next().is_some_and(|c| c.is_ascii_uppercase());
+        if type_like && !generics.contains(&name) && !NON_RECEIVER_WRAPPERS.contains(&name.as_str())
+        {
+            Some(name)
+        } else {
+            None
+        }
+    }
+
+    /// The concrete receiver type named by a `syn::Type` annotation, if syntactically certain: a plain
+    /// `Type::Path` (no qself) whose final segment passes [`receiver_type_name`]. `Foo`, `a::b::Foo`,
+    /// and `Foo<T>` all key under `Foo` (final segment, generics stripped) — matching how
+    /// [`impl_self_type_name`] keys impl blocks, so a receiver type and its impl agree. References,
+    /// wrappers, trait objects, tuples, `impl`/`dyn Trait`, and generic params → `None`.
+    fn annotation_type(ty: &syn::Type, generics: &HashSet<String>) -> Option<String> {
+        let syn::Type::Path(tp) = ty else {
+            return None;
+        };
+        if tp.qself.is_some() {
+            return None;
+        }
+        receiver_type_name(tp.path.segments.last()?.ident.to_string(), generics)
+    }
+
+    /// The concrete receiver type of a binding's **RHS expression**, for the two evidence-only idioms:
+    /// a constructor call `Foo::new(..)` / `Foo::default()` / `Foo::with_*(..)` (the owning type is the
+    /// path's second-to-last segment — these assoc fns return `Self` by overwhelming convention), and a
+    /// **single-segment** struct literal `Foo { .. }` (the type is named literally). A *multi-segment*
+    /// struct-literal path (`Enum::Variant { .. }`, `m::Struct { .. }`) is ambiguous, so it is skipped.
+    /// Everything else (method-chain returns, `from`/`try_from`, arbitrary assoc fns, free fns) → `None`.
+    fn rhs_type(expr: &syn::Expr, generics: &HashSet<String>) -> Option<String> {
+        match expr {
+            syn::Expr::Call(call) => {
+                let syn::Expr::Path(p) = &*call.func else {
+                    return None;
+                };
+                if p.qself.is_some() || p.path.leading_colon.is_some() || p.path.segments.len() < 2
+                {
+                    return None;
+                }
+                let last = p.path.segments.last()?.ident.to_string();
+                if !(last == "new" || last == "default" || last.starts_with("with_")) {
+                    return None;
+                }
+                let owner = p.path.segments[p.path.segments.len() - 2].ident.to_string();
+                receiver_type_name(owner, generics)
+            }
+            syn::Expr::Struct(s) if s.qself.is_none() && s.path.segments.len() == 1 => {
+                receiver_type_name(s.path.segments[0].ident.to_string(), generics)
+            }
+            _ => None,
+        }
+    }
+
+    /// Collects the **receiver-type map** `local name → concrete type` for one function body — the
+    /// inputs to `x.bar()` inference. Populated only from the high-confidence idioms ([`annotation_type`]
+    /// / [`rhs_type`]). Flow-insensitive and **poison-on-conflict**: a name bound to two different
+    /// types, re-`let` to an un-inferable type, or reassigned (`x = ..`) anywhere in the body is dropped
+    /// entirely — so a shadow or rebind can never mint a false edge (the map only ever yields a type it
+    /// is *certain* of, exactly the precision-first trade the call graph requires).
+    struct ReceiverTypeCollector<'g> {
+        generics: &'g HashSet<String>,
+        types: std::collections::BTreeMap<String, String>,
+        poisoned: HashSet<String>,
+    }
+    impl ReceiverTypeCollector<'_> {
+        fn record(&mut self, name: String, ty: Option<String>) {
+            if self.poisoned.contains(&name) {
+                return;
+            }
+            match ty {
+                Some(t) => match self.types.get(&name) {
+                    Some(prev) if *prev != t => {
+                        self.types.remove(&name);
+                        self.poisoned.insert(name);
+                    }
+                    Some(_) => {}
+                    None => {
+                        self.types.insert(name, t);
+                    }
+                },
+                // A later rebind whose type we cannot infer invalidates an earlier inferred type.
+                None => {
+                    if self.types.remove(&name).is_some() {
+                        self.poisoned.insert(name);
+                    }
+                }
+            }
+        }
+    }
+    impl<'ast> Visit<'ast> for ReceiverTypeCollector<'_> {
+        fn visit_local(&mut self, l: &'ast syn::Local) {
+            let (name, annot) = match &l.pat {
+                syn::Pat::Ident(pi) if pi.subpat.is_none() => (Some(pi.ident.to_string()), None),
+                syn::Pat::Type(pt) => match &*pt.pat {
+                    syn::Pat::Ident(pi) if pi.subpat.is_none() => {
+                        (Some(pi.ident.to_string()), Some(&*pt.ty))
+                    }
+                    _ => (None, None),
+                },
+                _ => (None, None),
+            };
+            if let Some(name) = name {
+                // Annotation wins; otherwise infer from the initialiser expression.
+                let ty = annot
+                    .and_then(|t| annotation_type(t, self.generics))
+                    .or_else(|| {
+                        l.init
+                            .as_ref()
+                            .and_then(|i| rhs_type(&i.expr, self.generics))
+                    });
+                self.record(name, ty);
+            }
+            syn::visit::visit_local(self, l);
+        }
+        fn visit_expr_assign(&mut self, a: &'ast syn::ExprAssign) {
+            // Flow-insensitive: any reassignment of a bare local drops its inferred type (the value
+            // after `x = ..` may be a type we cannot track). Conservative, never guesses.
+            if let syn::Expr::Path(p) = &*a.left {
+                if let Some(id) = p.path.get_ident() {
+                    self.types.remove(&id.to_string());
+                    self.poisoned.insert(id.to_string());
+                }
+            }
+            syn::visit::visit_expr_assign(self, a);
+        }
+    }
+
+    /// The receiver-type map for `x.bar()` inference in one function body — see
+    /// [`ReceiverTypeCollector`]. `enclosing_generics` carries the impl/trait block's type params (the
+    /// method `sig`'s own params are unioned in here) so a generic receiver is never mistaken for a
+    /// concrete type. Deterministic (`BTreeMap`, source-order traversal).
+    fn local_receiver_types(
+        sig: &syn::Signature,
+        block: &syn::Block,
+        enclosing_generics: &HashSet<String>,
+    ) -> std::collections::BTreeMap<String, String> {
+        let mut generics = enclosing_generics.clone();
+        generics.extend(generic_type_params(&sig.generics));
+        let mut c = ReceiverTypeCollector {
+            generics: &generics,
+            types: std::collections::BTreeMap::new(),
+            poisoned: HashSet::new(),
+        };
+        // Typed value params (`fn f(x: Foo)`); `self`/destructured/wrapper params yield no entry.
+        for input in &sig.inputs {
+            if let syn::FnArg::Typed(pt) = input {
+                if let syn::Pat::Ident(pi) = &*pt.pat {
+                    if pi.subpat.is_none() {
+                        let ty = annotation_type(&pt.ty, &generics);
+                        c.record(pi.ident.to_string(), ty);
+                    }
+                }
+            }
+        }
+        c.visit_block(block);
+        c.types
+    }
+
     /// Names bound *locally* in a function — its parameters plus every `let`, fn-local
     /// `const`/`static`, closure parameter, and pattern binding in its body. Used to suppress
     /// data-references that denote a local rather than a module-level `static`/`const`.
@@ -1038,16 +1287,19 @@ mod syn_ast {
     fn collect_calls(
         caller: &str,
         own_methods: &std::collections::HashSet<String>,
+        enclosing_generics: &std::collections::HashSet<String>,
         sig: &syn::Signature,
         block: &syn::Block,
         calls_out: &mut Vec<CallSite>,
         refs_out: &mut Vec<DataRef>,
     ) {
         let local_bound = local_bound_names(sig, block);
+        let local_types = local_receiver_types(sig, block, enclosing_generics);
         let mut v = CallVisitor {
             caller: caller.to_string(),
             own_methods,
             local_bound: &local_bound,
+            local_types: &local_types,
             calls: Vec::new(),
             data_refs: Vec::new(),
         };
@@ -1109,9 +1361,11 @@ mod syn_ast {
                 }
                 syn::Item::Fn(f) => {
                     push_sym(out, &f.sig.ident, SymbolKind::Function);
-                    // A free function has no `self`/`Self` methods in scope → empty own-method set.
+                    // A free function has no `self`/`Self` methods in scope → empty own-method set, and
+                    // no enclosing-block generics (its own `sig` generics are handled by collect_calls).
                     collect_calls(
                         &f.sig.ident.to_string(),
+                        &HashSet::new(),
                         &HashSet::new(),
                         &f.sig,
                         &f.block,
@@ -1131,6 +1385,7 @@ mod syn_ast {
                             _ => None,
                         })
                         .collect();
+                    let trait_generics = generic_type_params(&t.generics);
                     for ti in &t.items {
                         if let syn::TraitItem::Fn(method) = ti {
                             push_sym(out, &method.sig.ident, SymbolKind::Function);
@@ -1138,6 +1393,7 @@ mod syn_ast {
                                 collect_calls(
                                     &method.sig.ident.to_string(),
                                     &methods,
+                                    &trait_generics,
                                     &method.sig,
                                     body,
                                     &mut out.calls,
@@ -1169,19 +1425,32 @@ mod syn_ast {
                             _ => None,
                         })
                         .collect();
-                    let methods: HashSet<String> = match impl_self_type_name(i) {
+                    let self_ty = impl_self_type_name(i);
+                    let methods: HashSet<String> = match &self_ty {
                         Some(ty) => type_methods
-                            .get(&ty)
+                            .get(ty)
                             .map(|s| s.iter().cloned().collect())
                             .unwrap_or(own_block),
                         None => own_block,
                     };
+                    let impl_generics = generic_type_params(&i.generics);
                     for ii in &i.items {
                         if let syn::ImplItem::Fn(method) = ii {
                             push_sym(out, &method.sig.ident, SymbolKind::Function);
+                            // Index this method under its concrete Self type (Slice 3) — the input to
+                            // the `(type, method)` resolution index for `x.bar()` / `Type::assoc()`.
+                            // A non-concrete Self (generic param, reference, blanket impl) yields `None`
+                            // and contributes nothing, so no unrelated receiver type is ever linked.
+                            if let Some(ty) = &self_ty {
+                                out.method_defs.push(MethodDef {
+                                    type_name: ty.clone(),
+                                    method: method.sig.ident.to_string(),
+                                });
+                            }
                             collect_calls(
                                 &method.sig.ident.to_string(),
                                 &methods,
+                                &impl_generics,
                                 &method.sig,
                                 &method.block,
                                 &mut out.calls,
@@ -1520,28 +1789,112 @@ mod syn_tests {
     }
 
     #[test]
-    fn syn_captures_self_method_call_not_other_receivers() {
-        // `self.helper()` is captured as `Self::helper`; an arbitrary receiver `x.helper()` is not
-        // captured (unknown type — Slice 3+).
+    fn syn_captures_self_and_typed_receiver_method_calls() {
+        // `self.helper()` is captured as `Self::helper`; a typed receiver `x: T` makes `x.helper()`
+        // resolve to `T::helper` (Slice 3 receiver-type inference) — the older "only self" behaviour
+        // is intentionally gone. A receiver with no syntactically-known type is still dropped.
         let src = "struct T;\nimpl T {\n  fn run(&self, x: T) { self.helper(); x.helper(); }\n  fn helper(&self) {}\n}";
         let r = ASTParser::new().parse_source("t.rs", src);
+        let callees: Vec<String> = r
+            .call_sites
+            .iter()
+            .filter(|c| c.caller == "run")
+            .map(|c| c.callee.clone())
+            .collect();
         assert!(
-            r.call_sites
-                .iter()
-                .any(|c| c.caller == "run" && c.callee == "Self::helper"),
-            "self.helper() is captured as Self::helper, got {:?}",
-            r.call_sites
-                .iter()
-                .map(|c| (&c.caller, &c.callee))
-                .collect::<Vec<_>>()
+            callees.contains(&"Self::helper".to_string()),
+            "self.helper() → Self::helper, got {callees:?}"
         );
-        assert_eq!(
-            r.call_sites
-                .iter()
-                .filter(|c| c.callee.ends_with("helper"))
-                .count(),
-            1,
-            "only the self-receiver method call is captured, not x.helper()"
+        assert!(
+            callees.contains(&"T::helper".to_string()),
+            "x.helper() with x: T → T::helper, got {callees:?}"
+        );
+    }
+
+    // ── Slice 3: x.bar() receiver-type inference (precision-first) ───────────────
+    /// The callees emitted for `caller` in `src`.
+    fn callees_of(src: &str, caller: &str) -> Vec<String> {
+        ASTParser::new()
+            .parse_source("t.rs", src)
+            .call_sites
+            .into_iter()
+            .filter(|c| c.caller == caller)
+            .map(|c| c.callee)
+            .collect()
+    }
+
+    #[test]
+    fn infers_receiver_from_the_four_evidence_idioms() {
+        // Typed param, let-annotation, the new/default/with_* constructors, and a single-segment
+        // struct literal each pin a concrete receiver type → a `Foo::go` callee.
+        for (src, want) in [
+            ("fn f(x: Foo) { x.go(); }", "Foo::go"),
+            ("fn f() { let x: Foo = make(); x.go(); }", "Foo::go"),
+            ("fn f() { let x = Foo::new(); x.go(); }", "Foo::go"),
+            ("fn f() { let x = Foo::default(); x.go(); }", "Foo::go"),
+            (
+                "fn f() { let x = Foo::with_capacity(4); x.go(); }",
+                "Foo::go",
+            ),
+            ("fn f() { let x = Foo { a: 1 }; x.go(); }", "Foo::go"),
+        ] {
+            let cs = callees_of(src, "f");
+            assert!(
+                cs.contains(&want.to_string()),
+                "{src:?} should infer {want}, got {cs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn skips_shadowed_or_reassigned_receiver() {
+        // A name bound to two different types, re-`let` to an un-inferable type, or reassigned is
+        // POISONED — a shadow/rebind must never mint a false edge (drop-or-nothing).
+        for src in [
+            "fn f() { let x: A = a(); let x: B = b(); x.go(); }",
+            "fn f(mut x: A) { x.go(); x = make(); }",
+            "fn f() { let x: A = a(); let x = compute(); x.go(); }",
+        ] {
+            let cs = callees_of(src, "f");
+            assert!(
+                !cs.iter().any(|c| c.ends_with("::go")),
+                "{src:?} must poison the receiver (no ::go edge), got {cs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn skips_generic_wrapper_and_unknown_receivers() {
+        // Generic params, std wrappers, multi-segment (enum-variant) struct literals, method-chain
+        // returns, and non-constructor assoc fns are all dropped — a wrong type here is a false edge.
+        for src in [
+            "fn f<T>(x: T) { x.go(); }",                       // generic type param
+            "fn f(x: Box<Foo>) { x.go(); }",                   // std wrapper (no unwrap)
+            "fn f() { let x = Status::Ok { c: 0 }; x.go(); }", // enum-variant struct literal
+            "fn f(a: A) { let x = a.build(); x.go(); }",       // method-chain return type unknown
+            "fn f() { let x = String::from(\"s\"); x.go(); }", // from() is not a whitelisted ctor
+        ] {
+            let cs = callees_of(src, "f");
+            assert!(
+                !cs.iter().any(|c| c.ends_with("::go")),
+                "{src:?} must not infer a receiver type, got {cs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn emits_method_def_facts_for_concrete_impls_only() {
+        // A concrete `impl Foo` contributes (Foo, m) ownership facts; a blanket `impl<T> Tr for T`
+        // (Self type is a generic param) contributes nothing — it has no concrete owner to index.
+        let src = "struct Foo;\nimpl Foo { fn a(&self) {} fn b(&self) {} }\ntrait Tr { fn show(&self); }\nimpl<T> Tr for T { fn show(&self) {} }";
+        let defs = ASTParser::new().parse_source("t.rs", src).method_defs;
+        let pairs: Vec<(String, String)> =
+            defs.into_iter().map(|m| (m.type_name, m.method)).collect();
+        assert!(pairs.contains(&("Foo".into(), "a".into())));
+        assert!(pairs.contains(&("Foo".into(), "b".into())));
+        assert!(
+            !pairs.iter().any(|(t, _)| t == "T"),
+            "the blanket impl's generic Self must not be indexed, got {pairs:?}"
         );
     }
 

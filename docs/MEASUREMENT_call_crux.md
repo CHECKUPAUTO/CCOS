@@ -44,8 +44,9 @@ MRR 0.32), not a tautological "structure beats RAG" contest. What the call graph
 ## Scope (Slice 1)
 
 Bare free-function calls only; qualified paths (Slice 2: `use` longest-prefix + `self`/`Self`) and
-methods (Slice 3: receiver-name, unique-or-skip) are deferred — a precision-over-recall trade-off,
-stated so low recall on method/macro-heavy code is not read as a bug. The resolver is whole-graph
+methods (Slice 3: `x.bar()` receiver-type inference, unique-or-skip — now landed, see
+`docs/MEASUREMENT_method_crux.md`) extend it — a precision-over-recall trade-off throughout, stated so
+low recall on macro-heavy code is not read as a bug. The resolver is whole-graph
 (re-runs each ingest, self-healing as later files arrive) and feature-gated to the syn AST. The
 `Calls` edges are traversed type-blind by recall/regions/propagation, so they enrich those for free
 while staying filterable later.

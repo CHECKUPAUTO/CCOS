@@ -78,6 +78,25 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Call-graph Slice 3 (#23) — `x.bar()` receiver-type inference.** A method call `x.bar()` names the
+  method but not the type `x` belongs to, and CCOS stores a method as a flat `sym:<file>:bar` symbol, so
+  when two types both define `bar` the name is ambiguous and the resolver (precision-first) skipped it —
+  dropping the `caller → callee` edge. #23 closes this in two **resolve-uniquely-or-skip** halves. The
+  parser infers a local's concrete type from four syntactically-certain idioms only — a typed param, a
+  `let` annotation, a constructor `Foo::new()`/`default()`/`with_*()`, and a single-segment struct
+  literal — guarded by a PascalCase head (separates a type `Foo::new()` from a module fn `foo::new()`),
+  generic-param + std-wrapper exclusion, and **poison-on-conflict** (a name bound to two types,
+  re-`let`, or reassigned is dropped), then emits a `Foo::bar` callee. The resolver builds a
+  `(type, method) → symbol` index from each `impl` block (carrying per-bucket cardinality, so a
+  same-final-name type homonym is ambiguous → skipped, never last-writer-wins) and resolves a 2-segment
+  `A::b` callee by trying **both** interpretations — `A`-as-module and `A`-as-type — linking only when
+  they agree or exactly one resolves. A wrong inference would mint a *false* call edge (strictly worse
+  than the data-ref case), so everything outside the idiom whitelist is dropped; the bonus is that
+  explicit `Type::assoc()` calls now resolve too. The new edges are resolution-owned, so `replay == live`
+  and eager ≡ batch hold (the property test and a real-codebase `analyze → replay` round-trip both pass).
+  `examples/method_crux.rs` + `docs/MEASUREMENT_method_crux.md` measure it on an **adversarial twin**
+  (`render` on two types): **3/3 cross-file method edges recovered, 100 % precision, zero false edges**.
+
 - **`ccos stdin` — pipe a JSON op-stream through an ephemeral in-memory graph.** The persistence-free,
   pipe-friendly sibling of `ccos memory`: reads the same newline-delimited ops (`ingest` / `recall` /
   `failure` / `verify` / `stats` / …) from stdin and prints one JSON response per op, with no workspace
