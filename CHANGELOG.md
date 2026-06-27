@@ -6,6 +6,20 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Performance
+
+- **Ingestion is no longer ~O(N³): O(1) `add_edge` de-duplication + the `ingest_profile` profiler.**
+  Profiling (`examples/ingest_profile.rs`) found the ingestion hot spot is the whole-graph **resolve
+  passes** (data-flow ~49%, calls ~23%; parse is only ~5%) — *not* cache layout — and that `add_edge`
+  de-duplicated with an **O(E) linear scan of every edge**. Since the resolve passes re-run after each
+  ingested file and add an edge per ref, that made ingesting N files roughly **cubic** (600 files ≈
+  216 s of resolution). Replacing the scan with an **O(1) membership-set index** (`edge_set`, a
+  `serde(skip)` `HashSet<(source, target, type)>` rebuilt lazily on a length mismatch) cut a single
+  ingest pass **~11×** (the data-flow pass ~70×) and dropped scaling to a clean **O(N²)** (×~4.3 per
+  file-count doubling; 600 files ≈ 11 s). The remaining quadratic — the per-file whole-graph
+  re-resolution — is the next slice (incremental resolution → O(N)). Measuring first redirected the
+  work from a speculative SoA/cache rewrite to the real bottleneck.
+
 ### Changed
 
 - **The real `syn` AST parser is now the default ingestion path** (was opt-in behind
@@ -19,6 +33,21 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   runtime and no TLS in the default build.
 
 ### Added
+
+- **Cognitive distillation — the `Extractor` pipeline + Conflict-of-Origins resolution
+  (`src/extractor.rs`).** Turns raw text into Q-Page `Assertion`s (`{claim, source, stance,
+  authority}`) — the auto-detection of `Supports`/`Contradicts` edges that slice 1 left as manual
+  assertions. The `Extractor` trait keeps it **provider-agnostic**: a deterministic `MockExtractor`
+  drives the bench and tests with no model, and an `llm`-feature `LlmExtractor` distills the same shape
+  from text via the configurable LLM backend. Extraction is the only non-deterministic step and runs
+  once at ingest; its output is recorded as replayable `assert_*` / `Op::Assert` events, so a replay
+  never re-calls the model (`replay == live`). Each assertion carries a per-source **authority** in
+  `[0, 1]` (the evidence edge weight), and `QBelief::is_validated(min_belief, max_conflict)` is the
+  strategic gate — believed-enough AND not-too-contested. Measured by `examples/conflict_of_origins.rs`
+  / `docs/MEASUREMENT_conflict_of_origins.md`: as a dissenting source's authority `β` rises, the
+  claim's belief slides `+0.47 → −0.03` (the more credible origin wins the direction), `conflict`
+  climbs `0 → 0.65`, and validation flips off at `β = 0.30` — a defensible, inspectable resolution a
+  flat or majority store cannot express.
 
 - **Q-Page belief propagation — single deterministic hop (`MemoryGraph::propagate_beliefs`).** Belief
   revision across the causal graph: for every `Causes` edge `A → B` whose source claim `A` is

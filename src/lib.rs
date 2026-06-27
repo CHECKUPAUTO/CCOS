@@ -108,6 +108,7 @@ pub mod embeddings;
 pub mod event_log;
 pub mod eviction_policy;
 pub mod external_memory;
+pub mod extractor;
 pub mod guard;
 pub mod hashing_tokenizer;
 pub mod incremental;

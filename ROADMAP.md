@@ -379,7 +379,13 @@ honesty code↔docs↔paper, tests/API). **Fixed in this pass:**
      cannot represent (`docs/MEASUREMENT_contradiction_crux.md`: a refutation's cosine sits *inside*
      the support band, so no threshold separates support from refutation; the typed edge does).
      Contradictions are explicit, replayable assertions (`CcosMemory::assert_contradiction` /
-     `Op::Assert`). Auto-detection (rules / NLI) is a later slice.
+     `Op::Assert`); the **LLM extractor** (`src/extractor.rs`, behind `llm`) now distills them from raw
+     text into the same `{claim, source, stance, authority}` shape (provider-agnostic; output recorded
+     as `Op::Assert` so `replay == live`). Per-source **authority** weights the belief, and
+     `QBelief::is_validated(min_belief, max_conflict)` gates action — measured by the **Conflict-of-
+     Origins** bench (`docs/MEASUREMENT_conflict_of_origins.md`: a credible source outweighs a dubious
+     one; `conflict` flags the residual dispute). Rule-based detection and a trust/authority policy are
+     follow-ups.
    - ✅ **Q-Page decay — knowledge half-life (slice 2).** `MemoryGraph::qbelief_decayed(claim, half_life)`
      fades each evidence edge by `0.5^(age / half_life)` (age from its `created_at` vs the current
      `clock`) — lazy, pure, deterministic (`replay == live`), with no history mutated. A fresh
