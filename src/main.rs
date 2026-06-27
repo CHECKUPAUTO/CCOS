@@ -105,6 +105,7 @@ async fn main() {
         "experiment" => run_experiment_cmd(rest),
         "eval" => run_eval_cmd(rest).await,
         "memory" => run_memory_cmd(rest),
+        "stdin" => run_stdin_cmd(rest),
         "doctor" => run_doctor(&DoctorOpts::parse(rest)),
         "license" => run_license(rest),
         "tensions" => run_tensions(&TensionsOpts::parse(rest)),
@@ -2219,7 +2220,6 @@ fn render_focus_human(
 /// `{"op":"impact|causes","node":..,"depth":N}`, `{"op":"verify"}`,
 /// `{"op":"stats"}`.
 fn run_memory_cmd(args: &[String]) -> CliResult {
-    use std::io::BufRead;
     let mut path = "workspace.ccos".to_string();
     let mut i = 0;
     while i < args.len() {
@@ -2244,6 +2244,39 @@ fn run_memory_cmd(args: &[String]) -> CliResult {
         }
     };
 
+    // Process the op-stream against the persisted workspace, then checkpoint if it mutated.
+    let (dirty, had_error) = run_op_stream(&mut mem);
+    if dirty {
+        if let Err(e) = mem.checkpoint() {
+            return Err(CliError::fail(format!("ccos: checkpoint failed: {e}")));
+        }
+    }
+    if had_error {
+        Err(CliError::status(1))
+    } else {
+        Ok(())
+    }
+}
+
+/// `ccos stdin` — read the same newline-delimited JSON op-stream as `ccos memory`, but process it in an
+/// **ephemeral in-memory graph** (no workspace file, no checkpoint): the pipe-friendly, persistence-free
+/// sibling. Prints one JSON response per op and exits non-zero if any op errored.
+fn run_stdin_cmd(_args: &[String]) -> CliResult {
+    let mut mem = CcosMemory::new();
+    let (_dirty, had_error) = run_op_stream(&mut mem);
+    if had_error {
+        Err(CliError::status(1))
+    } else {
+        Ok(())
+    }
+}
+
+/// Read a newline-delimited JSON op-stream from stdin and apply it to `mem`, printing one JSON response
+/// per op (`ingest` / `failure` / `recall` / `impact` / `causes` / `verify` / `stats`). Returns
+/// `(dirty, had_error)` — whether any op mutated the memory, and whether any op failed. Shared by
+/// [`run_memory_cmd`] (persistent workspace) and [`run_stdin_cmd`] (in-memory).
+fn run_op_stream(mem: &mut CcosMemory) -> (bool, bool) {
+    use std::io::BufRead;
     let err = |msg: String| serde_json::json!({ "error": msg });
     let mut dirty = false;
     let mut had_error = false;
@@ -2330,17 +2363,7 @@ fn run_memory_cmd(args: &[String]) -> CliResult {
         };
         println!("{}", serde_json::to_string(&resp).unwrap());
     }
-
-    if dirty {
-        if let Err(e) = mem.checkpoint() {
-            return Err(CliError::fail(format!("ccos: checkpoint failed: {e}")));
-        }
-    }
-    if had_error {
-        Err(CliError::status(1))
-    } else {
-        Ok(())
-    }
+    (dirty, had_error)
 }
 
 /// `ccos postmortem [workspace.ccos] [--json]` — open the interactive **time-travel

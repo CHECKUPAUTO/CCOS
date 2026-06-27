@@ -78,6 +78,12 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`ccos stdin` — pipe a JSON op-stream through an ephemeral in-memory graph.** The persistence-free,
+  pipe-friendly sibling of `ccos memory`: reads the same newline-delimited ops (`ingest` / `recall` /
+  `failure` / `verify` / `stats` / …) from stdin and prints one JSON response per op, with no workspace
+  file. The op-loop is factored into a shared `run_op_stream`, so `ccos memory` (persistent) and
+  `ccos stdin` (in-memory) stay in lockstep. (Also un-breaks the CI smoke step, which already invoked it.)
+
 - **SciRust fusion (#14a) — distilled incremental LSA: linear ingestion + contradiction-aware
   retrieval.** After inspecting the SciRust repo, the verdict was **distill, not link** — its SVD is a
   `nalgebra` wrapper with no incremental update, and depending on `scirust-core` pulls rayon-parallel
