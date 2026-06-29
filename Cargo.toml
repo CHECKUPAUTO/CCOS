@@ -1,15 +1,87 @@
 [package]
-name = "neural_store"
-version = "0.1.0"
+name = "ccos"
+version = "0.3.0"
 edition = "2021"
+license = "LicenseRef-CheckupAuto-Dual"
 
 [dependencies]
-rayon = "1.10"
-crossbeam-skiplist = "0.1"
-memmap2 = "0.9"
-bytemuck = { version = "1.15", features = ["derive"] }
-parking_lot = "0.12"
-bincode = "1.3"
-serde = { version = "1.0", features = ["derive"] }
-anyhow = "1.0"
-crc32fast = "1.4"
+# Async runtime + HTTP client are only needed by the LLM / eval / workspace
+# modules (Ollama HTTP client, async file scanning). They are gated behind the
+# `llm` feature so a consumer of the sync core (e.g. `ccos::event_log`) pulls
+# neither the async runtime nor TLS. See `[features]` below.
+tokio = { version = "1", features = ["full"], optional = true }
+reqwest = { version = "0.12", features = ["json"], optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+rand = "0.8"
+
+# Optional real-AST parser (ROADMAP P0.1). With the `syn-parser` feature, the
+# `parser` module uses `syn` for accurate parsing (nested-module bodies,
+# multi-line signatures, grouped `use`, impl methods); without it the
+# zero-dependency line-based heuristic parser is used. `proc-macro2`'s
+# span-locations supplies real line numbers. Both crates are already present in
+# the dependency tree transitively, so enabling this pulls no new download.
+syn = { version = "2", features = ["full", "visit"], optional = true }
+proc-macro2 = { version = "1", features = ["span-locations"], optional = true }
+
+# Optional drop-in global allocator for bare-metal benchmarking. CCOS is not
+# allocation-bound at its scale (the kernel is <1% of an agent loop dominated by
+# LLM inference), so this is an opt-in knob to *measure*, not a default win. See
+# docs/PERFORMANCE.md.
+mimalloc = { version = "0.1", optional = true }
+
+# Optional offline license verifier (ROADMAP — Pro gating). Behind the `license`
+# feature so the default build pulls in **no cryptography**: a license is a locally
+# signed token verified with a baked-in ed25519 **public** key — no network, no
+# telemetry, nothing leaves the host. The matching private key is the vendor's and
+# never lives in this tree. See `src/license.rs`.
+ed25519-dalek = { version = "2", optional = true }
+
+[features]
+# Default = the **sync core** (causal memory, hash-chained event log, recall) plus
+# the real `syn` **AST parser**, now the default ingestion path: it is 36.5% more
+# accurate than the line heuristic on real code (two-thirds vs full import recall —
+# see docs/MEASUREMENT_ast.md), and `syn`/`proc-macro2` are already in the tree via
+# serde's derive, so defaulting to it pulls **no new dependency**. Still no async
+# runtime and no TLS — a consumer of `ccos::memory` / `ccos::event_log` pulls neither
+# tokio nor reqwest. Opt out with `--no-default-features` for the zero-extra-dependency
+# line-based heuristic (kept as the fallback for non-Rust / unparseable input).
+default = ["syn-parser"]
+# The LLM / eval / workspace modules and the `ccos` binary (which drives them).
+llm = ["dep:tokio", "dep:reqwest"]
+syn-parser = ["dep:syn", "dep:proc-macro2"]
+mimalloc = ["dep:mimalloc"]
+# Opt-in **learned** semantic embedder: distil the deterministic INT4 TF-IDF into
+# a latent-semantic (LSA / truncated-SVD) projection learned from the corpus's own
+# term co-occurrence. Zero new dependencies and fully deterministic (a fixed Jacobi
+# sweep), so the replay invariant holds; the default build keeps raw TF-IDF, the
+# measured baseline. See `src/lsa.rs` and ROADMAP "better retrieval — slice B".
+learned-embed = []
+# Offline **Pro license** verification: a locally signed (ed25519) token checked
+# against a baked-in public key. Pulls in `ed25519-dalek`; the default build has no
+# cryptography and runs in the free community tier. Nothing leaves the host.
+license = ["dep:ed25519-dalek"]
+
+[dev-dependencies]
+proptest = "1"
+criterion = "0.5"
+
+# The CLI binary drives the async modules, so it requires the `llm` feature;
+# `cargo build` (no features) builds only the sync library.
+[[bin]]
+name = "ccos"
+path = "src/main.rs"
+required-features = ["llm"]
+
+[[bench]]
+name = "delta_bench"
+harness = false
+
+# Vendor signing / keygen tool for offline licenses — requires the `license` feature
+# (it needs the ed25519 signing primitives). Never ships in the default build.
+[[example]]
+name = "license_sign"
+required-features = ["license"]

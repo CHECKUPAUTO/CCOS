@@ -1,0 +1,28 @@
+name: Security Audit
+
+# Kept off the per-push path to conserve GitHub Actions minutes on this private
+# repo: cargo-audit (which compiles from source) runs weekly and on demand,
+# rather than on every push. Informational — advisories in transitive deps that
+# are outside our control should not gate development.
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Rust
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit
+        run: cargo audit

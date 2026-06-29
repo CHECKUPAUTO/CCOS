@@ -1,82 +1,161 @@
-pub mod core;
-pub mod storage;
-pub mod brain;
-pub mod ffi;
-pub mod index;
-pub mod neuromodulation;
-pub mod api;
+//! # CCOS — Causal Context Operating System
+//!
+//! CCOS is an experimental "kernel" that treats an LLM's working context like a
+//! virtual-memory system: source code is parsed into a **causal memory graph**,
+//! nodes are scored by importance / failure-relevance / recency, and a bounded
+//! "context window" is paged in and out much like RAM ↔ VRAM. Every state
+//! transition is recorded in an append-only **event log** so a session can be
+//! replayed deterministically.
+//!
+//! ## Quick start
+//!
+//! The core entry types are re-exported at the crate root:
+//!
+//! ```
+//! use ccos::{CcosMemory, ExternalMemory, Recall};
+//!
+//! let mut mem = CcosMemory::new();
+//! mem.ingest_source("src/db.rs", "pub fn query() -> i64 { 0 }\n");
+//! let window = mem.recall(&Recall::working_set(), 1024);
+//! assert!(!window.items.is_empty());
+//! ```
+//!
+//! ## Modules
+//!
+//! - [`parser`] — dependency-light line-based AST extraction (modules, `use`
+//!   statements, symbols) from Rust source.
+//! - [`memory`] — the causal [`memory::MemoryGraph`]: scoring, failure
+//!   propagation, deterministic eviction/paging and context-window selection.
+//! - [`incremental`] — `O(Δ)` graph updates: only the changed file's subgraph is
+//!   re-evaluated on each edit ([`incremental::IncrementalGraphEngine`]).
+//! - [`event_log`] — append-only [`event_log::EventLog`] with deterministic
+//!   replay over typed [`event_log::EventPayload`] records.
+//! - [`distributed_event_log`] — hash-chained, tamper-evident event log with an
+//!   integrity verifier.
+//! - [`llm`] — async client for an Ollama-style `/api/generate` endpoint with
+//!   retries and a deterministic offline fallback.
+//! - [`guard`] — validation/sanitization layer that rejects malformed model
+//!   output and substitutes a safe, valid-JSON fallback.
+//! - [`sanitizer`] — deterministic Unicode de-obfuscation of ingested text:
+//!   surfaces hidden-character injection vectors (Trojan-Source bidi overrides,
+//!   zero-width formatting, Unicode-Tags ASCII smuggling) as explicit, auditable
+//!   literals rather than silently stripping them.
+//! - [`hashing_tokenizer`] — vocabulary-free, fixed-size, deterministic feature
+//!   hashing (the "hashing trick") turning text into the vector `X`.
+//! - [`injection_classifier`] — a linear log-space (multinomial-Naive-Bayes)
+//!   *signal* over `X` with an immutable SHA-256-verified weight blob and a
+//!   forensic, per-feature explanation of every score.
+//! - [`consensus`] — majority and confidence-weighted multi-model voting.
+//! - [`adversarial`] — fault injector (JSON corruption, hallucination, prompt
+//!   injection, timeouts) used to harden the guard and the graph.
+//! - [`persist`] — save/load a full [`persist::KernelSnapshot`] (graph + both
+//!   logs) to JSON for cross-session replay and verification.
+//! - [`query`] — read-only causal queries (impact/cause walks, hot set, GraphML
+//!   export) behind the `top`, `blame` and `export` subcommands.
+//! - [`trace`] — the dynamic layer: parse `cargo test` / panic / backtrace output
+//!   into the source locations a crash touched (a direct symptom→cause path), to
+//!   seed a *context page fault* instead of a diffuse structural walk.
+//! - [`agent_session`] — an event-sourced cognitive timeline: record an agent's
+//!   memory operations, replay the exact state at any step, and run *what-if*
+//!   recalls (time-travel debugging) — the deterministic/auditable angle RAG lacks.
+//! - [`external_memory`] — a documented façade ([`external_memory::ExternalMemory`]
+//!   / [`external_memory::CcosMemory`]) an agent uses to treat CCOS as external
+//!   working memory: ingest source, signal failures, recall a bounded causal
+//!   window, verify, and checkpoint.
+//! - [`mcp`] — a dependency-free [Model Context Protocol](https://modelcontextprotocol.io)
+//!   server (stdio JSON-RPC 2.0) that exposes the [`external_memory`] façade as MCP
+//!   tools, so any MCP-compatible agent can use CCOS as native working memory.
+//! - [`postmortem`] — an interactive **time-travel debugger** over an
+//!   [`agent_session::AgentSession`]: walk a recorded (or persisted) cognitive
+//!   timeline by hand, inspect how the recalled context window drifts, and diff two
+//!   points in the agent's history.
+//! - [`region_engine`] — the **Context Region Engine** (v0.3): clusters the
+//!   graph into spatial [`region_engine::ContextRegionEngine`] regions that are
+//!   hydrated as context windows, with a dynamic [`context_policy`] admission
+//!   policy and deterministic replay. See [`context_region`], [`region_metrics`].
+//!
+//! ## Wiring of the recent modules
+//!
+//! All of these are now on the **live path**: [`compressor`] (reversible CCR
+//! compression of the recalled window), [`sanitizer`] (inline Unicode
+//! de-obfuscation at ingest), [`injection_classifier`] (an injection-signal score
+//! on every [`external_memory::IngestReport`], via a shared detector), and
+//! [`embeddings`] (semantic recall through [`external_memory::Recall::Semantic`]).
+//! [`eviction_policy`] is wired into [`memory::MemoryGraph::enforce_paging`] but
+//! is **untrained by default** — in which case paging is *exactly* the
+//! deterministic greedy (lowest score first), so it is never worse; train it
+//! offline via [`memory::MemoryGraph::train_eviction_policy`] to give it effect.
+//!
+//! ## Invariants
+//!
+//! The memory graph maintains `edges ⊆ nodes × nodes` at all times (see
+//! [`memory::MemoryGraph::add_edge`] and
+//! [`memory::MemoryGraph::prune_dangling_edges`]). The `nodes`/`edges` stores are
+//! `pub(crate)`, reachable from outside only through read accessors
+//! ([`memory::MemoryGraph::node`], [`node_mut`](memory::MemoryGraph::node_mut),
+//! [`edges`](memory::MemoryGraph::edges), …) and the structural mutators above —
+//! so an external caller cannot push a dangling edge or orphan a node and break
+//! the invariant. Eviction order is deterministic, so replays and snapshot hashes
+//! are reproducible regardless of `HashMap` iteration order.
 
-pub use storage::LsmTree;
-pub use core::types::{Vector, Metric};
-pub use brain::BrainWorkers;
-pub use core::search::SearchEngine;
+pub mod adversarial;
+pub mod agent_session;
+pub mod cold_index;
+pub mod compressor;
+pub mod consensus;
+pub mod distributed_event_log;
+pub mod embeddings;
+pub mod event_log;
+pub mod eviction_policy;
+pub mod external_memory;
+pub mod extractor;
+pub mod guard;
+pub mod hashing_tokenizer;
+pub mod incremental;
+pub mod injection_classifier;
+pub mod license;
+#[cfg(feature = "llm")]
+pub mod llm;
+pub mod lsa;
+pub mod lzss;
+pub mod mcp;
+pub mod memory;
+pub mod parser;
+pub mod persist;
+pub mod postmortem;
+pub mod query;
+pub mod sanitizer;
+pub mod spectral;
+pub mod trace;
+pub mod util;
 
-use anyhow::Result;
-use std::path::Path;
+// ── CCOS v0.3 — Autonomous Context Runtime ──────────────────────────
+pub mod agents;
+pub mod benchmark;
+pub mod persistence;
+pub mod scheduler;
+#[cfg(feature = "llm")]
+pub mod workspace;
 
-/// Top-level orchestrator for the Neural Store.
-/// It coordinates storage (LsmTree), search (SearchEngine), and background workers (BrainWorkers).
-pub struct NeuralStore {
-    lsm: LsmTree<usize>,
-    workers: BrainWorkers,
-}
+// ── CCOS v0.3 — Context Region Engine (spatial memory) ──────────────
+pub mod context_policy;
+pub mod context_region;
+#[cfg(feature = "llm")]
+pub mod eval;
+pub mod experiment;
+pub mod region_engine;
+pub mod region_metrics;
 
-impl NeuralStore {
-    /// Initializes a new NeuralStore or opens an existing one from the given path.
-    ///
-    /// Initialization sequence:
-    /// 1. Load WAL & Restore MemTable (handled by LsmTree::open)
-    /// 2. Start Background Workers
-    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        // Step 1: Initialize Storage (WAL recovery is internal to LsmTree::open)
-        let lsm = LsmTree::<usize>::open(path)?;
-
-        // Step 2: Start Background Workers
-        let workers = BrainWorkers::start()?;
-
-        Ok(Self { lsm, workers })
-    }
-
-    /// Adds a new vector to the store.
-    pub fn put(&mut self, id: usize, vector: Vector) -> Result<()> {
-        self.lsm.put(id, vector)
-    }
-
-    /// Retrieves a vector by its ID.
-    pub fn get(&self, id: &usize) -> Option<std::sync::Arc<Vector>> {
-        self.lsm.get(id)
-    }
-
-    /// Performs a similarity search over all stored vectors.
-    pub fn search(&self, query: &[f32], k: usize) -> Vec<(usize, f32)> {
-        let entries = self.lsm.get_all();
-        if entries.is_empty() {
-            return Vec::new();
-        }
-
-        // Convert LsmTree vectors to the format expected by SearchEngine
-        let data: Vec<Vec<f32>> = entries
-            .iter()
-            .map(|(_, vec)| vec.0.clone())
-            .collect();
-
-        // Extract IDs for mapping search results back to store IDs
-        let ids: Vec<usize> = entries.iter().map(|(id, _)| *id).collect();
-
-        // Perform cosine search
-        let raw_results = SearchEngine::cosine_search(query, &data, k);
-
-        // Map the index-based results from SearchEngine back to our store IDs
-        raw_results
-            .into_iter()
-            .filter_map(|(idx, score)| {
-                ids.get(idx).map(|&id| (id, score))
-            })
-            .collect()
-    }
-
-    /// Returns the current number of elements in the store.
-    pub fn len(&self) -> usize {
-        self.lsm.len()
-    }
-}
+// ── Core re-exports ─────────────────────────────────────────────────
+//
+// The handful of entry types a library consumer needs, lifted to the crate root
+// so they can be reached as `ccos::CcosMemory` / `ccos::Recall` instead of the
+// full module path. The modules above remain public for everything else.
+pub use agent_session::AgentSession;
+pub use event_log::EventLog;
+pub use external_memory::{
+    CcosMemory, ExternalMemory, IngestReport, Integrity, MemoryError, Recall, RecallItem,
+    RecallWindow,
+};
+pub use memory::{EdgeType, GraphEdge, GraphNode, MemoryGraph, NodeId, NodeType, ScoringWeights};
+pub use persist::KernelSnapshot;

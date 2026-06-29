@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+# A single consolidated job keeps GitHub Actions minute usage low on this private
+# repo: one checkout, one toolchain setup, and one shared `target/` so
+# dependencies compile once and every step reuses them; dependency caching cuts
+# repeat runs further. Cheapest checks run first (fail-fast). Only GitHub-authored
+# actions are used (actions/checkout, actions/cache) so no third-party action can
+# be blocked by org policy. The slower `cargo audit` runs weekly in audit.yml,
+# off the per-push path.
+jobs:
+  ci:
+    name: CI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup component add rustfmt clippy
+          rustc --version && cargo --version
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      # Cheapest first: formatting needs no compilation.
+      - name: Format
+        run: cargo fmt --all --check
+
+      # One compile of all dependencies (incl. the optional `syn` path), reused
+      # by the test/doc/run steps below.
+      - name: Clippy (default + all features)
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Test (default — real `syn` AST is now the default parser)
+        run: cargo test --locked
+
+      - name: Test (--no-default-features — line-heuristic fallback)
+        run: cargo test --no-default-features --locked
+
+      - name: Test (llm feature — async modules + binary)
+        run: cargo test --features llm --locked
+
+      - name: Test (learned-embed feature — LSA semantic embedder)
+        run: cargo test --features learned-embed --locked
+
+      - name: Test (license feature — offline ed25519 verifier)
+        run: cargo test --features license --locked
+
+      - name: Docs
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        # `--all-features` so the feature-gated modules (llm/eval/workspace) and
+        # the intra-doc links that reference them resolve.
+        run: cargo doc --no-deps --all-features --locked
+
+      - name: Smoke-test the CLI
+        run: |
+          cargo run --locked --features llm -- version
+          cargo run --locked --features llm -- analyze src --out /tmp/run.json
+          cargo run --locked --features llm -- verify /tmp/run.json
+          cargo run --locked --features llm -- replay /tmp/run.json
+          cargo run --locked --features llm -- top src --limit 10
+          cargo run --locked --features llm -- blame /tmp/run.json file:src/lib.rs --depth 3
+          cargo run --locked --features llm -- export /tmp/run.json --out /tmp/ccos.graphml
+          cargo run --locked --features llm -- regions src
+          cargo run --locked --features llm -- regions src --activate file:src/lib.rs
+          cargo run --locked --features llm -- regions src --metrics file:src/lib.rs --json
+          cargo run --locked --features llm -- experiment --tasks 60
+          cargo run --locked --features llm -- eval --tasks 4
+          printf '%s\n' '{"op":"ingest","uri":"src/x.rs","source":"pub fn x() {}"}' '{"op":"recall","strategy":"working_set","budget":512}' '{"op":"verify"}' | cargo run --locked --features llm -- stdin
+          cargo run --locked --features llm -- chaos --iters 500
+          cargo run --locked --features llm -- license
