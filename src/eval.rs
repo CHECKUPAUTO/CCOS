@@ -849,6 +849,15 @@ mod tests {
 
     #[tokio::test]
     async fn pipeline_runs_offline_stub() {
+        // Hermetic: `provider_label()` picks the provider from the process env
+        // (ANTHROPIC_API_KEY / OPENAI_API_KEY / OLLAMA_ENDPOINT). A contributor
+        // with a local Ollama server configured would otherwise see this test
+        // fail with a non-`none` provider. Strip them so the offline stub path
+        // is exercised deterministically. This is the only test that calls
+        // `run_eval`, so removing these vars cannot race with a parallel test.
+        for v in ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OLLAMA_ENDPOINT"] {
+            std::env::remove_var(v);
+        }
         // With no LLM configured, the harness still runs; every answer is wrong.
         let report = run_eval(&EvalConfig {
             tasks: 6,

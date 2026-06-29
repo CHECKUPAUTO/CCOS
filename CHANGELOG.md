@@ -6,6 +6,27 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **CI unblocked after the `neural_store` unrelated-histories merge.** That merge
+  force-added the entire `target/` build tree (722 files — 77% of the tracked tree)
+  despite `/target` being in `.gitignore`, and pulled in unformatted `neural_store`
+  integration tests that broke `cargo fmt --all --check`. The build artifacts are now
+  untracked (`git rm -r --cached target/` — already gitignored, so local builds are
+  unaffected) and the offending tests were removed in the prior commit. CI runs green
+  again once the repo's GitHub Actions billing is restored (a public repo has unlimited
+  free minutes).
+- **`ci.yml` / `audit.yml`: bump `actions/checkout` and `actions/cache` to `v5`.** The
+  `v4` actions target Node 20, which GitHub Actions has deprecated (runs are forced to
+  Node 24 with a warning that will become a hard error). `v5` targets Node 24 natively.
+- **`eval::tests::pipeline_runs_offline_stub` is now hermetic.** `provider_label()` picks
+  the LLM provider from the process env (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY` /
+  `OLLAMA_ENDPOINT`), so the test — which asserts the offline `none` stub — failed for
+  any contributor with a local Ollama server configured, even though it passed in CI's
+  clean env. The test now strips those vars up front (it is the only test calling
+  `run_eval`, so there is no parallel-test race), matching CONTRIBUTING's "tests run
+  fully offline" contract.
+
 ### Performance
 
 - **Ingestion is no longer ~O(N³): O(1) `add_edge` de-duplication + the `ingest_profile` profiler.**
