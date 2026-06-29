@@ -379,6 +379,14 @@ pub struct CcosMemory {
     /// selection where it does not. `None` (default) ⇒ off; a runtime knob, so it
     /// never touches the deterministic graph state (recall is read-only).
     lsa_rerank_rank: Option<usize>,
+    /// Whether [`build_embeddings`](Self::build_embeddings) quantizes the INT4 store with the
+    /// **grouped** SLHAv2 scheme (`true`, the Pro [`Feature::SlhAv2Embeddings`] path) or the
+    /// **uniform** community fallback (`false`). Defaults to `true` (the historical behaviour for
+    /// a non-session caller); an [`AgentSession`](crate::agent_session::AgentSession) sets it from
+    /// the host license tier at open. Runtime-only (never serialised): the store is rebuilt on the
+    /// first recall after a load, and the flag is re-derived from the host tier then — exactly like
+    /// the licensing state itself (loaded fresh from the host, never from the timeline).
+    use_slhav2: bool,
     /// Cached **causally-weighted LSA model** `(version, fitted TF-IDF embedder, rank-R weighted
     /// projection)` for semantic-recall re-ranking (#14b SciRust fusion). Each document row is scaled by
     /// `(1 + λc·centrality)·(1 + λa·authority)` (eigenvector centrality × Q-Page belief) *before* the LSA
@@ -410,6 +418,7 @@ impl CcosMemory {
             region_cache: RefCell::new(None),
             embed_cache: RefCell::new(None),
             lsa_rerank_rank: None,
+            use_slhav2: true,
             weighted_lsa_cache: RefCell::new(None),
         }
     }
@@ -543,6 +552,7 @@ impl CcosMemory {
             region_cache: RefCell::new(None),
             embed_cache: RefCell::new(None),
             lsa_rerank_rank: None,
+            use_slhav2: true,
             weighted_lsa_cache: RefCell::new(None),
         })
     }
@@ -887,6 +897,9 @@ impl CcosMemory {
             }
         }
         let mut store = crate::embeddings::CausalEmbeddings::new();
+        // Apply the host-tier quantization scheme (grouped SLHAv2 for Pro, uniform for
+        // community) before fitting — the choice is read once at fit time.
+        store.set_slhav2(self.use_slhav2);
         let mut nodes: Vec<(String, String)> = self
             .graph
             .nodes
@@ -1082,6 +1095,27 @@ impl CcosMemory {
     /// a runtime knob that never touches the deterministic graph state.
     pub fn set_lsa_rerank(&mut self, rank: Option<usize>) {
         self.lsa_rerank_rank = rank;
+    }
+
+    /// Select the INT4 embedding quantization scheme: `true` ⇒ grouped **SLHAv2** (the Pro
+    /// [`Feature::SlhAv2Embeddings`](crate::license::Feature::SlhAv2Embeddings) path), `false` ⇒
+    /// the uniform community fallback. Applied at the next [`build_embeddings`](Self::build_embeddings)
+    /// fit; the cached store is dropped immediately so a tier switch mid-session never serves a
+    /// store quantized under the old scheme. Runtime-only — never touches the deterministic graph
+    /// state (the recall path is read-only), so the replay invariant holds; the scheme is a pure
+    /// function of the host tier, like the licensing state itself.
+    pub fn set_slhav2_embeddings(&mut self, enabled: bool) {
+        if self.use_slhav2 != enabled {
+            self.use_slhav2 = enabled;
+            // Drop any cached store built under the previous scheme.
+            *self.embed_cache.borrow_mut() = None;
+        }
+    }
+
+    /// Whether this memory quantizes embeddings with the grouped SLHAv2 scheme (vs the uniform
+    /// community fallback).
+    pub fn uses_slhav2_embeddings(&self) -> bool {
+        self.use_slhav2
     }
 
     /// LSA re-ranking signal for `region_ids`: cosine similarity of each region node to `query` in a

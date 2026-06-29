@@ -425,6 +425,30 @@ honesty code↔docs↔paper, tests/API). **Fixed in this pass:**
    the exact exit code (status-only failures keep their printed report, error messages print once).
    Exit-code behaviour byte-identical (`tests/cli.rs` asserts it). See `src/main.rs`.
 
+### P4 — Premium / enterprise licensing (zero-knowledge, offline)
+
+The Pro tier is a **locally-verified signed token** — no network, no telemetry; a customer runs
+air-gapped. The pluggable `LicenseVerifier` trait + `Licensing` runtime gate (`require`/`allows`)
+gate only advanced operator tooling; the **core** (ingestion, causal graph, Q-Page) is never gated
+or degraded. See `src/license.rs` and `docs/DEPLOYMENT.md` §4.
+
+- ✅ **Slice 29a — the gate + offline ed25519 verifier.** Tiers, the `Feature` set, the
+  fail-closed all-zero placeholder key, `load_license_blob` (the one I/O entry), and
+  `Ed25519Verifier` behind the `license` cargo feature. The default build pulls in no cryptography.
+- ✅ **Slice 29b — the three Pro behaviors.** `CustomAuthorityWeights`, `TensionVisualization`,
+  and `AuditReports`, built and gated through `require()`; `set_custom_authorities` is the gating
+  precedent (`replay == live` — the final weight is what is logged).
+- ✅ **Slice 29c — post-quantum SLH-DSA verifier (`license-pq`).** A second, independent offline
+  verifier (NIST FIPS 205, SLH-DSA-SHAKE-128s: 32-byte pk, 7,856-byte sig) alongside ed25519,
+  behind the orthogonal `license-pq` feature. A `slhdsa.` scheme tag dispatches `Licensing::detect`
+  and is bound into the signed message (no cross-scheme replay); both features compose in one build.
+  Uses `lattice-slh-dsa` (RustCrypto's `slh-dsa` pins a pre-release `signature` that conflicts with
+  `ed25519-dalek`); **unaudited** — see `docs/DEPLOYMENT.md` §4b.
+- ✅ **SLHAv2-embeddings gating.** The repo's grouped/adaptive INT4 quantization (the "SLHAv2
+  two-level INT4") is now `Feature::SlhAv2Embeddings` — Pro keeps the grouped scheme, community
+  falls back to uniform INT4. Decided at session open from the host tier; runtime-only, so
+  `replay == live` holds.
+
 ---
 
 ### Suggested order

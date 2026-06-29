@@ -39,6 +39,16 @@ mimalloc = { version = "0.1", optional = true }
 # telemetry, nothing leaves the host. The matching private key is the vendor's and
 # never lives in this tree. See `src/license.rs`.
 ed25519-dalek = { version = "2", optional = true }
+# Optional **post-quantum** offline license verifier (NIST FIPS 205 / SLH-DSA,
+# formerly SPHINCS+) behind the orthogonal `license-pq` feature. A second, fully
+# independent verifier: a `slhdsa.`-tagged token is verified with a baked-in
+# SLH-DSA **public** key. Pure Rust (`#![forbid(unsafe_code)]`, `zeroize`-backed)
+# but **not independently audited** (see docs/DEPLOYMENT.md §4b). We use the
+# `lattice-slh-dsa` crate rather than RustCrypto's `slh-dsa`: the latter pins a
+# pre-release `signature` crate that cannot coexist with `ed25519-dalek` in one
+# build (which would break `--all-features`); `lattice-slh-dsa` depends only on
+# stable `sha2`/`sha3`/`subtle`/`zeroize`, so `license` and `license-pq` compose.
+lattice-slh-dsa = { version = "0.3", default-features = false, optional = true }
 
 [features]
 # Default = the **sync core** (causal memory, hash-chained event log, recall) plus
@@ -64,6 +74,12 @@ learned-embed = []
 # against a baked-in public key. Pulls in `ed25519-dalek`; the default build has no
 # cryptography and runs in the free community tier. Nothing leaves the host.
 license = ["dep:ed25519-dalek"]
+# Offline **post-quantum** Pro license verification: a second, scheme-tagged
+# (`slhdsa.`) token verified against a baked-in SLH-DSA (FIPS 205) public key.
+# Orthogonal to `license` — a build may enable one, the other, or both (the
+# `slhdsa.` prefix dispatches which verifier checks a given token). Pulls in
+# `slh-dsa`; still no cryptography in the default build.
+license-pq = ["dep:lattice-slh-dsa"]
 
 [dev-dependencies]
 proptest = "1"
@@ -85,3 +101,12 @@ harness = false
 [[example]]
 name = "license_sign"
 required-features = ["license"]
+
+# Vendor signing / keygen tool for **post-quantum** (SLH-DSA / FIPS 205) offline
+# licenses — requires the `license-pq` feature (it needs the SLH-DSA signing
+# primitives). A separate example: cargo `required-features` is AND-only, so a
+# single combined example would force both crypto features on whenever either
+# vendor tool builds. Never ships in the default build.
+[[example]]
+name = "license_sign_pq"
+required-features = ["license-pq"]

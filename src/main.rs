@@ -176,9 +176,13 @@ fn run_doctor(opts: &DoctorOpts) -> CliResult {
     let release = !cfg!(debug_assertions);
     let f_llm = cfg!(feature = "llm");
     let f_license = cfg!(feature = "license");
+    let f_license_pq = cfg!(feature = "license-pq");
     let f_syn = cfg!(feature = "syn-parser");
     let f_learned = cfg!(feature = "learned-embed");
     let f_mimalloc = cfg!(feature = "mimalloc");
+    let pq_key_set = ccos::license::embedded_slh_dsa_key_is_set();
+    let any_verifier = f_license || f_license_pq;
+    let any_key_set = key_set || pq_key_set;
 
     // Actionable deployment warnings.
     let mut warnings: Vec<String> = Vec::new();
@@ -195,20 +199,26 @@ fn run_doctor(opts: &DoctorOpts) -> CliResult {
                 .into(),
         );
     }
-    if !f_license {
+    if !any_verifier {
         warnings.push(
-            "license verifier not compiled — Pro features unavailable; rebuild with \
-             --features license"
+            "no license verifier compiled — Pro features unavailable; rebuild with \
+             --features license (ed25519) and/or --features license-pq (post-quantum SLH-DSA)"
                 .into(),
         );
-    } else if !key_set {
+    } else if !any_key_set {
         warnings.push(
-            "embedded public key is the all-zero placeholder — Pro is fail-closed until a vendor \
-             key is set (see docs/DEPLOYMENT.md)"
+            "no vendor public key is set (both embedded keys are the all-zero placeholder) — Pro is \
+             fail-closed until a vendor key is set (see docs/DEPLOYMENT.md)"
+                .into(),
+        );
+    } else if f_license_pq && !pq_key_set {
+        warnings.push(
+            "the post-quantum (SLH-DSA) public key is the all-zero placeholder — slhdsa. tokens \
+             cannot unlock Pro until a vendor key is set (see docs/DEPLOYMENT.md §4b)"
                 .into(),
         );
     }
-    if f_license && key_set && !pro && token_present {
+    if any_verifier && any_key_set && !pro && token_present {
         warnings.push("a license token was found but did not verify or is expired".into());
     }
 
@@ -218,13 +228,14 @@ fn run_doctor(opts: &DoctorOpts) -> CliResult {
             "build": if release { "release" } else { "debug" },
             "target": { "arch": std::env::consts::ARCH, "os": std::env::consts::OS },
             "features": {
-                "llm": f_llm, "license": f_license, "syn-parser": f_syn,
-                "learned-embed": f_learned, "mimalloc": f_mimalloc,
+                "llm": f_llm, "license": f_license, "license-pq": f_license_pq,
+                "syn-parser": f_syn, "learned-embed": f_learned, "mimalloc": f_mimalloc,
             },
             "parser": if f_syn { "syn-ast" } else { "line-heuristic" },
             "license": {
-                "verifier": f_license,
-                "vendor_key_set": key_set,
+                "verifier": ccos::license::compiled_verifier_scheme(),
+                "ed25519_key_set": key_set,
+                "slh_dsa_key_set": pq_key_set,
                 "tier": if pro { "pro" } else { "community" },
                 "licensee": licensing.licensee(),
                 "token_present": token_present,
@@ -257,9 +268,10 @@ fn run_doctor(opts: &DoctorOpts) -> CliResult {
         }
     );
     println!(
-        "  features     llm={} license={} syn-parser={} learned-embed={} mimalloc={}",
+        "  features     llm={} license={} license-pq={} syn-parser={} learned-embed={} mimalloc={}",
         yn(f_llm),
         yn(f_license),
+        yn(f_license_pq),
         yn(f_syn),
         yn(f_learned),
         yn(f_mimalloc)
@@ -273,22 +285,34 @@ fn run_doctor(opts: &DoctorOpts) -> CliResult {
         }
     );
     println!("\n  license");
-    println!(
-        "    verifier   {}",
-        if f_license {
-            "ed25519 (compiled in)"
-        } else {
-            "none (community only)"
-        }
-    );
-    println!(
-        "    vendor key {}",
-        if key_set {
-            "set"
-        } else {
-            "placeholder (fail-closed)"
-        }
-    );
+    let verifier_label = match ccos::license::compiled_verifier_scheme() {
+        "slh-dsa+ed25519" => "slh-dsa (SLH-DSA-128s) + ed25519 (both compiled in)",
+        "slh-dsa" => "slh-dsa (SLH-DSA-128s, post-quantum, compiled in)",
+        "ed25519" => "ed25519 (compiled in)",
+        _ => "none (community only)",
+    };
+    println!("    verifier   {verifier_label}");
+    // Show each compiled-in verifier's vendor-key status on its own line.
+    if f_license {
+        println!(
+            "    ed25519 key {}",
+            if key_set {
+                "set"
+            } else {
+                "placeholder (fail-closed)"
+            }
+        );
+    }
+    if f_license_pq {
+        println!(
+            "    slh-dsa key {}",
+            if pq_key_set {
+                "set"
+            } else {
+                "placeholder (fail-closed)"
+            }
+        );
+    }
     println!("    tier       {}", if pro { "PRO" } else { "community" });
     if let Some(who) = licensing.licensee() {
         println!("    licensee   {who}");
@@ -307,7 +331,7 @@ fn run_doctor(opts: &DoctorOpts) -> CliResult {
         }
         println!(
             "\n  see docs/DEPLOYMENT.md for the recommended build \
-             (`--release --features llm,license`)."
+             (`--release --features llm,license,license-pq`)."
         );
     }
     Ok(())
@@ -347,10 +371,11 @@ fn run_license(_args: &[String]) -> CliResult {
             for f in Feature::ALL {
                 println!("    - {f}");
             }
-            #[cfg(not(feature = "license"))]
+            #[cfg(not(any(feature = "license", feature = "license-pq")))]
             println!(
                 "  (this build has no license verifier compiled in — rebuild with \
-                 `--features license` to enable Pro)"
+                 `--features license` (ed25519) and/or `--features license-pq` \
+                 (post-quantum SLH-DSA) to enable Pro)"
             );
         }
     }

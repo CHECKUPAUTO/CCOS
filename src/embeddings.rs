@@ -260,14 +260,32 @@ pub struct Int4Embedding {
 }
 
 impl Int4Embedding {
-    /// Quantize an f32 embedding into INT4 (group_size = 16, a good default
-    /// balancing fidelity and scale-count overhead).
+    /// Quantize an f32 embedding into **grouped** INT4 (group_size = 16, a good default
+    /// balancing fidelity and scale-count overhead) — the **SLHAv2** adaptive scheme, the Pro
+    /// [`Feature::SlhAv2Embeddings`](crate::license::Feature::SlhAv2Embeddings) path. Keeps cosine
+    /// fidelity high when vector magnitudes vary across dims.
     pub fn from_f32(vec: &[f32]) -> Self {
         let group_size = 16;
         let (codes, scales) = quantize_int4_grouped(vec, group_size);
         Self {
             codes,
             scales,
+            group_size,
+            dim: vec.len(),
+        }
+    }
+
+    /// Quantize an f32 embedding into **uniform** INT4 — a single per-vector absmax scale (one
+    /// group spanning the whole vector). The **community** fallback: cheaper and slightly less
+    /// faithful on heterogeneous vectors than the grouped [`from_f32`](Self::from_f32), but the
+    /// same 4× storage win. `group_size` is set to the vector length so the store discriminates
+    /// the two schemes (16 = grouped SLHAv2, `dim` = uniform).
+    pub fn from_f32_uniform(vec: &[f32]) -> Self {
+        let group_size = vec.len().max(1);
+        let (codes, scale) = quantize_int4(vec);
+        Self {
+            codes,
+            scales: vec![scale],
             group_size,
             dim: vec.len(),
         }
@@ -319,25 +337,57 @@ pub struct CausalEmbeddings {
     /// store holds raw TF-IDF vectors, byte-identical to before LSA existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     projection: Option<Vec<Vec<f32>>>,
+    /// Whether [`fit_and_embed`](Self::fit_and_embed) / [`fit_and_embed_lsa`](Self::fit_and_embed_lsa)
+    /// quantize with the **grouped** SLHAv2 scheme ([`Int4Embedding::from_f32`], `true`) or the
+    /// **uniform** community fallback ([`Int4Embedding::from_f32_uniform`], `false`). Defaults to
+    /// `true` — the historical behaviour — so direct (non-session) callers, tests, and benches are
+    /// unchanged; an [`AgentSession`](crate::agent_session::AgentSession) sets it from the host
+    /// license tier (Pro ⇒ grouped, community ⇒ uniform). Old snapshots predate the field, so it
+    /// deserialises as `true` (they were grouped) — no behaviour change on reload.
+    #[serde(default = "default_use_slhav2")]
+    use_slhav2: bool,
+}
+
+/// Serde default for [`CausalEmbeddings::use_slhav2`] — `true`, preserving the historical grouped
+/// scheme for snapshots that predate the field (and for direct callers).
+fn default_use_slhav2() -> bool {
+    true
 }
 
 impl CausalEmbeddings {
-    /// Fresh store with a 128-dim embedder and no IDF.
+    /// Fresh store with a 128-dim embedder and no IDF. Defaults to the grouped SLHAv2
+    /// quantization scheme (`use_slhav2 = true`); switch with [`set_slhav2`](Self::set_slhav2).
     pub fn new() -> Self {
         Self {
             embedder: TfidfEmbedder::default(),
             vectors: BTreeMap::new(),
             projection: None,
+            use_slhav2: true,
         }
     }
 
-    /// With a custom embedding dimension.
+    /// With a custom embedding dimension. Defaults to the grouped SLHAv2 scheme.
     pub fn with_dim(dim: usize) -> Self {
         Self {
             embedder: TfidfEmbedder::new(dim),
             vectors: BTreeMap::new(),
             projection: None,
+            use_slhav2: true,
         }
+    }
+
+    /// Select the INT4 quantization scheme: `true` ⇒ grouped SLHAv2
+    /// ([`Int4Embedding::from_f32`], the Pro path), `false` ⇒ uniform
+    /// ([`Int4Embedding::from_f32_uniform`], the community fallback). Set before
+    /// [`fit_and_embed`](Self::fit_and_embed) / [`fit_and_embed_lsa`](Self::fit_and_embed_lsa);
+    /// the choice is read at fit time.
+    pub fn set_slhav2(&mut self, enabled: bool) {
+        self.use_slhav2 = enabled;
+    }
+
+    /// Whether this store quantizes with the grouped SLHAv2 scheme (vs the uniform fallback).
+    pub fn uses_slhav2(&self) -> bool {
+        self.use_slhav2
     }
 
     /// Fit the IDF from a corpus of (node_id, token_list) pairs, then embed
@@ -356,7 +406,12 @@ impl CausalEmbeddings {
         self.projection = None;
         for (id, tokens) in &collected {
             let v = self.embedder.embed(tokens);
-            self.vectors.insert(id.clone(), Int4Embedding::from_f32(&v));
+            let emb = if self.use_slhav2 {
+                Int4Embedding::from_f32(&v)
+            } else {
+                Int4Embedding::from_f32_uniform(&v)
+            };
+            self.vectors.insert(id.clone(), emb);
         }
     }
 
@@ -392,8 +447,12 @@ impl CausalEmbeddings {
             } else {
                 crate::lsa::project(r, &proj)
             };
-            self.vectors
-                .insert(id.clone(), Int4Embedding::from_f32(&latent));
+            let emb = if self.use_slhav2 {
+                Int4Embedding::from_f32(&latent)
+            } else {
+                Int4Embedding::from_f32_uniform(&latent)
+            };
+            self.vectors.insert(id.clone(), emb);
         }
         self.projection = (!proj.is_empty()).then_some(proj);
     }
@@ -610,6 +669,43 @@ mod tests {
     fn cosine_against_mismatched_dim_is_zero() {
         let e = Int4Embedding::from_f32(&[1.0, 2.0, 3.0]);
         assert_eq!(e.cosine_f32(&[1.0, 2.0]), 0.0);
+    }
+
+    #[test]
+    fn uniform_and_grouped_schemes_are_selectable_and_both_round_trip() {
+        let corpus = [
+            ("a", "alpha beta gamma"),
+            ("b", "delta epsilon zeta"),
+            ("c", "eta theta iota"),
+        ];
+        // Default ⇒ grouped SLHAv2 (group_size == 16).
+        let mut grouped = CausalEmbeddings::new();
+        assert!(grouped.uses_slhav2());
+        grouped.fit_and_embed(corpus.iter().copied());
+        for e in grouped.vectors.values() {
+            assert_eq!(e.group_size, 16, "grouped scheme uses group_size 16");
+            assert!(e.scales.len() > 1, "grouped has one scale per group");
+        }
+        // Uniform ⇒ single per-vector scale (group_size == dim, one scale).
+        let mut uniform = CausalEmbeddings::new();
+        uniform.set_slhav2(false);
+        assert!(!uniform.uses_slhav2());
+        uniform.fit_and_embed(corpus.iter().copied());
+        for (id, e) in &uniform.vectors {
+            assert_eq!(
+                e.group_size, e.dim,
+                "uniform scheme spans the whole vector (id {id})"
+            );
+            assert_eq!(e.scales.len(), 1, "uniform has a single scale");
+        }
+        // Both schemes preserve direction well enough for retrieval (cosine > 0.9 on the
+        // node's own query) — the uniform fallback is cheaper, not broken.
+        for store in [&grouped, &uniform] {
+            let q = store.embed_query("alpha beta gamma");
+            let (id, score) = store.nearest(&q).unwrap();
+            assert_eq!(id, "a");
+            assert!(score > 0.9, "round-trips the query: {score}");
+        }
     }
 
     #[test]

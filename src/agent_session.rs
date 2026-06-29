@@ -215,14 +215,22 @@ impl Default for AgentSession {
 impl AgentSession {
     /// A fresh in-memory session with no checkpoint path (nothing is persisted).
     pub fn new() -> Self {
+        let licensing = Licensing::community();
+        let mut live = CcosMemory::new();
+        // An in-memory session is always community, so it uses the uniform INT4 embedding
+        // fallback (the grouped SLHAv2 scheme is a Pro [`Feature::SlhAv2Embeddings`]).
+        // File-backed [`open`](Self::open) derives this same flag from the host license tier.
+        live.set_slhav2_embeddings(
+            licensing.allows(Feature::SlhAv2Embeddings, crate::license::now_unix()),
+        );
         AgentSession {
-            live: CcosMemory::new(),
+            live,
             ops: Vec::new(),
             baseline: None,
             folded: 0,
             oplog_path: None,
             compressor: CausalCompressor::new(),
-            licensing: Licensing::community(),
+            licensing,
             custom_authorities: CustomAuthorityMap::new(),
         }
     }
@@ -243,7 +251,7 @@ impl AgentSession {
         // Resolve a directory workspace to its state file so the snapshot and the
         // op-log sidecar land together (see CcosMemory::open).
         let file = crate::external_memory::workspace_file(path.as_ref());
-        let live = CcosMemory::open(&file)?;
+        let mut live = CcosMemory::open(&file)?;
         let oplog_path = oplog_sidecar(&file);
 
         // Restore the timeline from the sidecar if one is there and parses; a
@@ -254,7 +262,17 @@ impl AgentSession {
 
         // Licensing is loaded fresh from the host (env / file), never from the timeline — so it is
         // independent of replay, and a shared workspace runs correctly under any tier.
-        let licensing = Licensing::detect(crate::license::now_unix());
+        let now = crate::license::now_unix();
+        let licensing = Licensing::detect(now);
+
+        // The SLHAv2 grouped-INT4 embedding scheme is a Pro feature
+        // ([`Feature::SlhAv2Embeddings`]): a Pro session keeps the adaptive grouped quantization,
+        // a community session falls back to uniform INT4. Decided silently via `allows` (not
+        // `require`) so opening a community session does not log a refusal on every open; an
+        // explicit request goes through [`enable_slhav2_embeddings`](Self::enable_slhav2_embeddings).
+        // Like licensing itself, the scheme reflects the host tier, not the timeline — the core
+        // recall path is unchanged, only the embedding precision varies with the tier.
+        live.set_slhav2_embeddings(licensing.allows(Feature::SlhAv2Embeddings, now));
 
         let mut session = match restored {
             Some(t) => AgentSession {
@@ -423,6 +441,21 @@ impl AgentSession {
         self.licensing
             .require(Feature::CustomAuthorityWeights, crate::license::now_unix())?;
         self.custom_authorities = map;
+        Ok(())
+    }
+
+    /// **Enable the SLHAv2 grouped-INT4 embedding scheme** — the Pro [`Feature::SlhAv2Embeddings`]
+    /// feature. Gated like [`set_custom_authorities`](Self::set_custom_authorities): returns
+    /// [`LicenseError::FeatureLocked`] in the community tier and changes nothing (the session keeps
+    /// the uniform INT4 fallback it was opened with). With Pro, subsequent
+    /// [`build_embeddings`](crate::external_memory::CcosMemory::build_embeddings) calls quantize with
+    /// the adaptive grouped scheme. The scheme is runtime-only (never persisted), so `replay == live`
+    /// holds with no need to record it — it is re-derived from the host tier at open, exactly like
+    /// the licensing state.
+    pub fn enable_slhav2_embeddings(&mut self) -> Result<(), LicenseError> {
+        self.licensing
+            .require(Feature::SlhAv2Embeddings, crate::license::now_unix())?;
+        self.live.set_slhav2_embeddings(true);
         Ok(())
     }
 
@@ -1201,6 +1234,44 @@ mod tests {
         assert_eq!(
             live, replay,
             "replay reproduces the custom-weighted belief (replay == live)"
+        );
+    }
+
+    #[test]
+    fn slhav2_embeddings_are_gated_by_tier() {
+        use crate::license::{License, Tier};
+
+        // An in-memory session is community, so it opens with the uniform INT4 embedding
+        // fallback (the grouped SLHAv2 scheme is a Pro feature).
+        let community = AgentSession::new();
+        assert_eq!(
+            community.licensing().tier(crate::license::now_unix()),
+            Tier::Community
+        );
+        assert!(
+            !community.memory().uses_slhav2_embeddings(),
+            "community session uses uniform INT4, not grouped SLHAv2"
+        );
+
+        // The explicit Pro setter is refused in community and changes nothing.
+        let mut c2 = AgentSession::new();
+        assert!(
+            c2.enable_slhav2_embeddings().is_err(),
+            "community tier refuses the Pro slhav2 setter"
+        );
+        assert!(!c2.memory().uses_slhav2_embeddings());
+
+        // Under Pro, the setter enables the grouped SLHAv2 scheme.
+        let mut pro = AgentSession::new();
+        pro.set_licensing(Licensing::licensed(License {
+            licensee: "acme".into(),
+            expires_at: None,
+        }));
+        pro.enable_slhav2_embeddings()
+            .expect("Pro tier enables slhav2 embeddings");
+        assert!(
+            pro.memory().uses_slhav2_embeddings(),
+            "Pro session uses grouped SLHAv2"
         );
     }
 
