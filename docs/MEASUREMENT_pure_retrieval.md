@@ -70,14 +70,48 @@ the digit, and every run is bit-for-bit identical.)
   is no hallucinating generator between query and result, and the index serialises and audits. A neural
   / generative RAG stage offers none of that.
 
-## Scope & next axes
+## Adaptive retrieval — the improvement loop (premium tier)
+
+The retrieval **core** above (dense / BM25 / hybrid + metrics) is free and fully functional, exactly
+like the rest of CCOS's core. The **premium** tier is a self-improving feedback loop
+(`retrieval::feedback::ImprovementLoop`): record confirmed `(query, relevant-doc)` pairs, then learn a
+linear projection of the embedding space by deterministic contrastive (InfoNCE) training so projected
+retrieval improves. It distills `scirust-retrieval`'s `contrastive` + `feedback` modules — which use
+`scirust-core`'s autodiff — reimplemented with a **seeded** RNG, **fixed-order `f32`**, and a
+**hand-derived analytic gradient** (gradient-checked against finite differences, so the math is
+verified, not trusted): no `scirust-core`, no rayon.
+
+`examples/retrieval_improvement.rs` builds a deliberate **vocabulary gap** — `n` (query, doc) pairs with
+*disjoint* terms, so a query shares zero vocabulary with its answer and base retrieval is at chance —
+then watches Recall climb as feedback accumulates (real output of the run):
+
+```
+  cycle   Recall@1   Recall@3   (n=12, 2 epochs/cycle, seeded, deterministic)
+    0         8%        17%      base (random projection)
+    1        17%        42%
+    2        33%        67%
+    3        75%        83%
+    4        83%        92%
+    5        92%        92%
+    7        92%       100%
+    8       100%       100%
+```
+
+The loop learns the cross-vocabulary mapping purely from feedback (no shared terms to lean on), and —
+seeded, fixed-order, hand-derived-gradient — the curve is **bit-for-bit identical** on every re-run.
+
+**Premium gate.** `RetrievalAccess::unlock(&licensing, now)` gates the loop behind CCOS's *own* #29
+ed25519 license (`Feature::AdaptiveRetrieval`): the community tier gets the standard no-silent-downgrade
+refusal (the free core keeps working), a valid Pro license unlocks it. This reuses CCOS's offline,
+deterministic, no-FFI license rather than linking `scirust-license` — one fewer dependency. (A
+node-locked `$1/machine/month` model would come from the clean `scirust-license` crate, which *is*
+safely linkable — `serde`/`sha2` only — if that commercial scheme is wanted.)
+
+## Scope & next axis
 
 The dense column equals lexical *because the encoder is TF-IDF* — pure dense over a lexical embedding
 cannot out-recall lexical. The genuine semantic lift would come from encoding through CCOS's
 **`learned-embed` LSA projection** (synonymy/transitivity TF-IDF cannot see); `CcosEncoder` is the seam
-where that swaps in. Two further axes from `scirust-retrieval` remain optional follow-ups, and both
-touch `scirust-core` so would be **distilled** the same way if pursued: the contrastive
-`ImprovementLoop` (learn a projection from confirmed (query, relevant-doc) pairs and watch Recall@k
-climb) and `RetrievalAccess` premium gating (which can ride CCOS's *own* ed25519 license from #29
-rather than linking `scirust-license`). The headline this PR establishes: **pure retrieval ties ccos's
-RAG on relevance and wins decisively on reproducibility** — and it does so with zero new dependencies.
+where that swaps in. The headline this work establishes: **pure retrieval ties ccos's RAG on relevance,
+wins decisively on reproducibility, and — premium — improves itself from feedback**, deterministically,
+all with zero new dependencies.

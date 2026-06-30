@@ -137,6 +137,20 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Adaptive retrieval — the self-improving `ImprovementLoop` (premium tier) + license gate.** The
+  `ccos::retrieval` core (dense/BM25/hybrid + metrics) is free; the **premium** tier learns a linear
+  projection of the embedding space from confirmed `(query, relevant-doc)` pairs by deterministic
+  contrastive (InfoNCE) training, so Recall@k climbs as feedback accumulates. Distilled from
+  `scirust-retrieval`'s `contrastive` + `feedback` (which use `scirust-core`'s autodiff) — reimplemented
+  with a **seeded** xorshift RNG, **fixed-order `f32`**, and a **hand-derived analytic gradient**
+  (gradient-checked against finite differences, so the math is verified not trusted): no `scirust-core`,
+  no rayon. `examples/retrieval_improvement.rs` shows Recall@1 climbing **8% → 100%** across cycles on a
+  deliberate *disjoint-vocabulary* gap (query and answer share no term — base retrieval is at chance),
+  bit-for-bit reproducible. Gated by `RetrievalAccess::unlock` behind CCOS's own #29 ed25519 license
+  (new `Feature::AdaptiveRetrieval`) — reusing the offline, deterministic, no-FFI license rather than
+  linking `scirust-license` (one fewer dep; the node-locked `$1/machine/month` model would come from the
+  clean `scirust-license` if wanted). 5 tests; always-compiled, zero new dependencies.
+
 - **Pure semantic retrieval (`ccos::retrieval`) — distilled from SciRust, challenges RAG, measured.**
   A dependency-free distillation of SciRust's `scirust-retrieval` pure modules over the embeddings CCOS
   already owns: `vector` primitives, an exact-cosine `DenseIndex`, a classic `Bm25Index`,
