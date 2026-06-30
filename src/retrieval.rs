@@ -820,3 +820,475 @@ pub mod metrics {
         }
     }
 }
+
+/// Online retrieval improvement: learn a linear projection of the embedding space from confirmed
+/// `(query, relevant-doc)` pairs by deterministic **contrastive (InfoNCE)** training, so Recall@k
+/// climbs as feedback accumulates. A distillation of `scirust-retrieval`'s `contrastive` + `feedback`
+/// modules — but reimplemented with a **seeded** RNG, **fixed-order `f32`**, and **hand-derived analytic
+/// gradients** (gradient-checked against finite differences), so it pulls in *no* `scirust-core`
+/// autodiff (and no rayon). The objective is a dot-product InfoNCE with full-batch SGD (a faithful,
+/// auditable simplification of SciRust's cosine/Adam variant).
+pub mod feedback {
+    use super::metrics::recall_at_k;
+    use super::{vector, DenseIndex};
+    use std::collections::HashSet;
+
+    /// A seeded xorshift64 RNG → signed uniform in `[-1, 1)`, for deterministic head initialisation.
+    struct Rng(u64);
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            // Avoid the xorshift fixed point at 0.
+            Self(seed ^ 0x9E37_79B9_7F4A_7C15)
+        }
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        /// Signed uniform in `[-1, 1)` from the top 24 bits.
+        fn signed(&mut self) -> f32 {
+            let u = (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32; // [0, 1)
+            2.0 * u - 1.0
+        }
+    }
+
+    /// A linear projection head `dim_in → dim_out` (`out = v·W + b`), seeded-initialised.
+    #[derive(Debug, Clone)]
+    pub struct ProjectionHead {
+        weight: Vec<f32>, // dim_in × dim_out, row-major (row index = input dimension)
+        bias: Vec<f32>,   // dim_out
+        dim_in: usize,
+        dim_out: usize,
+    }
+
+    impl ProjectionHead {
+        /// A head initialised from `seed`: `W[i,j] ~ scale·U(-1,1)` with `scale = √(1/dim_in)`, `b = 0`.
+        pub fn new(dim_in: usize, dim_out: usize, seed: u64) -> Self {
+            let mut rng = Rng::new(seed);
+            let scale = (1.0 / dim_in as f32).sqrt();
+            let weight = (0..dim_in * dim_out)
+                .map(|_| rng.signed() * scale)
+                .collect();
+            Self {
+                weight,
+                bias: vec![0.0; dim_out],
+                dim_in,
+                dim_out,
+            }
+        }
+
+        /// The input dimension.
+        pub fn dim_in(&self) -> usize {
+            self.dim_in
+        }
+
+        /// The output (projected) dimension.
+        pub fn dim_out(&self) -> usize {
+            self.dim_out
+        }
+
+        /// Project `v` (`dim_in`) → `dim_out`: `out[j] = b[j] + Σ_i v[i]·W[i,j]`, summed in index order.
+        pub fn project(&self, v: &[f32]) -> Vec<f32> {
+            assert_eq!(v.len(), self.dim_in, "project: input dim mismatch");
+            let mut out = self.bias.clone();
+            for (i, &vi) in v.iter().enumerate() {
+                if vi == 0.0 {
+                    continue;
+                }
+                let row = &self.weight[i * self.dim_out..(i + 1) * self.dim_out];
+                for (o, &w) in out.iter_mut().zip(row) {
+                    *o += vi * w;
+                }
+            }
+            out
+        }
+    }
+
+    /// Contrastive-training hyperparameters.
+    #[derive(Debug, Clone, Copy)]
+    pub struct ContrastiveConfig {
+        /// Full-batch SGD epochs per training cycle.
+        pub epochs: usize,
+        /// Learning rate.
+        pub lr: f32,
+        /// Softmax temperature (lower = sharper contrast).
+        pub temperature: f32,
+    }
+
+    impl Default for ContrastiveConfig {
+        fn default() -> Self {
+            Self {
+                epochs: 400,
+                lr: 0.05,
+                temperature: 0.1,
+            }
+        }
+    }
+
+    /// One forward+backward pass of the dot-product InfoNCE objective. Returns the mean loss and the
+    /// gradients `(dW, db)`. With `aᵢ = qᵢW + b`, `cⱼ = pⱼW + b`, `Sᵢⱼ = (aᵢ·cⱼ)/τ`, row-softmax `P`,
+    /// and diagonal targets: `L = −(1/n)Σᵢ log Pᵢᵢ`, `Gᵢⱼ = (Pᵢⱼ − δᵢⱼ)/(n·τ)`, `dA = G C`, `dC = Gᵀ A`,
+    /// `dW = Qᵀ dA + Pᵀ dC`, `db = Σ(dA + dC)` — all summed in fixed index order (deterministic).
+    fn forward_backward(
+        head: &ProjectionHead,
+        q: &[Vec<f32>],
+        p: &[Vec<f32>],
+        temp: f32,
+    ) -> (f32, Vec<f32>, Vec<f32>) {
+        let (n, di, dout) = (q.len(), head.dim_in, head.dim_out);
+        let a: Vec<Vec<f32>> = q.iter().map(|r| head.project(r)).collect();
+        let c: Vec<Vec<f32>> = p.iter().map(|r| head.project(r)).collect();
+
+        let mut loss = 0.0f32;
+        let mut soft = vec![vec![0.0f32; n]; n]; // row-softmax of S
+        for i in 0..n {
+            let s: Vec<f32> = (0..n).map(|j| vector::dot(&a[i], &c[j]) / temp).collect();
+            let maxs = s.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = s.iter().map(|&x| (x - maxs).exp()).collect();
+            let sum: f32 = exps.iter().sum();
+            for j in 0..n {
+                soft[i][j] = exps[j] / sum;
+            }
+            loss += -(s[i] - maxs - sum.ln()); // −log softmax(S_i)[i]
+        }
+        loss /= n.max(1) as f32;
+
+        // dA_i = Σ_j G_ij c_j ; dC_j = Σ_i G_ij a_i with G_ij = (soft_ij − δ_ij)/(n·τ).
+        let mut da = vec![vec![0.0f32; dout]; n];
+        let mut dc = vec![vec![0.0f32; dout]; n];
+        for i in 0..n {
+            for j in 0..n {
+                let g = (soft[i][j] - if i == j { 1.0 } else { 0.0 }) / (n as f32 * temp);
+                for d in 0..dout {
+                    da[i][d] += g * c[j][d];
+                    dc[j][d] += g * a[i][d];
+                }
+            }
+        }
+        // dW[ii,d] = Σ_k q_k[ii]·dA_k[d] + p_k[ii]·dC_k[d] ; db[d] = Σ_k dA_k[d] + dC_k[d].
+        let mut dw = vec![0.0f32; di * dout];
+        let mut db = vec![0.0f32; dout];
+        for k in 0..n {
+            for ii in 0..di {
+                let (qk, pk) = (q[k][ii], p[k][ii]);
+                if qk == 0.0 && pk == 0.0 {
+                    continue;
+                }
+                let base = ii * dout;
+                for d in 0..dout {
+                    dw[base + d] += qk * da[k][d] + pk * dc[k][d];
+                }
+            }
+            for d in 0..dout {
+                db[d] += da[k][d] + dc[k][d];
+            }
+        }
+        (loss, dw, db)
+    }
+
+    /// The InfoNCE loss of `head` on the pairs (no training) — used by the gradient-check oracle.
+    pub fn infonce_loss(head: &ProjectionHead, q: &[Vec<f32>], p: &[Vec<f32>], temp: f32) -> f32 {
+        forward_backward(head, q, p, temp).0
+    }
+
+    /// Train `head` in place for `cfg.epochs` of full-batch SGD on the dot-product InfoNCE loss; returns
+    /// the per-epoch loss (monotone as it converges). Deterministic: fixed-order `f32`, no RNG in the
+    /// step. Distilled from `scirust-retrieval`'s Adam/autodiff `train`.
+    pub fn train(
+        head: &mut ProjectionHead,
+        q: &[Vec<f32>],
+        p: &[Vec<f32>],
+        cfg: ContrastiveConfig,
+    ) -> Vec<f32> {
+        assert_eq!(
+            q.len(),
+            p.len(),
+            "train: queries and positives must pair 1:1"
+        );
+        if q.is_empty() {
+            return Vec::new();
+        }
+        let mut losses = Vec::with_capacity(cfg.epochs);
+        for _ in 0..cfg.epochs {
+            let (loss, dw, db) = forward_backward(head, q, p, cfg.temperature);
+            losses.push(loss);
+            for (w, g) in head.weight.iter_mut().zip(&dw) {
+                *w -= cfg.lr * g;
+            }
+            for (b, g) in head.bias.iter_mut().zip(&db) {
+                *b -= cfg.lr * g;
+            }
+        }
+        losses
+    }
+
+    /// An online **improvement loop**: accumulate confirmed `(query, relevant-doc)` embedding pairs,
+    /// then `train_cycle` a [`ProjectionHead`] on them so projected retrieval improves. Deterministic
+    /// and dependency-free; the projected space is consumed by the same [`DenseIndex`] the rest of
+    /// `ccos::retrieval` uses, so improvement is measured with [`Self::evaluate_recall_at_k`].
+    pub struct ImprovementLoop {
+        head: ProjectionHead,
+        queries: Vec<Vec<f32>>,
+        positives: Vec<Vec<f32>>,
+        cfg: ContrastiveConfig,
+        replay_cap: Option<usize>,
+    }
+
+    impl ImprovementLoop {
+        /// A loop over a fresh `dim_in → dim_out` head seeded by `seed`, trained per `cfg`.
+        pub fn new(dim_in: usize, dim_out: usize, seed: u64, cfg: ContrastiveConfig) -> Self {
+            Self {
+                head: ProjectionHead::new(dim_in, dim_out, seed),
+                queries: Vec::new(),
+                positives: Vec::new(),
+                cfg,
+                replay_cap: None,
+            }
+        }
+
+        /// Bound the retained feedback to the most recent `cap` pairs (a sliding window).
+        pub fn with_replay_cap(mut self, cap: Option<usize>) -> Self {
+            self.replay_cap = cap;
+            self
+        }
+
+        /// Record a confirmed `(query, relevant-doc)` embedding pair, evicting the oldest past the cap.
+        pub fn record(&mut self, query: &[f32], positive: &[f32]) {
+            self.queries.push(query.to_vec());
+            self.positives.push(positive.to_vec());
+            if let Some(cap) = self.replay_cap {
+                while self.queries.len() > cap {
+                    self.queries.remove(0);
+                    self.positives.remove(0);
+                }
+            }
+        }
+
+        /// Number of recorded pairs.
+        pub fn feedback_len(&self) -> usize {
+            self.queries.len()
+        }
+
+        /// Whether no feedback has been recorded.
+        pub fn is_empty(&self) -> bool {
+            self.queries.is_empty()
+        }
+
+        /// Project a `dim_in` vector through the current head.
+        pub fn project(&self, v: &[f32]) -> Vec<f32> {
+            self.head.project(v)
+        }
+
+        /// Run one training cycle over all recorded feedback; returns the per-epoch loss curve.
+        pub fn train_cycle(&mut self) -> Vec<f32> {
+            train(&mut self.head, &self.queries, &self.positives, self.cfg)
+        }
+
+        /// Mean Recall@k of `eval` `(query, relevant-id)` over `corpus` `(id, embedding)`, with both the
+        /// corpus and the queries projected through the current head — the metric that should climb
+        /// across `train_cycle`s.
+        pub fn evaluate_recall_at_k(
+            &self,
+            eval: &[(Vec<f32>, u64)],
+            corpus: &[(u64, Vec<f32>)],
+            k: usize,
+        ) -> f64 {
+            if eval.is_empty() {
+                return 0.0;
+            }
+            let mut index = DenseIndex::new(self.head.dim_out());
+            for (id, emb) in corpus {
+                index
+                    .add(*id, &self.head.project(emb))
+                    .expect("corpus embedding dimension matches the head");
+            }
+            let mut sum = 0.0;
+            for (query, relevant_id) in eval {
+                let ranked: Vec<u64> = index
+                    .search(&self.head.project(query), k)
+                    .into_iter()
+                    .map(|s| s.id)
+                    .collect();
+                let relevant: HashSet<u64> = [*relevant_id].into_iter().collect();
+                sum += recall_at_k(&ranked, &relevant, k);
+            }
+            sum / eval.len() as f64
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn projection_head_is_deterministic_for_a_seed() {
+            let a = ProjectionHead::new(8, 4, 42);
+            let b = ProjectionHead::new(8, 4, 42);
+            assert_eq!(
+                a.weight, b.weight,
+                "same seed → identical init, bit for bit"
+            );
+            let c = ProjectionHead::new(8, 4, 43);
+            assert_ne!(
+                a.weight, c.weight,
+                "a different seed gives a different init"
+            );
+        }
+
+        #[test]
+        fn analytic_gradient_matches_finite_differences() {
+            // The honest correctness oracle for the hand-derived InfoNCE gradient: perturb each
+            // parameter and compare the central finite difference to the analytic gradient.
+            let mut head = ProjectionHead::new(4, 3, 7);
+            let q = vec![vec![1.0, 0.0, 0.5, 0.0], vec![0.0, 1.0, 0.0, 0.5]];
+            let p = vec![vec![0.0, 0.5, 1.0, 0.0], vec![0.5, 0.0, 0.0, 1.0]];
+            let temp = 0.5;
+            let (_, dw, db) = forward_backward(&head, &q, &p, temp);
+            let eps = 1e-2f32;
+            // A few representative weights + a bias.
+            for &idx in &[0usize, 5, 11] {
+                let orig = head.weight[idx];
+                head.weight[idx] = orig + eps;
+                let lp = infonce_loss(&head, &q, &p, temp);
+                head.weight[idx] = orig - eps;
+                let lm = infonce_loss(&head, &q, &p, temp);
+                head.weight[idx] = orig;
+                let numeric = (lp - lm) / (2.0 * eps);
+                assert!(
+                    (numeric - dw[idx]).abs() < 0.02 * (1.0 + dw[idx].abs()),
+                    "dW[{idx}]: analytic {} vs finite-diff {numeric}",
+                    dw[idx]
+                );
+            }
+            let orig = head.bias[1];
+            head.bias[1] = orig + eps;
+            let lp = infonce_loss(&head, &q, &p, temp);
+            head.bias[1] = orig - eps;
+            let lm = infonce_loss(&head, &q, &p, temp);
+            head.bias[1] = orig;
+            let numeric = (lp - lm) / (2.0 * eps);
+            assert!(
+                (numeric - db[1]).abs() < 0.02 * (1.0 + db[1].abs()),
+                "db[1]: analytic {} vs finite-diff {numeric}",
+                db[1]
+            );
+        }
+
+        #[test]
+        fn training_monotonically_reduces_the_loss() {
+            let head = ProjectionHead::new(6, 4, 1);
+            let q = vec![
+                vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                vec![0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+            ];
+            let p = vec![
+                vec![0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+                vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            ];
+            let mut h = head.clone();
+            let losses = train(&mut h, &q, &p, ContrastiveConfig::default());
+            assert!(
+                losses.last().unwrap() < &(losses[0] * 0.5),
+                "loss falls over training: {} → {}",
+                losses[0],
+                losses.last().unwrap()
+            );
+        }
+
+        #[test]
+        fn retrieval_quality_climbs_as_feedback_accumulates() {
+            // Synthetic separable task (SciRust's own `feedback` test design): query i is a one-hot in
+            // [0, n), doc i a one-hot in [n, 2n) — disjoint, so they are orthogonal and a random
+            // projection retrieves at chance. Training the head to align (queryᵢ, docᵢ) makes Recall@1
+            // climb toward 1.0 — measured, not asserted as a constant.
+            let n = 8usize;
+            let query = |i: usize| {
+                let mut v = vec![0.0f32; 2 * n];
+                v[i] = 1.0;
+                v
+            };
+            let doc = |i: usize| {
+                let mut v = vec![0.0f32; 2 * n];
+                v[n + i] = 1.0;
+                v
+            };
+            let mut loop_ = ImprovementLoop::new(2 * n, 8, 99, ContrastiveConfig::default());
+            for i in 0..n {
+                loop_.record(&query(i), &doc(i));
+            }
+            let corpus: Vec<(u64, Vec<f32>)> = (0..n).map(|i| (i as u64, doc(i))).collect();
+            let eval: Vec<(Vec<f32>, u64)> = (0..n).map(|i| (query(i), i as u64)).collect();
+
+            let before = loop_.evaluate_recall_at_k(&eval, &corpus, 1);
+            loop_.train_cycle();
+            let after = loop_.evaluate_recall_at_k(&eval, &corpus, 1);
+            assert!(
+                after > before && after >= 0.99,
+                "Recall@1 climbs to ~1.0 after a training cycle: {before} → {after}"
+            );
+        }
+    }
+}
+
+/// **Premium gate** for the *adaptive-retrieval* tier. The retrieval core — dense / BM25 / hybrid
+/// retrieval plus the ranking [`metrics`] — is **free** and fully functional, exactly like the rest of
+/// CCOS's core; only the self-improving [`feedback::ImprovementLoop`] is a Pro capability. `unlock`
+/// consults CCOS's own offline license ([`Feature::AdaptiveRetrieval`](crate::license::Feature)); on
+/// the community tier it returns a [`LicenseError`](crate::license::LicenseError) (with CCOS's standard
+/// no-silent-downgrade log) and the caller keeps the free core. This reuses CCOS's #29 ed25519 license
+/// rather than linking `scirust-license` — same deterministic, offline, no-FFI guarantee, one fewer dep.
+/// (A node-locked `$1/machine/month` scheme would come from the clean `scirust-license` crate, which is
+/// safely linkable — `serde`/`sha2` only, no `scirust-core` — if that commercial model is wanted.)
+pub struct RetrievalAccess {
+    #[allow(dead_code)]
+    gated: (),
+}
+
+impl RetrievalAccess {
+    /// Unlock the adaptive-retrieval tier from CCOS's `licensing` state at `now`. `Ok` only on the Pro
+    /// tier; otherwise the standard `Feature::AdaptiveRetrieval` refusal (the core stays usable).
+    pub fn unlock(
+        licensing: &crate::license::Licensing,
+        now: u64,
+    ) -> Result<Self, crate::license::LicenseError> {
+        licensing.require(crate::license::Feature::AdaptiveRetrieval, now)?;
+        Ok(Self { gated: () })
+    }
+
+    /// Construct the premium adaptive [`feedback::ImprovementLoop`] — reachable only behind
+    /// [`Self::unlock`].
+    pub fn improvement_loop(
+        &self,
+        dim_in: usize,
+        dim_out: usize,
+        seed: u64,
+        cfg: feedback::ContrastiveConfig,
+    ) -> feedback::ImprovementLoop {
+        feedback::ImprovementLoop::new(dim_in, dim_out, seed, cfg)
+    }
+}
+
+#[cfg(test)]
+mod access_tests {
+    use super::*;
+    use crate::license::{License, Licensing};
+
+    #[test]
+    fn adaptive_retrieval_is_gated_by_the_license() {
+        let now = 1_000u64;
+        // Community tier → locked (the core retrieval still works; only the loop is gated).
+        assert!(RetrievalAccess::unlock(&Licensing::community(), now).is_err());
+        // A valid Pro license → unlocked, and the premium improvement loop is constructible.
+        let pro = Licensing::licensed(License {
+            licensee: "acme".into(),
+            expires_at: None,
+        });
+        let access =
+            RetrievalAccess::unlock(&pro, now).expect("pro tier unlocks adaptive retrieval");
+        let lp = access.improvement_loop(16, 8, 1, feedback::ContrastiveConfig::default());
+        assert!(lp.is_empty());
+    }
+}

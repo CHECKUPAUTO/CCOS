@@ -40,6 +40,11 @@ pub enum Feature {
     /// scheme. The core recall path is unchanged — only the *precision* of the semantic
     /// embedding store reflects the tier, exactly like [`Feature::CustomAuthorityWeights`].
     SlhAv2Embeddings,
+    /// **Adaptive retrieval** — the `ccos::retrieval` self-improving feedback loop
+    /// (`ImprovementLoop`: learn a projection from confirmed (query, relevant-doc) pairs so Recall@k
+    /// climbs). The *core* retrieval (dense / BM25 / hybrid + metrics) is free and fully functional,
+    /// exactly like the rest of CCOS's core; only the continuous-improvement tier is gated.
+    AdaptiveRetrieval,
 }
 
 impl Feature {
@@ -50,15 +55,17 @@ impl Feature {
             Feature::TensionVisualization => "tension-visualization",
             Feature::AuditReports => "audit-reports",
             Feature::SlhAv2Embeddings => "slhav2-embeddings",
+            Feature::AdaptiveRetrieval => "adaptive-retrieval",
         }
     }
 
     /// Every Pro feature — for enumerating the gate.
-    pub const ALL: [Feature; 4] = [
+    pub const ALL: [Feature; 5] = [
         Feature::CustomAuthorityWeights,
         Feature::TensionVisualization,
         Feature::AuditReports,
         Feature::SlhAv2Embeddings,
+        Feature::AdaptiveRetrieval,
     ];
 }
 
