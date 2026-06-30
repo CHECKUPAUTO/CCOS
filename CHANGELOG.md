@@ -6,6 +6,44 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Post-quantum Pro license verifier (`license-pq` feature / SLH-DSA, FIPS 205).** A second,
+  fully independent offline license-signature verifier alongside ed25519, behind the orthogonal
+  `license-pq` cargo feature. A license token can now be signed/verified with **SLH-DSA**
+  (NIST FIPS 205, formerly SPHINCS+) — stateless hash-based signatures conjectured secure against
+  a large-scale quantum computer, where ed25519 (Discrete-Log) is not. Parameter set
+  **SLH-DSA-SHAKE-128s**: a 32-byte public key (the same shape as ed25519, so the fail-closed
+  all-zero placeholder transfers verbatim) and a 7,856-byte (~10.5 KB base64url) signature — the
+  smallest FIPS 205 signature, NIST PQ category 1, a like-for-like PQ upgrade of ed25519's
+  classical 128-bit. The token format is `slhdsa.<payload>.<sig>` — a `slhdsa.` scheme tag that
+  both dispatches [`Licensing::detect`] to the right verifier (a build may compile in one, the
+  other, or both via `--features license,license-pq`) and is bound into the signed message, so a
+  signature made under one scheme can never be replayed as the other. New `SlhDsaVerifier`,
+  `sign_token_slhdsa`, `LICENSE_SLH_DSA_PUBLIC_KEY` placeholder, vendor tool
+  `cargo run --features license-pq --example license_sign_pq`, `ccos doctor` scheme surfacing, and
+  a full mirror of the ed25519 test suite plus cross-scheme isolation tests. **Crate choice:** the
+  `lattice-slh-dsa` crate (pure Rust, `#![forbid(unsafe_code)]`), not RustCrypto's `slh-dsa` — the
+  latter pins a pre-release `signature` crate that cannot coexist with `ed25519-dalek` in one build
+  (which would break `--all-features`); `lattice-slh-dsa` depends only on stable `sha2`/`sha3`, so
+  the two license features compose. **Caveat:** `lattice-slh-dsa` is not independently audited — see
+  `docs/DEPLOYMENT.md` §4b before trusting it to gate production features. (ROADMAP slice 29c.)
+
+### Changed
+
+- **SLHAv2 grouped-INT4 embeddings are now a Pro feature (`Feature::SlhAv2Embeddings`).** The
+  adaptive per-group INT4 quantization (group size 16, the "SLHAv2 two-level INT4" distilled from
+  SCIRUST's KV-cache) that powers semantic recall is now gated behind the Pro license. A
+  **community** session falls back to **uniform** INT4 (a single per-vector absmax scale — the same
+  4× storage win, slightly less faithful on heterogeneous vectors); a **Pro** session keeps the
+  grouped scheme. The core recall path is unchanged — only the *precision* of the semantic embedding
+  store reflects the tier, exactly like custom authority weights. The scheme is decided silently at
+  session open from the host tier (community `new()`/`open` → uniform; Pro `open` → grouped) and via
+  the explicit gated `AgentSession::enable_slhav2_embeddings`; it is runtime-only (never persisted),
+  so `replay == live` holds. The `Int4Embedding.group_size` field already discriminated the two
+  schemes (16 = grouped, `dim` = uniform), so there is no persistence-schema change; old snapshots
+  deserialize with the grouped default.
+
 ### Fixed
 
 - **CI unblocked after the `neural_store` unrelated-histories merge.** That merge

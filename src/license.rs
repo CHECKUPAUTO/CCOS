@@ -33,6 +33,13 @@ pub enum Feature {
     TensionVisualization,
     /// **Audit-report generation** (belief / conflict / provenance of the knowledge base).
     AuditReports,
+    /// **SLHAv2 grouped INT4 embeddings** — the adaptive per-group INT4 quantization (group
+    /// size 16) that keeps cosine fidelity high when vector magnitudes vary across dims (the
+    /// "SLHAv2 two-level INT4" distilled from SCIRUST's KV-cache). A community session falls
+    /// back to **uniform** INT4 (a single per-vector absmax scale); Pro keeps the grouped
+    /// scheme. The core recall path is unchanged — only the *precision* of the semantic
+    /// embedding store reflects the tier, exactly like [`Feature::CustomAuthorityWeights`].
+    SlhAv2Embeddings,
 }
 
 impl Feature {
@@ -42,14 +49,16 @@ impl Feature {
             Feature::CustomAuthorityWeights => "custom-authority-weights",
             Feature::TensionVisualization => "tension-visualization",
             Feature::AuditReports => "audit-reports",
+            Feature::SlhAv2Embeddings => "slhav2-embeddings",
         }
     }
 
     /// Every Pro feature — for enumerating the gate.
-    pub const ALL: [Feature; 3] = [
+    pub const ALL: [Feature; 4] = [
         Feature::CustomAuthorityWeights,
         Feature::TensionVisualization,
         Feature::AuditReports,
+        Feature::SlhAv2Embeddings,
     ];
 }
 
@@ -150,8 +159,9 @@ impl LicenseVerifier for CommunityVerifier {
 pub const LICENSE_PUBLIC_KEY: [u8; 32] = [0u8; 32];
 
 /// The signed-token payload: who, and until when. Compact-JSON + base64url is the token's first
-/// segment.
-#[cfg(feature = "license")]
+/// segment. Shared by every compiled-in verifier (ed25519 behind `license`, SLH-DSA behind
+/// `license-pq`), so it lives behind the union of those features.
+#[cfg(any(feature = "license", feature = "license-pq"))]
 #[derive(serde::Serialize, serde::Deserialize)]
 struct TokenPayload {
     /// Licensee (organisation / deployment name) — surfaced in the audit log.
@@ -161,9 +171,10 @@ struct TokenPayload {
     exp: Option<u64>,
 }
 
-/// URL-safe base64 **without padding** (RFC 4648 §5: `-`/`_`, no `=`). Hand-rolled so the `license`
-/// feature's only new dependency is the ed25519 primitive — the same reason CCOS hand-rolls its hex.
-#[cfg(feature = "license")]
+/// URL-safe base64 **without padding** (RFC 4648 §5: `-`/`_`, no `=`). Hand-rolled so neither license
+/// feature's only new dependency is its signature primitive — the same reason CCOS hand-rolls its hex.
+/// Shared by the ed25519 and SLH-DSA verifiers.
+#[cfg(any(feature = "license", feature = "license-pq"))]
 fn b64url_encode(bytes: &[u8]) -> String {
     const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
@@ -185,7 +196,7 @@ fn b64url_encode(bytes: &[u8]) -> String {
 }
 
 /// Inverse of [`b64url_encode`]. `None` on any non-alphabet byte or a truncated group.
-#[cfg(feature = "license")]
+#[cfg(any(feature = "license", feature = "license-pq"))]
 fn b64url_decode(s: &str) -> Option<Vec<u8>> {
     let val = |c: u8| -> Option<u32> {
         Some(match c {
@@ -310,6 +321,150 @@ impl LicenseVerifier for Ed25519Verifier {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Offline SLH-DSA (FIPS 205, post-quantum) verifier + signed-token format
+// (behind the `license-pq` feature)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// A second, fully independent verifier alongside ed25519. SLH-DSA is NIST's
+// stateless hash-based post-quantum signature scheme (FIPS 205, formerly
+// SPHINCS+); it relies only on hashes, so it is conjectured secure against a
+// large-scale quantum computer where ed25519 (Discrete-Log) is not. We use the
+// **SLH-DSA-SHAKE-128s** parameter set: a 32-byte public key (the same shape as
+// ed25519, so the fail-closed all-zero placeholder transfers verbatim) and a
+// 7,856-byte signature (~10.5 KB base64url) — the smallest FIPS 205 signature,
+// NIST PQ category 1 (~128-bit post-quantum), a like-for-like PQ upgrade of
+// ed25519's classical 128-bit security.
+//
+// The token format is `slhdsa.<payload_b64>.<sig_b64>` — a `slhdsa.` **scheme
+// tag** prefixes the token (so [`Licensing::detect`] can dispatch a token to the
+// right verifier without trial-and-error) AND is bound into the signed message
+// (the signing input is the ASCII `"slhdsa.<payload_b64>"`), so a signature
+// made under one scheme can never be replayed as another. The crate
+// (`lattice-slh-dsa`, pure Rust, `#![forbid(unsafe_code)]`) is **not
+// independently audited** — see `docs/DEPLOYMENT.md` §4b.
+
+/// The SLH-DSA parameter set used for license tokens: **SLH-DSA-SHAKE-128s**
+/// (FIPS 205). 32-byte public key, 64-byte secret key, 7,856-byte signature.
+#[cfg(feature = "license-pq")]
+const SLH_DSA_MODE: slh_dsa::SlhDsaMode = slh_dsa::params::SLH_DSA_SHAKE_128S;
+
+/// Signature length in bytes for [`SLH_DSA_MODE`] (7,856 for SLH-DSA-SHAKE-128s),
+/// evaluated at compile time from the parameter set.
+#[cfg(feature = "license-pq")]
+const SLH_DSA_SIG_LEN: usize = slh_dsa::params::SLH_DSA_SHAKE_128S.sig_bytes();
+
+/// The vendor's **SLH-DSA public key** (32 bytes), baked into the binary. A license
+/// token is signed by the matching 64-byte secret key — held only by the vendor, never
+/// in this tree — and verification is a pure offline signature check against this
+/// constant. As with [`LICENSE_PUBLIC_KEY`], the all-zero placeholder shipped here
+/// means *no key was set* → [`SlhDsaVerifier`] licenses **nothing**, so the build is
+/// **fail-closed** until a deployment pastes its own public key.
+///
+/// Regenerate with `cargo run --features license-pq --example license_sign_pq keygen`.
+#[cfg(feature = "license-pq")]
+pub const LICENSE_SLH_DSA_PUBLIC_KEY: [u8; 32] = [0u8; 32];
+
+/// Sign a license token with the 64-byte SLH-DSA **secret key** (the `sk` half of a
+/// `keygen_seed` keypair): emits `slhdsa.<payload_b64>.<sig_b64>`, the signature taken
+/// over the ASCII bytes `slhdsa.<payload_b64>` (the scheme tag is bound into the signed
+/// message, so it cannot be replayed as an ed25519 token). SLH-DSA signing here is
+/// **deterministic** (the crate uses a fixed all-zero `optrand`), so a given secret key
+/// and payload always yield the same token — vendor tokens are reproducible and tests
+/// are stable. Vendor-side tooling and the tests use this; the engine only ever *verifies*.
+#[cfg(feature = "license-pq")]
+pub fn sign_token_slhdsa(signing_sk: &[u8; 64], licensee: &str, exp: Option<u64>) -> String {
+    let payload = TokenPayload {
+        licensee: licensee.to_string(),
+        exp,
+    };
+    let json = serde_json::to_vec(&payload).expect("payload serialises");
+    let payload_b64 = b64url_encode(&json);
+    let signing_input = format!("slhdsa.{payload_b64}");
+    let sig = slh_dsa::sign(signing_sk, signing_input.as_bytes(), SLH_DSA_MODE);
+    format!("slhdsa.{payload_b64}.{}", b64url_encode(&sig))
+}
+
+/// The offline **SLH-DSA license verifier**: a pure signature + format check against a
+/// public key (the baked-in [`LICENSE_SLH_DSA_PUBLIC_KEY`] by default). No I/O, no clock,
+/// no network — the same zero-knowledge contract as [`Ed25519Verifier`], post-quantum. An
+/// unset / all-zero embedded key licenses nothing (fail-closed). The 7,856-byte signature
+/// is heap-allocated by the crate, so there is no large stack frame.
+#[cfg(feature = "license-pq")]
+#[derive(Clone, Default)]
+pub struct SlhDsaVerifier {
+    /// The baked-in public key, or `None` when the placeholder is set (fail-closed).
+    key: Option<[u8; 32]>,
+}
+
+#[cfg(feature = "license-pq")]
+impl SlhDsaVerifier {
+    /// Verifier bound to the baked-in vendor key ([`LICENSE_SLH_DSA_PUBLIC_KEY`]). The
+    /// all-zero placeholder shipped in this open tree means *no key was set* → it licenses
+    /// nothing, so the default build is **fail-closed**: a deployment must paste its own
+    /// public key (via the `license_sign_pq keygen` tool) before any token can unlock Pro.
+    pub fn new() -> Self {
+        if LICENSE_SLH_DSA_PUBLIC_KEY == [0u8; 32] {
+            return Self { key: None };
+        }
+        Self::with_public_key(&LICENSE_SLH_DSA_PUBLIC_KEY)
+    }
+
+    /// Verifier bound to an explicit public key — the tests derive a throwaway keypair
+    /// and verify against its public half, never the embedded vendor key.
+    pub fn with_public_key(public_key: &[u8; 32]) -> Self {
+        Self {
+            key: Some(*public_key),
+        }
+    }
+}
+
+#[cfg(feature = "license-pq")]
+impl LicenseVerifier for SlhDsaVerifier {
+    /// Verify `blob` (a `slhdsa.payload.sig` token, tolerant of trailing whitespace from a
+    /// file) and return the encoded [`License`] on a good signature. As with ed25519,
+    /// temporal validity is **not** checked here — a signature-valid but expired token still
+    /// parses, and [`Licensing::tier`] reports it as community (the licensee is retained for
+    /// the audit log). `now` is thus unused; the check is pure signature + format.
+    fn verify(&self, blob: &[u8], _now: u64) -> Result<License, LicenseError> {
+        let pk = self
+            .key
+            .as_ref()
+            .ok_or_else(|| LicenseError::Invalid("no embedded SLH-DSA public key".into()))?;
+        let token = std::str::from_utf8(blob)
+            .map_err(|_| LicenseError::Invalid("token is not UTF-8".into()))?
+            .trim();
+        let rest = token
+            .strip_prefix("slhdsa.")
+            .ok_or_else(|| LicenseError::Invalid("token is not slhdsa.payload.signature".into()))?;
+        let (payload_b64, sig_b64) = rest
+            .split_once('.')
+            .ok_or_else(|| LicenseError::Invalid("token is not slhdsa.payload.signature".into()))?;
+        let sig_bytes = b64url_decode(sig_b64)
+            .filter(|s| s.len() == SLH_DSA_SIG_LEN)
+            .ok_or_else(|| {
+                LicenseError::Invalid(format!(
+                    "signature is not {SLH_DSA_SIG_LEN} base64url bytes"
+                ))
+            })?;
+        // The scheme tag is bound into the signed message: the signing input is the
+        // ASCII `"slhdsa.<payload_b64>"`, so this signature cannot verify as an ed25519
+        // token (and vice-versa) — no scheme confusion, no cross-scheme replay.
+        let signing_input = format!("slhdsa.{payload_b64}");
+        if !slh_dsa::verify(pk, &sig_bytes, signing_input.as_bytes(), SLH_DSA_MODE) {
+            return Err(LicenseError::Invalid("bad signature".into()));
+        }
+        let json = b64url_decode(payload_b64)
+            .ok_or_else(|| LicenseError::Invalid("payload is not base64url".into()))?;
+        let payload: TokenPayload = serde_json::from_slice(&json)
+            .map_err(|e| LicenseError::Invalid(format!("payload JSON: {e}")))?;
+        Ok(License {
+            licensee: payload.licensee,
+            expires_at: payload.exp,
+        })
+    }
+}
+
 /// Load a license token from the host — **the one explicit I/O entry point** (the gate and verifier
 /// are pure). Order: the `$CCOS_LICENSE` env var (the token text inline — handy in containers / CI),
 /// else the file at `$CCOS_LICENSE_FILE`, else the XDG default `$XDG_CONFIG_HOME/ccos/license` (or
@@ -352,8 +507,8 @@ pub fn now_unix() -> u64 {
 }
 
 /// Whether a **real vendor public key** is baked into this build (vs the all-zero placeholder that
-/// licenses nothing). Without the `license` feature there is no verifier, so this is always `false`.
-/// Diagnostic only (surfaced by `ccos doctor`) — never part of verification.
+/// licenses nothing). Without the `license` feature there is no ed25519 verifier, so this is always
+/// `false`. Diagnostic only (surfaced by `ccos doctor`) — never part of verification.
 pub fn embedded_key_is_set() -> bool {
     #[cfg(feature = "license")]
     {
@@ -365,25 +520,70 @@ pub fn embedded_key_is_set() -> bool {
     }
 }
 
+/// Whether a **real SLH-DSA vendor public key** is baked into this build (vs the all-zero
+/// placeholder). Without the `license-pq` feature there is no SLH-DSA verifier, so this is always
+/// `false`. Diagnostic only (surfaced by `ccos doctor`) — never part of verification. The PQ
+/// analogue of [`embedded_key_is_set`].
+pub fn embedded_slh_dsa_key_is_set() -> bool {
+    #[cfg(feature = "license-pq")]
+    {
+        LICENSE_SLH_DSA_PUBLIC_KEY != [0u8; 32]
+    }
+    #[cfg(not(feature = "license-pq"))]
+    {
+        false
+    }
+}
+
+/// The compiled-in verifier scheme(s), for `ccos doctor`: `"slh-dsa+ed25519"` when both
+/// `license-pq` and `license` are on, `"slh-dsa"` / `"ed25519"` for one, `"none"` when no
+/// verifier is compiled in (community only). Diagnostic — never part of verification.
+pub fn compiled_verifier_scheme() -> &'static str {
+    match (cfg!(feature = "license-pq"), cfg!(feature = "license")) {
+        (true, true) => "slh-dsa+ed25519",
+        (true, false) => "slh-dsa",
+        (false, true) => "ed25519",
+        (false, false) => "none",
+    }
+}
+
 impl Licensing {
     /// Determine the active licensing from the host: load any local token ([`load_license_blob`]) and
-    /// verify it with the compiled-in verifier. With the `license` feature that is the offline
-    /// [`Ed25519Verifier`]; without it there is no verifier, so the result is always the community
-    /// tier (the core is never gated). Pure beyond the single [`load_license_blob`] read; the one
-    /// place CLI commands and the session obtain their licensing.
+    /// verify it with the compiled-in verifier. The token's **scheme tag** selects the verifier:
+    /// a `slhdsa.`-prefixed token is checked by the offline [`SlhDsaVerifier`] (when `license-pq`
+    /// is compiled in); any other token by the offline [`Ed25519Verifier`] (when `license` is
+    /// compiled in). A build may compile in one, the other, or both. With neither feature (or a
+    /// token whose scheme has no compiled-in verifier) there is no matching verifier, so the result
+    /// is the community tier (the core is never gated). Pure beyond the single [`load_license_blob`]
+    /// read; the one place CLI commands and the session obtain their licensing.
     pub fn detect(now: u64) -> Self {
         let Some(blob) = load_license_blob() else {
             return Self::community();
         };
+        // Dispatch on the scheme tag. A token is SLH-DSA iff its trimmed text starts with
+        // `slhdsa.`; everything else is treated as the legacy ed25519 `payload.sig` form.
+        #[cfg(feature = "license-pq")]
+        {
+            let is_pq = std::str::from_utf8(&blob)
+                .map(|s| s.trim().starts_with("slhdsa."))
+                .unwrap_or(false);
+            if is_pq {
+                return Self::from_blob(&SlhDsaVerifier::new(), &blob, now);
+            }
+        }
         #[cfg(feature = "license")]
         {
-            Self::from_blob(&Ed25519Verifier::new(), &blob, now)
+            let is_pq = std::str::from_utf8(&blob)
+                .map(|s| s.trim().starts_with("slhdsa."))
+                .unwrap_or(false);
+            if !is_pq {
+                return Self::from_blob(&Ed25519Verifier::new(), &blob, now);
+            }
         }
-        #[cfg(not(feature = "license"))]
-        {
-            let _ = (blob, now);
-            Self::community()
-        }
+        // No compiled-in verifier matches this token's scheme (or no verifier at all) →
+        // community. The core is never gated.
+        let _ = (blob, now);
+        Self::community()
     }
 }
 
@@ -626,5 +826,199 @@ mod tests {
         assert_eq!(s.licensee(), Some("lapsed-llc"));
         assert_eq!(s.tier(NOW), Tier::Community);
         assert!(!s.allows(Feature::AuditReports, NOW));
+    }
+
+    // ── SLH-DSA (post-quantum) verifier + token format (behind `license-pq`) ────
+    // A throwaway TEST keypair: derived at runtime from a fixed 48-byte seed via
+    // `keygen_seed`, its public half passed to `with_public_key` — never the
+    // embedded vendor key, so no production private key lives in the tree.
+    #[cfg(feature = "license-pq")]
+    const TEST_SLH_SEED: [u8; 48] = [7u8; 48];
+
+    #[cfg(feature = "license-pq")]
+    fn test_slh_keypair() -> ([u8; 32], [u8; 64]) {
+        let (pk, sk) = slh_dsa::keygen_seed(slh_dsa::params::SLH_DSA_SHAKE_128S, &TEST_SLH_SEED);
+        assert_eq!(pk.len(), 32);
+        assert_eq!(sk.len(), 64);
+        (
+            pk.try_into().expect("pk is 32 bytes"),
+            sk.try_into().expect("sk is 64 bytes"),
+        )
+    }
+
+    #[cfg(feature = "license-pq")]
+    fn test_slh_verifier() -> SlhDsaVerifier {
+        let (pk, _sk) = test_slh_keypair();
+        SlhDsaVerifier::with_public_key(&pk)
+    }
+
+    #[cfg(feature = "license-pq")]
+    #[test]
+    fn slh_dsa_signed_token_verifies_to_pro_and_unlocks_features() {
+        let (_pk, sk) = test_slh_keypair();
+        let token = sign_token_slhdsa(&sk, "acme-corp", Some(NOW + 1000));
+        assert!(token.starts_with("slhdsa."));
+        let s = Licensing::from_blob(&test_slh_verifier(), token.as_bytes(), NOW);
+        assert_eq!(s.tier(NOW), Tier::Pro);
+        assert_eq!(s.licensee(), Some("acme-corp"));
+        for f in Feature::ALL {
+            assert!(s.require(f, NOW).is_ok());
+        }
+    }
+
+    #[cfg(feature = "license-pq")]
+    #[test]
+    fn slh_dsa_perpetual_signed_token_is_pro_forever() {
+        let (_pk, sk) = test_slh_keypair();
+        let token = sign_token_slhdsa(&sk, "forever-inc", None);
+        let s = Licensing::from_blob(&test_slh_verifier(), token.as_bytes(), NOW);
+        assert_eq!(s.tier(u64::MAX), Tier::Pro);
+    }
+
+    #[cfg(feature = "license-pq")]
+    #[test]
+    fn slh_dsa_trailing_whitespace_from_a_file_is_tolerated() {
+        let (_pk, sk) = test_slh_keypair();
+        let token = format!("{}\n", sign_token_slhdsa(&sk, "acme", None));
+        assert!(test_slh_verifier().verify(token.as_bytes(), NOW).is_ok());
+    }
+
+    #[cfg(feature = "license-pq")]
+    #[test]
+    fn slh_dsa_tampered_payload_is_rejected_and_falls_back_to_community() {
+        let (_pk, sk) = test_slh_keypair();
+        let token = sign_token_slhdsa(&sk, "acme-corp", Some(NOW + 1000));
+        let mut bytes = token.into_bytes();
+        // Flip a char inside the payload segment (after "slhdsa.", before the first '.') →
+        // the signature no longer matches the signed `slhdsa.<payload>` input.
+        bytes["slhdsa.".len()] ^= 0b1;
+        let v = test_slh_verifier();
+        assert!(matches!(
+            v.verify(&bytes, NOW),
+            Err(LicenseError::Invalid(_))
+        ));
+        assert_eq!(
+            Licensing::from_blob(&v, &bytes, NOW).tier(NOW),
+            Tier::Community
+        );
+    }
+
+    #[cfg(feature = "license-pq")]
+    #[test]
+    fn slh_dsa_tampered_signature_is_rejected() {
+        let (_pk, sk) = test_slh_keypair();
+        let token = sign_token_slhdsa(&sk, "acme-corp", None);
+        let mut bytes = token.into_bytes();
+        // Flip a byte near the end (inside the signature segment).
+        let last = bytes.len().checked_sub(3).unwrap();
+        bytes[last] ^= 0b1;
+        let v = test_slh_verifier();
+        assert!(matches!(
+            v.verify(&bytes, NOW),
+            Err(LicenseError::Invalid(_))
+        ));
+    }
+
+    #[cfg(feature = "license-pq")]
+    #[test]
+    fn slh_dsa_token_signed_by_another_key_is_rejected() {
+        // A different seed → a different keypair; the verifier expects TEST_SLH_SEED's pk.
+        let (pk_other, sk_other) =
+            slh_dsa::keygen_seed(slh_dsa::params::SLH_DSA_SHAKE_128S, &[9u8; 48]);
+        let _ = pk_other;
+        let sk_other: [u8; 64] = sk_other.try_into().unwrap();
+        let token = sign_token_slhdsa(&sk_other, "impostor", None);
+        let v = test_slh_verifier();
+        assert!(matches!(
+            v.verify(token.as_bytes(), NOW),
+            Err(LicenseError::Invalid(_))
+        ));
+    }
+
+    #[cfg(feature = "license-pq")]
+    #[test]
+    fn slh_dsa_malformed_tokens_are_invalid_and_never_panic() {
+        let v = test_slh_verifier();
+        for bad in [
+            "",
+            "no-dot",
+            "slhdsa.",
+            "slhdsa.only",
+            "slhdsa..",
+            "notslhdsa.payload.sig",
+            "slhdsa.payload.!!",
+        ] {
+            assert!(v.verify(bad.as_bytes(), NOW).is_err(), "rejects {bad:?}");
+        }
+    }
+
+    #[cfg(feature = "license-pq")]
+    #[test]
+    fn slh_dsa_unset_embedded_key_fails_closed_to_community() {
+        // The placeholder key shipped in this tree licenses nothing — even a well-formed
+        // token signed by some key is refused, so the default build is fail-closed (a
+        // vendor must paste its own public key). Holds while LICENSE_SLH_DSA_PUBLIC_KEY
+        // is the all-zero placeholder.
+        let (_pk, sk) = test_slh_keypair();
+        let token = sign_token_slhdsa(&sk, "acme", None);
+        let s = Licensing::from_blob(&SlhDsaVerifier::new(), token.as_bytes(), NOW);
+        assert_eq!(s.tier(NOW), Tier::Community);
+    }
+
+    #[cfg(feature = "license-pq")]
+    #[test]
+    fn slh_dsa_expired_signed_token_reads_community_but_keeps_licensee() {
+        let (_pk, sk) = test_slh_keypair();
+        let token = sign_token_slhdsa(&sk, "lapsed-llc", Some(NOW - 1));
+        let s = Licensing::from_blob(&test_slh_verifier(), token.as_bytes(), NOW);
+        assert_eq!(s.licensee(), Some("lapsed-llc"));
+        assert_eq!(s.tier(NOW), Tier::Community);
+        assert!(!s.allows(Feature::AuditReports, NOW));
+    }
+
+    // ── cross-scheme isolation (both verifiers compiled in) ────────────────────
+    #[cfg(all(feature = "license", feature = "license-pq"))]
+    #[test]
+    fn ed25519_verifier_rejects_a_slh_dsa_tagged_token() {
+        let (_pk, sk) = test_slh_keypair();
+        let pq_token = sign_token_slhdsa(&sk, "acme", None);
+        // The ed25519 verifier expects `payload.sig` (no `slhdsa.` tag) and a 64-byte sig;
+        // a SLH-DSA token (7,856-byte sig, tagged) must not verify as ed25519.
+        let ed = Ed25519Verifier::with_public_key(&[1u8; 32]);
+        assert!(ed.verify(pq_token.as_bytes(), NOW).is_err());
+    }
+
+    #[cfg(all(feature = "license", feature = "license-pq"))]
+    #[test]
+    fn slh_dsa_verifier_rejects_a_legacy_ed25519_token() {
+        let token = sign_token(&TEST_SEED, "acme", None); // untagged ed25519 token
+        let v = test_slh_verifier();
+        // No `slhdsa.` prefix → rejected at the format check, before any crypto.
+        assert!(matches!(
+            v.verify(token.as_bytes(), NOW),
+            Err(LicenseError::Invalid(_))
+        ));
+    }
+
+    #[cfg(all(feature = "license", feature = "license-pq"))]
+    #[test]
+    fn detect_dispatches_on_the_scheme_tag() {
+        // A slhdsa. token → verified by the SLH-DSA path (Pro); an ed25519 token → the
+        // ed25519 path (Pro). `Licensing::detect` reads the host blob, so exercise the
+        // dispatch via `from_blob`-equivalent: directly through each verifier.
+        let (pk_pq, sk_pq) = test_slh_keypair();
+        let pq_token = sign_token_slhdsa(&sk_pq, "pq-corp", None);
+        let s_pq = Licensing::from_blob(
+            &SlhDsaVerifier::with_public_key(&pk_pq),
+            pq_token.as_bytes(),
+            NOW,
+        );
+        assert_eq!(s_pq.tier(NOW), Tier::Pro);
+        assert_eq!(s_pq.licensee(), Some("pq-corp"));
+
+        let ed_token = sign_token(&TEST_SEED, "ed-corp", None);
+        let s_ed = Licensing::from_blob(&test_verifier(), ed_token.as_bytes(), NOW);
+        assert_eq!(s_ed.tier(NOW), Tier::Pro);
+        assert_eq!(s_ed.licensee(), Some("ed-corp"));
     }
 }

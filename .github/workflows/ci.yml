@@ -65,6 +65,12 @@ jobs:
       - name: Test (license feature — offline ed25519 verifier)
         run: cargo test --features license --locked
 
+      - name: Test (license-pq feature — offline post-quantum SLH-DSA verifier)
+        run: cargo test --features license-pq --locked
+
+      - name: Test (license + license-pq — both verifiers compose, cross-scheme isolation)
+        run: cargo test --features license,license-pq --locked
+
       - name: Docs
         env:
           RUSTDOCFLAGS: "-D warnings"
@@ -89,3 +95,9 @@ jobs:
           printf '%s\n' '{"op":"ingest","uri":"src/x.rs","source":"pub fn x() {}"}' '{"op":"recall","strategy":"working_set","budget":512}' '{"op":"verify"}' | cargo run --locked --features llm -- stdin
           cargo run --locked --features llm -- chaos --iters 500
           cargo run --locked --features llm -- license
+          # Post-quantum license verifier builds + runs under each feature combo (the embedded
+          # key is the fail-closed placeholder, so the tier stays community — the verify→Pro path
+          # is covered by the `license-pq` unit tests above, not by this smoke).
+          cargo run --locked --features llm,license-pq -- doctor
+          cargo run --locked --features llm,license,license-pq -- doctor
+          cargo run --locked --features license-pq --example license_sign_pq -- keygen >/dev/null
