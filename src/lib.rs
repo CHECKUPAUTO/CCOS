@@ -124,6 +124,7 @@ pub mod parser;
 pub mod persist;
 pub mod postmortem;
 pub mod query;
+pub mod retrieval;
 pub mod sanitizer;
 pub mod spectral;
 pub mod trace;

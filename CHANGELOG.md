@@ -137,6 +137,24 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Pure semantic retrieval (`ccos::retrieval`) — distilled from SciRust, challenges RAG, measured.**
+  A dependency-free distillation of SciRust's `scirust-retrieval` pure modules over the embeddings CCOS
+  already owns: `vector` primitives, an exact-cosine `DenseIndex`, a classic `Bm25Index`,
+  `reciprocal_rank_fusion`, `SemanticRetriever` / `HybridRetriever`, the five ranking `metrics`
+  (Recall@k, Precision@k, MRR, MAP, nDCG@k), and a `CcosEncoder` bridge (`Encoder` over the TF-IDF
+  embedder). **Distilled, not linked** — `scirust-retrieval` depends on `scirust-core`
+  (`default = ["rayon"]` + `nalgebra`/`ndarray`), and linking it would drag rayon's non-deterministic
+  parallel `f32` reductions into the build, breaking `replay == live` and CCOS's zero-dep/air-gappable
+  identity (the exact #14 trap); the retrieval algorithms themselves are pure, so they're reimplemented
+  with fixed-order `f32` and hand-derived oracle tests (matching SciRust's own vectors). The benchmark
+  `examples/pure_retrieval_vs_rag.rs` scores all three retrievers on CCOS's own `src/` corpus + AST
+  dependency ground truth: **pure dense reproduces ccos's lexical RAG bit-for-bit** (24/52/66
+  Recall@1/5/10, MRR 0.626 — a faithful-distillation check; absolute figures track the live `src/`
+  corpus, qualitative result is stable), the hybrid trades slightly on this structural task (an honest
+  negative), and the decisive win is **determinism** (every number reproducible bit-for-bit, zero RNG,
+  zero generative step). Zero new dependencies; always-compiled.
+  See `docs/MEASUREMENT_pure_retrieval.md`.
+
 - **Call-graph Slice 3 (#23) — `x.bar()` receiver-type inference.** A method call `x.bar()` names the
   method but not the type `x` belongs to, and CCOS stores a method as a flat `sym:<file>:bar` symbol, so
   when two types both define `bar` the name is ambiguous and the resolver (precision-first) skipped it —
