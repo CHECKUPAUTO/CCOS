@@ -22,6 +22,16 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Data-flow resolution now links *bare* global refs through imports and same-module scope, not only
+  when globally unique.** A bare `static`/`const` reference previously became a `DataFlow` edge
+  only when exactly one symbol of that name existed graph-wide, so a common name like
+  `CONFIG`/`MAX`/`LIMIT` shared across modules resolved to nothing. `resolve_data_flow` now runs the
+  same **Tier A → B → C** ladder as the call resolver — import-scoped (`use m::CONFIG` pins the
+  defining module), then the reader's own module, then global-unique — against the data-symbol-only
+  index. A shared global reached through an explicit import (or defined alongside the reader) links
+  even when its name is not unique; ambiguous imports and unresolvable names still
+  **resolve-uniquely-or-skip** (no guessed edge). Deterministic, no new dependencies.
+
 - **External dense-retrieval backend (`scirust-retrieval` feature).** An optional bridge to the
   `scirust-retrieval` crate's *pure core* (`default-features = false`: no `scirust-core` autodiff/nn
   stack — only `serde`/`sha2`, already in our tree), wiring its exact, full-precision `DenseIndex`
