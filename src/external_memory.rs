@@ -92,6 +92,11 @@ pub enum MemoryError {
     /// [`ExternalMemory::checkpoint`] was called with no path bound; use
     /// [`CcosMemory::open`] or [`CcosMemory::checkpoint_to`].
     NoPath,
+    /// A workspace's timeline sidecar failed its tamper-evident hash-chain check
+    /// on open: the recorded history was mutated on disk. The sidecar is left
+    /// untouched (forensic evidence); `ccos verify <workspace>` shows the broken
+    /// links, and deleting the sidecar explicitly restarts the timeline.
+    TimelineTampered(String),
 }
 
 impl std::fmt::Display for MemoryError {
@@ -101,6 +106,9 @@ impl std::fmt::Display for MemoryError {
             MemoryError::Io(e) => write!(f, "io error: {e}"),
             MemoryError::Serde(e) => write!(f, "serialization error: {e}"),
             MemoryError::NoPath => write!(f, "no checkpoint path bound"),
+            MemoryError::TimelineTampered(detail) => {
+                write!(f, "timeline sidecar failed its hash-chain check: {detail}")
+            }
         }
     }
 }

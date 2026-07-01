@@ -357,6 +357,17 @@ honesty code↔docs↔paper, tests/API). **Fixed in this pass:**
   `id`/`timestamp` so the chain stays reproducible). `EventLog::verify_integrity`
   detects any payload tamper, reorder, insertion or deletion, and `ccos verify` /
   `ccos replay` check it on every run. See `src/event_log.rs`.
+
+  ✅ **…and the session op-log (paper §9 item 2, closing slice)** — *done.* The third
+  log — the `AgentSession` op-log, the timeline that actually carries `replay == live` —
+  is now chained too: every recorded `Op` links into a SHA-256 chain (`chain`/`anchor`),
+  the replay **baseline** is pinned by a commitment (`baseline_hash`), compaction moves
+  the *anchor* but never the head (one hash commits to the whole history since genesis),
+  and `AgentSession::open` **refuses** a workspace whose sidecar fails the check
+  (`MemoryError::TimelineTampered`, sidecar left intact for forensics) while chain-valid
+  staleness still self-heals. Pre-chain sidecars load and are backfilled. `ccos verify
+  <workspace>` audits a sidecar without opening it. Every run is auditable by default —
+  the paper's item 2 is fully landed. See `src/agent_session.rs`.
 3. **Semantic edges.** (L) — *both halves landed; deep polish underway.* Call-graph (fn→fn `Calls`:
    bare, qualified, `self`/`Self` methods — #74/#75/#76/#77; plus **renamed-import alias calls**
    `use a::b as c` and **cross-impl-block self-calls** via per-type unioned method sets) **and

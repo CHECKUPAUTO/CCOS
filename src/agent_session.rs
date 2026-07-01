@@ -36,6 +36,7 @@
 //! ```
 
 use crate::compressor::{CausalCompressor, CcrRef};
+use crate::event_log::LogIntegrity;
 use crate::external_memory::{
     CcosMemory, ExternalMemory, IngestReport, MemoryError, Recall, RecallWindow,
 };
@@ -136,6 +137,161 @@ struct PersistedTimeline {
     /// Ops folded into `baseline` by compaction (absent in pre-compaction logs).
     #[serde(default)]
     folded: usize,
+    /// Tamper-evident hash chain over the op tail: `chain[i]` is the SHA-256 link
+    /// for `ops[i]` (see [`op_link_hash`]). Absent in pre-chain logs (backfilled
+    /// on open — the chain protects the timeline from then on).
+    #[serde(default)]
+    chain: Vec<String>,
+    /// The chain predecessor of `ops[0]`: [`TIMELINE_GENESIS`] for an uncompacted
+    /// timeline, or the head of the folded prefix after compaction — so the
+    /// surviving chain provably extends the folded history and the head stays a
+    /// commitment to *every* op since genesis.
+    #[serde(default)]
+    anchor: String,
+    /// SHA-256 commitment to `baseline` (empty when the timeline replays from
+    /// empty). Ops alone don't pin the state the tail replays *on top of*; this
+    /// does, so a baseline edit is as detectable as an op edit.
+    #[serde(default)]
+    baseline_hash: String,
+}
+
+/// Genesis predecessor for the first link of an uncompacted timeline chain.
+const TIMELINE_GENESIS: &str = "GENESIS";
+
+/// SHA-256 link over `(prev, absolute step, op)`. Ops carry no wall-clock ids or
+/// timestamps (the timeline is indexed by logical step), so the *whole* record is
+/// hashed and the chain is bit-reproducible across runs — the same
+/// exclude-nothing-nondeterministic rule as [`EventLog`](crate::event_log::EventLog).
+fn op_link_hash(prev: &str, seq: usize, op: &Op) -> String {
+    let op_json = serde_json::to_string(op).unwrap_or_default();
+    crate::util::sha256_hex(&format!("{prev}|{seq}|{op_json}"))
+}
+
+/// The chain commitment to a replay baseline (empty string for "replays from empty").
+fn baseline_commitment(baseline: Option<&str>) -> String {
+    baseline.map(crate::util::sha256_hex).unwrap_or_default()
+}
+
+/// Recompute the whole chain for `ops` from `anchor` at compaction floor `folded` —
+/// used to backfill pre-chain sidecars and by tests.
+fn chain_over(anchor: &str, folded: usize, ops: &[Op]) -> Vec<String> {
+    let mut chain = Vec::with_capacity(ops.len());
+    let mut prev = anchor.to_string();
+    for (i, op) in ops.iter().enumerate() {
+        let h = op_link_hash(&prev, folded + i, op);
+        chain.push(h.clone());
+        prev = h;
+    }
+    chain
+}
+
+/// Verify a timeline's canonical hash chain: the baseline commitment, the
+/// link count, and every link from the anchor forward. Pure — shared by
+/// [`AgentSession::verify_timeline`] and [`audit_workspace`] so the CLI can audit
+/// a sidecar without opening (and potentially self-healing) the session.
+fn verify_timeline_parts(
+    anchor: &str,
+    folded: usize,
+    ops: &[Op],
+    chain: &[String],
+    baseline: Option<&str>,
+    baseline_hash: &str,
+) -> LogIntegrity {
+    let mut errors = Vec::new();
+    let mut verified = 0usize;
+
+    // A pre-chain sidecar has nothing to verify against — reported as valid with
+    // zero verified links (the caller can surface "legacy"); the chain is
+    // established the next time the session checkpoints.
+    if chain.is_empty() && anchor.is_empty() && baseline_hash.is_empty() {
+        return LogIntegrity {
+            valid: true,
+            verified_events: 0,
+            errors,
+        };
+    }
+
+    if baseline_commitment(baseline) != baseline_hash {
+        errors.push("baseline does not match its recorded commitment".to_string());
+    }
+    if chain.len() != ops.len() {
+        errors.push(format!(
+            "chain has {} link(s) for {} op(s): an op was inserted or removed",
+            chain.len(),
+            ops.len()
+        ));
+    }
+    let mut prev = anchor.to_string();
+    for (i, (op, link)) in ops.iter().zip(chain.iter()).enumerate() {
+        let seq = folded + i;
+        if op_link_hash(&prev, seq, op) == *link {
+            verified += 1;
+        } else {
+            errors.push(format!("link t={} broken: op or hash mutated", seq + 1));
+        }
+        prev = link.clone();
+    }
+    LogIntegrity {
+        valid: errors.is_empty(),
+        verified_events: verified,
+        errors,
+    }
+}
+
+/// A CLI-facing audit of a workspace's timeline sidecar — see [`audit_workspace`].
+#[derive(Debug)]
+pub struct TimelineAudit {
+    /// Chain verification result (baseline commitment + every link).
+    pub integrity: LogIntegrity,
+    /// Ops in the live tail (on top of `folded` compacted ones).
+    pub ops: usize,
+    /// Ops already folded into the baseline by compaction.
+    pub folded: usize,
+    /// The chain head — a single hash committing to the whole recorded history.
+    pub head: String,
+    /// True for a pre-chain sidecar: nothing to verify yet; the chain is
+    /// established on the session's next checkpoint.
+    pub legacy: bool,
+}
+
+/// Audit the tamper-evident chain of a workspace's `.oplog` sidecar **without**
+/// opening the session (so a tampered or stale timeline is *reported*, never
+/// healed or rejected as a side effect). `None` when the workspace has no
+/// sidecar; a sidecar that no longer parses is reported as invalid.
+pub fn audit_workspace(path: impl AsRef<Path>) -> Option<TimelineAudit> {
+    let file = crate::external_memory::workspace_file(path.as_ref());
+    let sidecar = oplog_sidecar(&file);
+    let raw = std::fs::read_to_string(&sidecar).ok()?;
+    let Ok(t) = serde_json::from_str::<PersistedTimeline>(&raw) else {
+        return Some(TimelineAudit {
+            integrity: LogIntegrity {
+                valid: false,
+                verified_events: 0,
+                errors: vec!["sidecar does not parse as a timeline".to_string()],
+            },
+            ops: 0,
+            folded: 0,
+            head: String::new(),
+            legacy: false,
+        });
+    };
+    let legacy = t.chain.is_empty() && t.anchor.is_empty() && t.baseline_hash.is_empty();
+    let integrity = verify_timeline_parts(
+        &t.anchor,
+        t.folded,
+        &t.ops,
+        &t.chain,
+        t.baseline.as_deref(),
+        &t.baseline_hash,
+    );
+    let head = t.chain.last().cloned().unwrap_or(t.anchor);
+    Some(TimelineAudit {
+        integrity,
+        ops: t.ops.len(),
+        folded: t.folded,
+        head,
+        legacy,
+    })
 }
 
 /// Per-source **authority overrides** for assertions — the Pro `CustomAuthorityWeights` knob. Maps an
@@ -205,6 +361,17 @@ pub struct AgentSession {
     /// a `replay_to(step)` for `step <= folded` collapses to the baseline (the
     /// compaction floor). Keeps the op-log bounded for a long-running daemon.
     folded: usize,
+    /// Tamper-evident SHA-256 chain over `ops` (`chain[i]` links `ops[i]` to its
+    /// predecessor — see [`op_link_hash`]). Passive metadata: replay never reads
+    /// it, so `replay == live` is untouched; [`verify_timeline`](Self::verify_timeline)
+    /// and `ccos verify` read it to prove the recorded history unmutated.
+    chain: Vec<String>,
+    /// Chain predecessor of `ops[0]` — [`TIMELINE_GENESIS`], or the folded
+    /// prefix's head after compaction (head continuity across folds).
+    anchor: String,
+    /// Commitment to `baseline`, so the state the tail replays on top of is as
+    /// tamper-evident as the ops themselves.
+    baseline_hash: String,
     /// Where the timeline sidecar lives (`<workspace>.oplog`); `None` for an
     /// in-memory [`new`](Self::new) session.
     oplog_path: Option<PathBuf>,
@@ -245,6 +412,9 @@ impl AgentSession {
             ops: Vec::new(),
             baseline: None,
             folded: 0,
+            chain: Vec::new(),
+            anchor: TIMELINE_GENESIS.to_string(),
+            baseline_hash: baseline_commitment(None),
             oplog_path: None,
             compressor: CausalCompressor::new(),
             licensing,
@@ -292,23 +462,56 @@ impl AgentSession {
         live.set_slhav2_embeddings(licensing.allows(Feature::SlhAv2Embeddings, now));
 
         let mut session = match restored {
-            Some(t) => AgentSession {
-                live,
-                ops: t.ops,
-                baseline: t.baseline,
-                folded: t.folded,
-                oplog_path: Some(oplog_path),
-                compressor: CausalCompressor::new(),
-                licensing,
-                custom_authorities: CustomAuthorityMap::new(),
-            },
+            Some(mut t) => {
+                // A pre-chain sidecar has no chain to check — establish one now
+                // (deterministic backfill), so the history is protected from here
+                // on. A *chained* sidecar must verify before it is trusted:
+                // a broken link means the recorded history was mutated on disk,
+                // and silently self-healing would destroy the evidence — so open
+                // refuses, leaving the sidecar intact for forensics
+                // (`ccos verify <workspace>` reports the broken links).
+                if t.chain.is_empty() && t.anchor.is_empty() && t.baseline_hash.is_empty() {
+                    t.anchor = TIMELINE_GENESIS.to_string();
+                    t.baseline_hash = baseline_commitment(t.baseline.as_deref());
+                    t.chain = chain_over(&t.anchor, t.folded, &t.ops);
+                } else {
+                    let integrity = verify_timeline_parts(
+                        &t.anchor,
+                        t.folded,
+                        &t.ops,
+                        &t.chain,
+                        t.baseline.as_deref(),
+                        &t.baseline_hash,
+                    );
+                    if !integrity.valid {
+                        return Err(MemoryError::TimelineTampered(integrity.errors.join("; ")));
+                    }
+                }
+                AgentSession {
+                    live,
+                    ops: t.ops,
+                    baseline: t.baseline,
+                    folded: t.folded,
+                    chain: t.chain,
+                    anchor: t.anchor,
+                    baseline_hash: t.baseline_hash,
+                    oplog_path: Some(oplog_path),
+                    compressor: CausalCompressor::new(),
+                    licensing,
+                    custom_authorities: CustomAuthorityMap::new(),
+                }
+            }
             None => {
                 let baseline = Some(live.to_json()?);
+                let baseline_hash = baseline_commitment(baseline.as_deref());
                 AgentSession {
                     live,
                     ops: Vec::new(),
                     baseline,
                     folded: 0,
+                    chain: Vec::new(),
+                    anchor: TIMELINE_GENESIS.to_string(),
+                    baseline_hash,
                     oplog_path: Some(oplog_path),
                     compressor: CausalCompressor::new(),
                     licensing,
@@ -319,10 +522,15 @@ impl AgentSession {
 
         // Consistency guard: a restored op-log must reproduce the loaded memory.
         // If not, trust the snapshot (authoritative state) and reset the timeline.
+        // Reaching here the chain verified, so this is legitimate staleness (an
+        // out-of-band `ccos memory` write), not tampering.
         if !session.ops.is_empty() && !session.timeline_reproduces_memory() {
             session.baseline = Some(session.live.to_json()?);
             session.ops.clear();
             session.folded = 0;
+            session.chain.clear();
+            session.anchor = TIMELINE_GENESIS.to_string();
+            session.baseline_hash = baseline_commitment(session.baseline.as_deref());
         }
         Ok(session)
     }
@@ -341,6 +549,9 @@ impl AgentSession {
                 baseline: self.baseline.clone(),
                 ops: self.ops.clone(),
                 folded: self.folded,
+                chain: self.chain.clone(),
+                anchor: self.anchor.clone(),
+                baseline_hash: self.baseline_hash.clone(),
             };
             crate::util::write_durable(p, serde_json::to_string(&timeline)?.as_bytes())?;
         }
@@ -359,6 +570,12 @@ impl AgentSession {
         let fold = self.ops.len() - keep;
         let floor = self.replay_to(self.folded + fold);
         if let Ok(snapshot) = floor.to_json() {
+            // The folded prefix's last link becomes the anchor, so the surviving
+            // chain still extends the folded history: the head is unchanged by a
+            // compaction and keeps committing to every op since genesis.
+            self.anchor = self.chain[fold - 1].clone();
+            self.chain.drain(0..fold);
+            self.baseline_hash = baseline_commitment(Some(&snapshot));
             self.baseline = Some(snapshot);
             self.ops.drain(0..fold);
             self.folded += fold;
@@ -389,9 +606,47 @@ impl AgentSession {
         a.nodes == b.nodes && a.edges == b.edges && a.files == b.files
     }
 
+    /// Append `op` to the timeline **and** extend the tamper-evident chain — the
+    /// single write path for every recorded operation.
+    fn record(&mut self, op: Op) {
+        let prev = self
+            .chain
+            .last()
+            .cloned()
+            .unwrap_or_else(|| self.anchor.clone());
+        let seq = self.folded + self.ops.len();
+        self.chain.push(op_link_hash(&prev, seq, &op));
+        self.ops.push(op);
+    }
+
+    /// Verify the timeline's canonical hash chain — the baseline commitment and
+    /// every op link from the anchor forward. Any post-hoc mutation of a recorded
+    /// op, a reorder, an insertion/deletion, or a baseline edit breaks it. Purely
+    /// a read: replay never consults the chain, so `replay == live` is untouched.
+    pub fn verify_timeline(&self) -> LogIntegrity {
+        verify_timeline_parts(
+            &self.anchor,
+            self.folded,
+            &self.ops,
+            &self.chain,
+            self.baseline.as_deref(),
+            &self.baseline_hash,
+        )
+    }
+
+    /// The chain head — one hash committing to the entire recorded history since
+    /// genesis (compaction moves the anchor, never the head). Two sessions with
+    /// the same head provably recorded the same timeline.
+    pub fn timeline_head(&self) -> String {
+        self.chain
+            .last()
+            .cloned()
+            .unwrap_or_else(|| self.anchor.clone())
+    }
+
     /// Record and apply an ingest.
     pub fn ingest(&mut self, uri: &str, source: &str) -> IngestReport {
-        self.ops.push(Op::Ingest {
+        self.record(Op::Ingest {
             uri: uri.to_string(),
             source: source.to_string(),
         });
@@ -423,7 +678,7 @@ impl AgentSession {
         let mut reports = Vec::new();
         for (uri, source) in files {
             let (uri, source) = (uri.as_ref(), source.as_ref());
-            self.ops.push(Op::Ingest {
+            self.record(Op::Ingest {
                 uri: uri.to_string(),
                 source: source.to_string(),
             });
@@ -483,7 +738,7 @@ impl AgentSession {
         // Pro custom-authority override; a community session's map is always empty, so the input
         // weight is used unchanged (today's behaviour).
         let weight = self.custom_authorities.get(evidence).unwrap_or(weight);
-        self.ops.push(Op::Assert {
+        self.record(Op::Assert {
             evidence: evidence.to_string(),
             claim: claim.to_string(),
             supports: true,
@@ -498,7 +753,7 @@ impl AgentSession {
     pub fn assert_contradiction(&mut self, evidence: &str, claim: &str, weight: f64) -> bool {
         // Pro custom-authority override (see `assert_support`); community map is empty → unchanged.
         let weight = self.custom_authorities.get(evidence).unwrap_or(weight);
-        self.ops.push(Op::Assert {
+        self.record(Op::Assert {
             evidence: evidence.to_string(),
             claim: claim.to_string(),
             supports: false,
@@ -521,7 +776,7 @@ impl AgentSession {
 
     /// Record and apply a failure signal.
     pub fn signal_failure(&mut self, node: &str, depth: u32) -> Result<usize, MemoryError> {
-        self.ops.push(Op::Failure {
+        self.record(Op::Failure {
             node: node.to_string(),
             depth,
         });
@@ -541,7 +796,7 @@ impl AgentSession {
             self.live.ensure_resident(uri);
         }
         let window = self.live.recall(&recall, budget);
-        self.ops.push(Op::Recall { recall, budget });
+        self.record(Op::Recall { recall, budget });
         window
     }
 
@@ -561,7 +816,7 @@ impl AgentSession {
         let window = self
             .live
             .recall_compressed(&recall, budget, &mut self.compressor);
-        self.ops.push(Op::Recall { recall, budget });
+        self.record(Op::Recall { recall, budget });
         window
     }
 
@@ -593,7 +848,7 @@ impl AgentSession {
             &mut self.compressor,
             max_rounds,
         );
-        self.ops.push(Op::Recall { recall, budget });
+        self.record(Op::Recall { recall, budget });
         window
     }
 
@@ -621,7 +876,7 @@ impl AgentSession {
             .map(|f| Recall::around(format!("file:{f}")))
             .unwrap_or(Recall::WorkingSet);
         let window = self.live.recall(&recall, budget);
-        self.ops.push(Op::PageFault { files, depth });
+        self.record(Op::PageFault { files, depth });
         window
     }
 
@@ -930,7 +1185,7 @@ impl AgentSession {
         let after = self.retrieval_reward(&tuned);
         if after > before {
             self.live.set_scoring_weights(tuned);
-            self.ops.push(Op::Retune { weights: tuned });
+            self.record(Op::Retune { weights: tuned });
             true
         } else {
             false
@@ -1033,6 +1288,9 @@ impl AgentSession {
             ops: self.ops[..tail].to_vec(),
             baseline: self.baseline.clone(),
             folded: self.folded,
+            chain: self.chain[..tail].to_vec(),
+            anchor: self.anchor.clone(),
+            baseline_hash: self.baseline_hash.clone(),
             oplog_path: None,
             compressor: CausalCompressor::new(),
             licensing: self.licensing.clone(),
@@ -1906,5 +2164,162 @@ mod tests {
         );
         // Replay uses the recorded depth → reproduces the same pressure on d.rs.
         assert!((fr(&s.replay_to(s.len())) - fr(s.memory())).abs() < 1e-9);
+    }
+
+    // ── Tamper-evident timeline chain (P1 — fold tamper-evidence into the primary log) ──
+
+    /// Build a persisted two-op workspace and return its sidecar path.
+    fn chained_workspace(tag: &str) -> std::path::PathBuf {
+        let path = tmp(tag);
+        cleanup(&path);
+        let mut s = AgentSession::open(&path).unwrap();
+        s.ingest("src/a.rs", "pub fn a() {}\n");
+        s.ingest("src/b.rs", "use crate::a;\npub fn b() { a::a() }\n");
+        assert!(s.verify_timeline().valid);
+        s.checkpoint().unwrap();
+        path
+    }
+
+    /// Load, mutate, and rewrite a sidecar's JSON.
+    fn mutate_sidecar(path: &std::path::Path, f: impl FnOnce(&mut serde_json::Value)) {
+        let sidecar = super::oplog_sidecar(path);
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&sidecar).unwrap()).unwrap();
+        f(&mut v);
+        std::fs::write(&sidecar, serde_json::to_string(&v).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn oplog_chain_detects_payload_tampering() {
+        let path = chained_workspace("ccos-chain-tamper");
+        // Rewrite recorded history: the first ingest now claims another file.
+        mutate_sidecar(&path, |v| {
+            v["ops"][0]["Ingest"]["uri"] = serde_json::Value::from("src/evil.rs");
+        });
+        let audit = audit_workspace(&path).unwrap();
+        assert!(!audit.integrity.valid, "mutated op must break its link");
+        assert!(matches!(
+            AgentSession::open(&path),
+            Err(MemoryError::TimelineTampered(_))
+        ));
+        // The evidence is preserved: the sidecar still fails an audit after the
+        // refused open (nothing healed it away).
+        assert!(!audit_workspace(&path).unwrap().integrity.valid);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn oplog_chain_detects_reorder_and_mid_deletion() {
+        let reordered = chained_workspace("ccos-chain-reorder");
+        mutate_sidecar(&reordered, |v| {
+            let ops = v["ops"].as_array_mut().unwrap();
+            ops.swap(0, 1);
+        });
+        assert!(!audit_workspace(&reordered).unwrap().integrity.valid);
+        cleanup(&reordered);
+
+        // Deleting an op *and* its link keeps lengths equal — the successor's
+        // link still breaks (its prev changed).
+        let deleted = chained_workspace("ccos-chain-delete");
+        mutate_sidecar(&deleted, |v| {
+            v["ops"].as_array_mut().unwrap().remove(0);
+            v["chain"].as_array_mut().unwrap().remove(0);
+        });
+        assert!(!audit_workspace(&deleted).unwrap().integrity.valid);
+        cleanup(&deleted);
+    }
+
+    #[test]
+    fn oplog_chain_detects_baseline_tampering() {
+        let path = tmp("ccos-chain-baseline");
+        cleanup(&path);
+        let mut s = AgentSession::open(&path).unwrap();
+        for i in 0..6 {
+            s.ingest(&format!("src/f{i}.rs"), &format!("pub fn f{i}() {{}}\n"));
+        }
+        s.compact(2); // ops fold into the baseline — the chain must now pin it
+        assert!(s.verify_timeline().valid);
+        s.checkpoint().unwrap();
+        mutate_sidecar(&path, |v| {
+            let doctored = v["baseline"].as_str().unwrap().replace("f0", "fX");
+            v["baseline"] = serde_json::Value::from(doctored);
+        });
+        let audit = audit_workspace(&path).unwrap();
+        assert!(
+            !audit.integrity.valid,
+            "a doctored baseline must fail its commitment"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn legacy_oplog_backfills_chain_and_verifies() {
+        let path = chained_workspace("ccos-chain-legacy");
+        // Strip the chain fields — the sidecar an older CCOS wrote.
+        mutate_sidecar(&path, |v| {
+            let o = v.as_object_mut().unwrap();
+            o.remove("chain");
+            o.remove("anchor");
+            o.remove("baseline_hash");
+        });
+        let audit = audit_workspace(&path).unwrap();
+        assert!(
+            audit.legacy && audit.integrity.valid,
+            "legacy = nothing to verify yet"
+        );
+        // Open backfills deterministically; the next checkpoint persists the chain.
+        let mut s = AgentSession::open(&path).unwrap();
+        assert!(s.verify_timeline().valid);
+        assert!(s.verify_timeline().verified_events > 0, "chain established");
+        s.checkpoint().unwrap();
+        let audit = audit_workspace(&path).unwrap();
+        assert!(!audit.legacy && audit.integrity.valid);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn chain_head_survives_checkpoint_reopen_and_compaction() {
+        let path = tmp("ccos-chain-head");
+        cleanup(&path);
+        let mut s = AgentSession::open(&path).unwrap();
+        for i in 0..8 {
+            s.ingest(&format!("src/m{i}.rs"), &format!("pub fn m{i}() {{}}\n"));
+        }
+        let head = s.timeline_head();
+        // Compaction folds the prefix but must not move the head: the anchor
+        // takes over the folded history's commitment.
+        s.compact(3);
+        assert_eq!(s.timeline_head(), head, "compaction keeps the head");
+        assert!(s.verify_timeline().valid);
+        s.checkpoint().unwrap();
+        let s2 = AgentSession::open(&path).unwrap();
+        assert_eq!(s2.timeline_head(), head, "head survives a restart");
+        assert!(s2.verify_timeline().valid);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn fork_inherits_a_valid_chain_prefix() {
+        let mut s = AgentSession::new();
+        s.ingest("src/a.rs", "pub fn a() {}\n");
+        s.ingest("src/b.rs", "pub fn b() {}\n");
+        s.ingest("src/c.rs", "pub fn c() {}\n");
+        let fork = s.fork_at(2);
+        assert!(fork.verify_timeline().valid);
+        assert_ne!(fork.timeline_head(), s.timeline_head());
+        // The fork's chain is a strict prefix of the trunk's: same links up to
+        // the fork point.
+        assert_eq!(fork.chain[..], s.chain[..2]);
+    }
+
+    #[test]
+    fn identical_timelines_have_identical_heads() {
+        let build = || {
+            let mut s = AgentSession::new();
+            s.ingest("src/a.rs", "pub fn a() {}\n");
+            s.signal_failure("file:src/a.rs", 2).unwrap();
+            s.timeline_head()
+        };
+        assert_eq!(build(), build(), "the chain is bit-reproducible");
     }
 }
