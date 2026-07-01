@@ -951,19 +951,7 @@ impl AgentSession {
     /// the post-mortem path, not a hot loop. A capability a stateless retriever cannot have — it has
     /// no per-item trajectory and no operation log to attribute a change to.
     pub fn attribute_drift(&self, node: &str) -> Option<DriftCause> {
-        let id = crate::memory::NodeId(node.to_string());
-        let n = self.len();
-        // The node's score at each step of the replayable history (0 ops … n ops).
-        let mut series = Vec::with_capacity(n + 1);
-        for step in 0..=n {
-            let mem = self.replay_to(step);
-            let g = mem.graph();
-            let s = g
-                .node(&id)
-                .map(|gn| g.compute_node_score(gn))
-                .unwrap_or(0.0);
-            series.push(s);
-        }
+        let series = self.score_trajectory(node);
         let cp = crate::drift::changepoint(&series)?;
         // `series[k]` is the state after `k` ops, so the shift into `series[cp.index]` was caused by
         // the op at absolute step `cp.index` (the timeline lists it as `t=<index>`).
@@ -984,6 +972,41 @@ impl AgentSession {
             cusum: cp.cusum,
             op,
         })
+    }
+
+    /// A node's causal-score trajectory across the replayable history: its
+    /// [`compute_node_score`](crate::memory::MemoryGraph::compute_node_score) at every step
+    /// `0..=len` (`0.0` where the node is absent). A pure, deterministic function of the op-log —
+    /// the basis for [`attribute_drift`](Self::attribute_drift) and
+    /// [`align_node_trajectory`](Self::align_node_trajectory).
+    pub fn score_trajectory(&self, node: &str) -> Vec<f64> {
+        let id = crate::memory::NodeId(node.to_string());
+        (0..=self.len())
+            .map(|step| {
+                let mem = self.replay_to(step);
+                let g = mem.graph();
+                g.node(&id)
+                    .map(|gn| g.compute_node_score(gn))
+                    .unwrap_or(0.0)
+            })
+            .collect()
+    }
+
+    /// **Timeline alignment** for regression hunting: DTW-align a node's score trajectory in this
+    /// session against `other`'s ([`crate::dtw::align`]), so two runs of the same task that took
+    /// slightly different step counts can still be compared, and the first step at which they stopped
+    /// tracking (differing by more than `divergence_threshold`) is pinpointed. Read-only and
+    /// deterministic (both trajectories are pure replays). A stateless retriever has no per-item
+    /// trajectory to align across two runs.
+    pub fn align_node_trajectory(
+        &self,
+        other: &AgentSession,
+        node: &str,
+        divergence_threshold: f64,
+    ) -> crate::dtw::Alignment {
+        let mine = self.score_trajectory(node);
+        let theirs = other.score_trajectory(node);
+        crate::dtw::align(&mine, &theirs, divergence_threshold)
     }
 
     /// A human-readable journal of the cognitive timeline. If compaction has folded
@@ -1106,6 +1129,30 @@ mod tests {
             cause.op
         );
         assert!(cause.delta > 0.0, "failure pressure raises the score");
+    }
+
+    #[test]
+    fn align_node_trajectory_finds_where_two_runs_diverge() {
+        // Two runs ingest the same file and recall it; run B additionally fails it, so B's score
+        // trajectory splits from A's — DTW aligns the differing lengths and finds the divergence.
+        let base = || {
+            let mut s = AgentSession::new();
+            s.ingest("src/a.rs", "pub fn a() -> i64 { 0 }\n");
+            for _ in 0..5 {
+                s.recall(Recall::working_set(), 512);
+            }
+            s
+        };
+        let a = base();
+        let mut b = base();
+        b.signal_failure("file:src/a.rs", 0).unwrap(); // B diverges here (extra op + score jump)
+        let al = a.align_node_trajectory(&b, "file:src/a.rs", 0.1);
+        assert!(al.distance > 0.0, "the runs differ after B's failure");
+        assert!(al.divergence.is_some(), "a divergence onset is found");
+        // A run aligned with itself never diverges (and is deterministic).
+        let self_al = a.align_node_trajectory(&a, "file:src/a.rs", 0.1);
+        assert_eq!(self_al.distance, 0.0);
+        assert!(self_al.divergence.is_none());
     }
 
     // ── slice C: self-improving retrieval from the replayable log ─────────────
