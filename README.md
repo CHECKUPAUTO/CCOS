@@ -147,9 +147,13 @@ measurements behind the numbers above are in
 ### 3. Standard MCP transport
 
 - **Stdio JSON-RPC server.** Native, synchronous, zero-network integration with any
-  MCP-compatible host (e.g. Claude Code). Nine tools: `ingest`, `recall`,
+  MCP-compatible host (e.g. Claude Code). Thirteen tools: `ingest`, `recall`,
   `signal_failure`, `page_fault`, `stats`, `verify`, `timeline`, `recall_what_if`,
-  `ccos_retrieve` (fetch the original of a compressed item).
+  `ccos_retrieve` (fetch the original of a compressed item), the causal-intervention
+  pair `causal_intervene` (do(X): the nodes a change would force) / `causal_blame`
+  (candidate root causes — what a node depends on), `drift_cause` (change-point
+  attribution: which recorded op moved a node's score), and `retrodict_belief`
+  (the RTS-smoothed belief trajectory — future evidence folded back into past steps).
 - **Dynamic resources.** `ccos://session/context` exposes the self-bounding working
   set, **reversibly compressed** by default (`CCOS_COMPRESS_CONTEXT=0` to disable for
   A/B), for the host to drop into its system prompt; `ccos://session/timeline` exposes
