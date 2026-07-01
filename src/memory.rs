@@ -2618,8 +2618,10 @@ impl MemoryGraph {
     /// edges — the shared-global-state channel call and import edges miss (a function reads a
     /// global defined in a file it never imports by name). A **whole-graph** pass, run after
     /// [`resolve_symbol_calls`](Self::resolve_symbol_calls). Always **resolve-uniquely-or-skip**, so
-    /// a wrong edge is never invented. A **bare** ref `X` (Slice 1) links only when exactly one
-    /// resident `static`/`const` named `X` exists graph-wide. A **qualified** ref `m::…::X` (Slice 2)
+    /// a wrong edge is never invented. A **bare** ref `X` runs the same Tier A→B→C ladder as a bare
+    /// call (import-scoped `use m::X` → the reader's own module → exactly one graph-wide `X`), against
+    /// the data-symbol-only index — so a shared global reached through an explicit import, or defined
+    /// in the reader's module, links even when `X` is not globally unique. A **qualified** ref `m::…::X` (Slice 2)
     /// pins its module prefix to a defining file via the SAME machinery as qualified calls
     /// (`resolve_qualified`) — crate-rooted, or an `alias::X` expanded through the file's imports —
     /// then links to that file's `sym:<file>:X` *only if it is a marked data symbol*;
@@ -2676,7 +2678,7 @@ impl MemoryGraph {
 
             let mut acc: Vec<(NodeId, NodeId)> = Vec::new();
             for (file, refs) in &self.pending_data_refs {
-                let (fcrate, _) = crate_and_module(file).unwrap_or_default();
+                let (fcrate, fmodule) = crate_and_module(file).unwrap_or_default();
                 for (reader, name, _line) in refs {
                     let reader_sym = NodeId(format!("sym:{file}:{reader}"));
                     if !self.nodes.contains_key(&reader_sym) {
@@ -2686,10 +2688,23 @@ impl MemoryGraph {
                         // Qualified `m::…::X` — resolve exactly like a qualified call, against the
                         // data-symbol-only `defs` so the result is guaranteed a `static`/`const`.
                         resolve_qualified(file, name, &fcrate, &scope, &file_index, &defs)
-                    } else if name_count.get(name.as_str()).copied() == Some(1) {
-                        name_first.get(name.as_str()).map(|t| (*t).clone())
                     } else {
-                        None
+                        // Bare `X` — the data-flow analogue of the call resolver's Tier A→B→C ladder
+                        // (import-scoped → reader's own module → global-unique), against the
+                        // data-symbol-only indices, so a shared global reached through an explicit
+                        // `use m::X` — or defined in the reader's module — links even when `X` is not
+                        // globally unique. resolve-uniquely-or-skip at every tier.
+                        resolve_bare_data(
+                            name,
+                            file,
+                            &fcrate,
+                            &fmodule,
+                            &scope,
+                            &file_index,
+                            &defs,
+                            &name_count,
+                            &name_first,
+                        )
                     };
                     if let Some(t) = target {
                         if t != reader_sym {
@@ -3338,6 +3353,64 @@ fn resolve_call(
     // Tier C — exactly one symbol of this name graph-wide (prelude / sibling re-export).
     if name_count.get(callee).copied() == Some(1) {
         return name_first.get(callee).cloned();
+    }
+    None
+}
+
+/// Bare data-ref resolution — the data-flow analogue of [`resolve_call`]'s Tier A→B→C ladder for a
+/// bare `name`, against the **data-symbol-only** `defs`/name indices. Tier A (import-scoped): a
+/// `use <module>::name` pins the defining module (the same [`resolve_use`] resolver bare calls use)
+/// and requires a unique data symbol there. Tier B: a `static`/`const` of that name in the reader's
+/// own module. Tier C: exactly one such symbol graph-wide. resolve-uniquely-or-skip at every tier, so
+/// a shared global reached through an explicit import (or same-module) links even when its name is not
+/// globally unique — and a wrong edge is never invented.
+#[allow(clippy::too_many_arguments)]
+fn resolve_bare_data(
+    name: &str,
+    file: &str,
+    fcrate: &str,
+    fmodule: &str,
+    scope: &HashMap<String, Vec<String>>,
+    file_index: &HashMap<(String, String), NodeId>,
+    defs: &HashMap<(String, String, String), NodeId>,
+    name_count: &HashMap<&str, u32>,
+    name_first: &HashMap<&str, &NodeId>,
+) -> Option<NodeId> {
+    // Tier A — import-scoped: `use <module>::name` pins the defining module; require a unique data
+    // symbol there. Mirrors resolve_call Tier A exactly (same `resolve_use`), against data-only `defs`.
+    if let Some(paths) = scope.get(file) {
+        let mut cands: std::collections::BTreeSet<NodeId> = std::collections::BTreeSet::new();
+        for usepath in paths {
+            if usepath.rsplit("::").next() != Some(name) {
+                continue; // this import does not bring in `name`
+            }
+            let Some((module_path, _)) = usepath.rsplit_once("::") else {
+                continue; // bare `use name;` — no module path to resolve
+            };
+            if let Some(deffile_node) = resolve_use(fcrate, module_path, file_index) {
+                if let Some(deffile) = deffile_node.0.strip_prefix("file:") {
+                    if let Some((c, m)) = crate_and_module(deffile) {
+                        if let Some(sym) = defs.get(&(c, m, name.to_string())) {
+                            cands.insert(sym.clone());
+                        }
+                    }
+                }
+            }
+        }
+        if cands.len() == 1 {
+            return cands.into_iter().next();
+        }
+        if cands.len() > 1 {
+            return None; // ambiguous imports ⇒ skip, never fall through to a contradicted guess
+        }
+    }
+    // Tier B — a `static`/`const` of this name in the reader's own module.
+    if let Some(sym) = defs.get(&(fcrate.to_string(), fmodule.to_string(), name.to_string())) {
+        return Some(sym.clone());
+    }
+    // Tier C — exactly one data symbol of this name graph-wide.
+    if name_count.get(name).copied() == Some(1) {
+        return name_first.get(name).map(|t| (*t).clone());
     }
     None
 }
@@ -3994,6 +4067,78 @@ mod tests {
         assert!(
             data_flow_of(&g).is_empty(),
             "unresolvable qualified data-refs skip — never falling back to the bare global index"
+        );
+    }
+
+    #[test]
+    fn resolve_data_flow_bare_ref_resolves_via_import_scope_despite_global_ambiguity() {
+        // `CONFIG` is defined in TWO files (globally ambiguous ⇒ the old bare/Tier-C rule skips), but
+        // `src/api.rs` imports `use crate::other::CONFIG;`. The import pins WHICH `CONFIG` the bare
+        // reference means → a DataFlow edge to `other`'s const, never the decoy (data-flow Tier A).
+        let mut g = graph_with_defs(&[
+            ("src/other.rs", "CONFIG"),
+            ("src/decoy.rs", "CONFIG"),
+            ("src/api.rs", "reader"),
+        ]);
+        g.mark_data_symbol(NodeId("sym:src/other.rs:CONFIG".into()));
+        g.mark_data_symbol(NodeId("sym:src/decoy.rs:CONFIG".into()));
+        add_import(&mut g, "src/api.rs", "crate::other::CONFIG");
+        g.set_pending_data_refs("src/api.rs", vec![("reader".into(), "CONFIG".into(), 1)]);
+        g.resolve_data_flow();
+        assert_eq!(
+            data_flow_of(&g),
+            vec![(
+                "sym:src/api.rs:reader".to_string(),
+                "sym:src/other.rs:CONFIG".to_string()
+            )],
+            "an imported bare global resolves via the import scope, not the ambiguous global index"
+        );
+    }
+
+    #[test]
+    fn resolve_data_flow_bare_ref_resolves_in_readers_own_module_despite_global_ambiguity() {
+        // `CONFIG` in the reader's OWN file plus a decoy `CONFIG` elsewhere (globally ambiguous). A
+        // bare reference resolves to the same-module const (data-flow Tier B), as Rust name
+        // resolution would — never guessing the decoy.
+        let mut g = graph_with_defs(&[
+            ("src/api.rs", "CONFIG"),
+            ("src/api.rs", "reader"),
+            ("src/decoy.rs", "CONFIG"),
+        ]);
+        g.mark_data_symbol(NodeId("sym:src/api.rs:CONFIG".into()));
+        g.mark_data_symbol(NodeId("sym:src/decoy.rs:CONFIG".into()));
+        g.set_pending_data_refs("src/api.rs", vec![("reader".into(), "CONFIG".into(), 1)]);
+        g.resolve_data_flow();
+        assert_eq!(
+            data_flow_of(&g),
+            vec![(
+                "sym:src/api.rs:reader".to_string(),
+                "sym:src/api.rs:CONFIG".to_string()
+            )],
+            "a bare global defined in the reader's own module resolves same-module (Tier B)"
+        );
+    }
+
+    #[test]
+    fn resolve_data_flow_bare_ref_ambiguous_imports_skip() {
+        // Two imports bring in `CONFIG` from two different modules (only possible in non-compiling
+        // Rust — duplicate imports). The import scope itself is ambiguous → skip, never fall through
+        // to a same-module/global guess the imports already contradict.
+        let mut g = graph_with_defs(&[
+            ("src/m1.rs", "CONFIG"),
+            ("src/m2.rs", "CONFIG"),
+            ("src/api.rs", "reader"),
+        ]);
+        g.mark_data_symbol(NodeId("sym:src/m1.rs:CONFIG".into()));
+        g.mark_data_symbol(NodeId("sym:src/m2.rs:CONFIG".into()));
+        add_import(&mut g, "src/api.rs", "crate::m1::CONFIG");
+        add_import(&mut g, "src/api.rs", "crate::m2::CONFIG");
+        g.set_pending_data_refs("src/api.rs", vec![("reader".into(), "CONFIG".into(), 1)]);
+        g.resolve_data_flow();
+        assert!(
+            data_flow_of(&g).is_empty(),
+            "ambiguous imports for a bare global skip — never a guessed edge: {:?}",
+            data_flow_of(&g)
         );
     }
 
