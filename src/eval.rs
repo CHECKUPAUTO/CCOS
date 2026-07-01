@@ -77,16 +77,9 @@ const STRATEGIES: [&str; 6] = [
     "ccos-region",
 ];
 
-/// The strategies to evaluate. With the `scirust-retrieval` feature enabled,
-/// `scirust-dense` is appended: an exact, full-precision dense index (from the
-/// external `scirust-retrieval` crate) over CCOS's own TF-IDF embeddings, to
-/// contrast against the lexical `rag-dense` baseline and CCOS's INT4 `nearest_k`.
+/// The strategies to evaluate.
 fn strategies() -> Vec<&'static str> {
-    #[allow(unused_mut)]
-    let mut s = STRATEGIES.to_vec();
-    #[cfg(feature = "scirust-retrieval")]
-    s.push("scirust-dense");
-    s
+    STRATEGIES.to_vec()
 }
 
 /// Per `(strategy, diameter)` tally: `(solved, hallucinations, covered, token_sum, n)`.
@@ -381,19 +374,6 @@ fn select(strategy: &str, task: &Task, g: &MemoryGraph, budget: usize) -> Vec<St
         "graphrag-bfs" => take_budget(bfs(g, &best_hit(task))),
         "ccos-from-query" => take_budget(region_ordered(g, &region_of(g, &best_hit(task)))),
         "ccos-region" => take_budget(region_ordered(g, &region_of(g, &task.anchor))),
-        // A *genuine* dense retriever (unlike the lexical `rag-dense` above):
-        // CCOS TF-IDF embeddings ranked by scirust-retrieval's exact, full-precision
-        // `DenseIndex`. Deterministic, so the replay invariant holds.
-        #[cfg(feature = "scirust-retrieval")]
-        "scirust-dense" => {
-            let docs: Vec<(&str, &str)> = task
-                .files
-                .iter()
-                .map(|f| (f.id.as_str(), f.text.as_str()))
-                .collect();
-            let query = task.query.iter().cloned().collect::<Vec<_>>().join(" ");
-            take_budget(crate::scirust_bridge::dense_rank(&docs, &query))
-        }
         _ => Vec::new(),
     }
 }
@@ -890,7 +870,7 @@ mod tests {
             ..Default::default()
         })
         .await;
-        // One row per strategy; the `scirust-retrieval` feature adds `scirust-dense`.
+        // One row per strategy.
         assert_eq!(report.overall.len(), strategies().len());
         assert!(report.provider.starts_with("none"));
         for s in &report.overall {

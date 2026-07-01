@@ -71,9 +71,6 @@ jobs:
       - name: Test (license + license-pq — both verifiers compose, cross-scheme isolation)
         run: cargo test --features license,license-pq --locked
 
-      - name: Test (scirust-retrieval feature — external dense-index backend + scirust-dense eval strategy)
-        run: cargo test --features llm,scirust-retrieval --locked
-
       - name: Docs
         env:
           RUSTDOCFLAGS: "-D warnings"
