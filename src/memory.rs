@@ -55,6 +55,27 @@ pub struct GraphNode {
     /// skip-if-`Stable` keeps existing snapshots byte-identical on the default path.
     #[serde(default, skip_serializing_if = "NodeState::is_stable")]
     pub state: NodeState,
+    /// **Provenance trust** in `[0, 1]`, `1.0 = fully trusted` (the default). Stamped at ingest from
+    /// the injection signal: a source that trips the injection flag, or carries a Trojan-Source /
+    /// ASCII-smuggling anomaly, gets a discounted trust so everything it produces is structurally
+    /// down-weighted in recall (via the gated `w_trust` term) — a poisoned file cannot silently
+    /// become high-authority context. Only a *flagged* source deviates from `1.0`, so clean code
+    /// keeps `1.0`; `serde(default = 1.0)` + skip-if-full-trust then keeps clean snapshots
+    /// byte-identical. Recomputed on replay from the same deterministic ingest, so `replay == live`.
+    #[serde(default = "full_trust", skip_serializing_if = "is_full_trust")]
+    pub trust: f64,
+}
+
+/// Default [`GraphNode::trust`] (fully trusted); also fills the field when an older snapshot
+/// (written before it existed) is deserialised.
+fn full_trust() -> f64 {
+    1.0
+}
+
+/// `serde` skip predicate: elide `trust` when the node is fully trusted, keeping clean snapshots
+/// byte-identical.
+fn is_full_trust(v: &f64) -> bool {
+    *v >= 1.0
 }
 
 /// Lifecycle state of a node, kept orthogonal to graph topology so a node's *health* /
@@ -248,6 +269,13 @@ pub struct ScoringWeights {
     /// existing snapshots are byte-identical.
     #[serde(default, skip_serializing_if = "CentralityMode::is_default")]
     pub centrality_mode: CentralityMode,
+    /// Weight on a node's **provenance distrust** `(1 − trust)`: a source that tripped the injection
+    /// signal (or a Trojan-Source / ASCII-smuggling anomaly) is structurally down-weighted in recall,
+    /// so poisoned context sinks below the budget. **Default `0.0`** (off) — the score is then
+    /// byte-identical to before this term existed; a deployment opts into quarantine by raising it.
+    /// `skip_serializing_if` elides it at `0.0` so existing snapshots are unchanged.
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
+    pub w_trust: f64,
     /// Geometric attenuation of failure pressure per propagation hop.
     pub failure_decay: f64,
     /// Out-degree at which a node starts **distributing** (rather than
@@ -304,6 +332,7 @@ impl Default for ScoringWeights {
             w_recency: 0.30,
             w_access: 0.05,
             w_centrality: 0.0,
+            w_trust: 0.0,
             centrality_mode: CentralityMode::InDegree,
             failure_decay: 0.8,
             failure_fanout: default_failure_fanout(),
@@ -331,6 +360,7 @@ impl ScoringWeights {
             w_recency: get("CCOS_W_RECENCY", d.w_recency),
             w_access: get("CCOS_W_ACCESS", d.w_access),
             w_centrality: get("CCOS_W_CENTRALITY", d.w_centrality),
+            w_trust: get("CCOS_W_TRUST", d.w_trust),
             // `CCOS_CENTRALITY_MODE=eigenvector` switches to the global recursive
             // centrality; anything else (or unset) keeps the in-degree default.
             centrality_mode: match std::env::var("CCOS_CENTRALITY_MODE")
@@ -836,6 +866,7 @@ impl MemoryGraph {
                     created_at: now,
                     last_accessed: now,
                     state: NodeState::Stable,
+                    trust: full_trust(),
                 };
                 self.nodes.insert(id, node);
             }
@@ -901,6 +932,86 @@ impl MemoryGraph {
             node.recency = 1.0;
             node.last_accessed = self.clock;
         }
+    }
+
+    /// A node's [provenance trust](GraphNode::trust) in `[0, 1]` (`1.0` = fully trusted / absent).
+    pub fn node_trust(&self, id: &NodeId) -> f64 {
+        self.nodes.get(id).map(|n| n.trust).unwrap_or(1.0)
+    }
+
+    /// Stamp provenance [`trust`](GraphNode::trust) (clamped to `[0, 1]`) on a node — lower = less
+    /// trusted. With the gated `w_trust` scoring term on, a low-trust node sinks in recall.
+    pub fn set_trust(&mut self, id: &NodeId, trust: f64) {
+        if let Some(node) = self.nodes.get_mut(id) {
+            node.trust = trust.clamp(0.0, 1.0);
+        }
+    }
+
+    /// Stamp `trust` on **every node produced by `file_path`** — its file node, symbols, uses and
+    /// modules (the same id family [`evict_file_nodes`](crate::incremental::IncrementalGraphEngine::evict_file_nodes)
+    /// targets). Used at ingest to taint a suspicious source's whole footprint in one call.
+    pub fn stamp_file_trust(&mut self, file_path: &str, trust: f64) {
+        let trust = trust.clamp(0.0, 1.0);
+        let prefix = format!("file:{file_path}");
+        let mod_prefix = format!("mod:{file_path}:");
+        let use_prefix = format!("use:{file_path}:");
+        let sym_prefix = format!("sym:{file_path}:");
+        for (id, node) in self.nodes.iter_mut() {
+            let s = id.0.as_str();
+            if s == prefix
+                || s.starts_with(&mod_prefix)
+                || s.starts_with(&use_prefix)
+                || s.starts_with(&sym_prefix)
+            {
+                node.trust = trust;
+            }
+        }
+    }
+
+    /// **One-hop trust propagation.** A node that depends on a low-trust node inherits an attenuated
+    /// share of the distrust, so a poisoned dependency drags down its consumers. For each directional
+    /// dependency edge `A → B` (A depends on B) with `trust[B] < 1`, lower `A`'s trust toward
+    /// `1 − (1 − trust[B]) · edge.weight · damping`. A single **bounded** hop (no cascade),
+    /// deterministic (edges in canonical order, read-then-apply so ordering cannot leak). Returns the
+    /// number of nodes whose trust dropped.
+    pub fn propagate_trust(&mut self, damping: f64) -> usize {
+        let damping = damping.clamp(0.0, 1.0);
+        let mut edges: Vec<(NodeId, NodeId, f64)> = self
+            .edges
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.edge_type,
+                    EdgeType::Calls | EdgeType::DependsOn | EdgeType::DataFlow
+                )
+            })
+            .map(|e| (e.source.clone(), e.target.clone(), e.weight))
+            .collect();
+        edges.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        // Read-only: compute the minimum inherited trust per dependent, then apply.
+        let mut updates: BTreeMap<NodeId, f64> = BTreeMap::new();
+        for (dependent, dependency, weight) in &edges {
+            let dep_trust = self.node_trust(dependency);
+            if dep_trust < 1.0 {
+                let inherited = 1.0 - (1.0 - dep_trust) * weight * damping;
+                let entry = updates
+                    .entry(dependent.clone())
+                    .or_insert_with(|| self.node_trust(dependent));
+                if inherited < *entry {
+                    *entry = inherited;
+                }
+            }
+        }
+        let mut changed = 0;
+        for (id, t) in updates {
+            if let Some(node) = self.nodes.get_mut(&id) {
+                if t < node.trust {
+                    node.trust = t.clamp(0.0, 1.0);
+                    changed += 1;
+                }
+            }
+        }
+        changed
     }
 
     /// Record an access to a node that is **already resident** — refresh its
@@ -979,7 +1090,15 @@ impl MemoryGraph {
             NodeState::Working => 0.3,
             NodeState::Orphan => -1.0,
         };
-        (base + failure + recency + access + centrality + state_bias).clamp(0.0, 1.0)
+        // Provenance-distrust penalty. Off by default (`w_trust == 0`), so this is byte-identical to
+        // before the term existed; a node from a fully-trusted source (`trust == 1`) is never
+        // penalised. When on, a suspicious source's nodes sink below the recall budget.
+        let distrust = if w.w_trust != 0.0 {
+            (1.0 - node.trust.clamp(0.0, 1.0)) * w.w_trust
+        } else {
+            0.0
+        };
+        (base + failure + recency + access + centrality + state_bias - distrust).clamp(0.0, 1.0)
     }
 
     /// In-degree of `id` among the **resident** graph — the count of incoming
@@ -5095,6 +5214,83 @@ mod tests {
     }
 
     #[test]
+    fn trust_defaults_to_full_and_is_elided_from_snapshots() {
+        let mut g = MemoryGraph::new(0.0, usize::MAX);
+        g.upsert_node("a".into(), "a".into(), String::new(), NodeType::Module);
+        assert_eq!(
+            g.node_trust(&"a".into()),
+            1.0,
+            "nodes default to fully trusted"
+        );
+        // Full trust is elided ⇒ a clean node's snapshot is byte-identical to before the field.
+        let clean = serde_json::to_string(g.node(&"a".into()).unwrap()).unwrap();
+        assert!(
+            !clean.contains("trust"),
+            "full trust is not serialized: {clean}"
+        );
+        // A discounted trust IS recorded (and an absent node reads as fully trusted).
+        g.set_trust(&"a".into(), 0.3);
+        assert!(serde_json::to_string(g.node(&"a".into()).unwrap())
+            .unwrap()
+            .contains("trust"));
+        assert_eq!(g.node_trust(&"missing".into()), 1.0);
+    }
+
+    #[test]
+    fn distrust_penalty_is_off_by_default_and_sinks_a_tainted_node() {
+        let mut g = MemoryGraph::new(0.0, usize::MAX);
+        g.upsert_node("a".into(), "a".into(), String::new(), NodeType::Module);
+        let full = g.compute_node_score(g.node(&"a".into()).unwrap());
+        g.set_trust(&"a".into(), 0.0); // fully distrusted
+                                       // w_trust == 0 (default) ⇒ scoring is byte-identical to before the term existed.
+        assert_eq!(
+            g.compute_node_score(g.node(&"a".into()).unwrap()),
+            full,
+            "distrust is off by default"
+        );
+        // Turn the gate on: a distrusted node scores strictly lower.
+        g.set_scoring_weights(ScoringWeights {
+            w_trust: 0.5,
+            ..Default::default()
+        });
+        assert!(
+            g.compute_node_score(g.node(&"a".into()).unwrap()) < full,
+            "with w_trust on, a tainted node sinks in recall"
+        );
+    }
+
+    #[test]
+    fn stamp_file_trust_and_one_hop_propagation() {
+        let mut g = MemoryGraph::new(0.0, usize::MAX);
+        for id in ["file:src/evil.rs", "file:src/user.rs"] {
+            g.upsert_node(id.into(), id.into(), String::new(), NodeType::Module);
+        }
+        // user.rs depends on evil.rs (importer → defining file).
+        g.add_edge(
+            "file:src/user.rs".into(),
+            "file:src/evil.rs".into(),
+            1.0,
+            EdgeType::DependsOn,
+        );
+        g.stamp_file_trust("src/evil.rs", 0.2);
+        assert!((g.node_trust(&"file:src/evil.rs".into()) - 0.2).abs() < 1e-9);
+        assert_eq!(
+            g.node_trust(&"file:src/user.rs".into()),
+            1.0,
+            "not yet propagated"
+        );
+        // One hop: the dependent inherits an attenuated share of the distrust.
+        assert_eq!(g.propagate_trust(0.9), 1);
+        let inherited = g.node_trust(&"file:src/user.rs".into());
+        assert!(
+            inherited < 1.0 && inherited > 0.2,
+            "attenuated, not full: {inherited}"
+        );
+        // Idempotent: a second pass changes nothing new.
+        assert_eq!(g.propagate_trust(0.9), 0);
+    }
+
+    #[test]
     fn paging_from_env_falls_back_to_defaults_when_unset() {
         // With no CCOS_PAGING_THRESHOLD / CCOS_MAX_RESIDENT set, the env constructor is identical
         // to `new` with the given defaults (the env-override convention, default-identical).
@@ -6439,6 +6635,7 @@ mod tests {
                 created_at: 0,
                 last_accessed: 0,
                 state: NodeState::Stable,
+                trust: full_trust(),
             };
             node.recency = (5 - i) as f64 * 0.1;
             graph.nodes.insert(node.id.clone(), node);

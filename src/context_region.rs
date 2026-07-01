@@ -290,6 +290,7 @@ mod tests {
             created_at: 0,
             last_accessed: 0,
             state: crate::memory::NodeState::Stable,
+            trust: 1.0,
         };
         let g = MemoryGraph::default();
         let p = ContextPoint::from_node(&node, &g, 0.5);
