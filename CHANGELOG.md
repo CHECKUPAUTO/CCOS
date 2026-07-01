@@ -8,6 +8,16 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Removed
 
+- **External dense-retrieval backend (`scirust-retrieval` feature).** Removed the optional bridge to the
+  external `scirust-retrieval` crate (`src/scirust_bridge.rs`) and its `scirust-dense` eval strategy. CI
+  could no longer authenticate to the private `CHECKUPAUTO/scirust` repo (the pinned revision became
+  unreachable), which failed `cargo clippy --all-features --locked` at **dependency resolution** on every
+  PR — before any code compiled. As the dependency was optional and off by default, removing it (dep,
+  feature, `scirust_bridge` module, `scirust-dense` eval arm, the dedicated CI step, and the lock entries)
+  unblocks the whole repo's CI without touching the default build. The **distilled, dependency-free**
+  retrieval (`src/retrieval.rs`: exact dense / BM25 / RRF / LSA over CCOS's own embeddings) is unaffected
+  and remains the moat-aligned path; the external backend can be re-added once `scirust` access is restored.
+
 - **Dead Neural Store source files (`src/brain`, `src/core`, `src/ffi`, `src/storage`) — 1065 LOC of
   uncompiled orphan code.** An unrelated-histories merge flattened a separate "Neural Store" crate
   (SIMD engine, LSM-tree, brain workers, zero-copy FFI) into `src/`, but its own `Cargo.toml`/`lib.rs`
@@ -41,23 +51,6 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   even when its name is not unique; ambiguous imports and unresolvable names still
   **resolve-uniquely-or-skip** (no guessed edge). Deterministic, no new dependencies.
 
-- **External dense-retrieval backend (`scirust-retrieval` feature).** An optional bridge to the
-  `scirust-retrieval` crate's *pure core* (`default-features = false`: no `scirust-core` autodiff/nn
-  stack — only `serde`/`sha2`, already in our tree), wiring its exact, full-precision `DenseIndex`
-  into the eval harness as a new `scirust-dense` strategy. `src/scirust_bridge.rs` adds `CcosEncoder`
-  (implements the crate's bring-your-own-embeddings `Encoder` trait over CCOS's own deterministic
-  TF-IDF vectors) and `dense_rank`, so the *same* embeddings CCOS uses can drive a full-precision
-  index instead of the INT4-quantized `nearest_k`. **Off by default → the default build is
-  byte-identical and pulls no new dependency**; the strategy also needs `llm` (the harness lives
-  there): `cargo run --features "llm,scirust-retrieval" -- eval`. Fully deterministic (the replay
-  invariant holds): the embedder is order-free and `DenseIndex::search` breaks score ties by
-  ascending id. On the offline coverage oracle (120 tasks, seed 7, 600-token budget), `scirust-dense`
-  reaches **0.858 clean / 0.225 noisy** coverage vs **0.000** for both lexical baselines
-  (`rag-dense`, `rag-hybrid`) — a genuine dense retriever far above token-overlap — while CCOS's own
-  graph/region strategies still lead at **1.000**, corroborating the causal-memory thesis rather than
-  replacing it. **Caveat:** the backend is a git dependency on `CHECKUPAUTO/scirust`; CI builds it via
-  `--all-features` (clippy/docs) and a dedicated test job, so the CI runner needs read access to that
-  repository. (ROADMAP "better retrieval".)
 - **Post-quantum Pro license verifier (`license-pq` feature / SLH-DSA, FIPS 205).** A second,
   fully independent offline license-signature verifier alongside ed25519, behind the orthogonal
   `license-pq` cargo feature. A license token can now be signed/verified with **SLH-DSA**
