@@ -124,6 +124,12 @@ pub mod lsa;
 pub mod lzss;
 pub mod mcp;
 pub mod memory;
+// Quarantined neural embedder (off-by-default `neural-embed` feature): an
+// `retrieval::Encoder` over a LOCAL Ollama-style /api/embeddings endpoint. The
+// default build compiles none of it and stays deterministic + replay-exact —
+// that is the quarantine. See the module docs and docs/NEURAL_EMBED.md.
+#[cfg(feature = "neural-embed")]
+pub mod neural_embed;
 pub mod parser;
 pub mod persist;
 pub mod postmortem;

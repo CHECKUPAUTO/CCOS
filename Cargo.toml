@@ -94,6 +94,13 @@ license-pq = ["dep:lattice-slh-dsa"]
 # **no `scirust`** (verify: `cargo tree --features slhav2 | grep scirust` → none).
 # Off by default → the default build is byte-identical. `cargo build --features slhav2`.
 slhav2 = ["dep:ccos-memory-runtime"]
+# **Quarantined neural embedder** (the paper's future-work item 1): a
+# `retrieval::Encoder` over a LOCAL Ollama-style `/api/embeddings` endpoint
+# (e.g. `nomic-embed-text`). Off by default because a neural embedder cannot
+# promise bit-exact replay (weights/server/hardware-dependent) — the flag IS the
+# quarantine. Pulls **no new crate**: only the blocking client of the `reqwest`
+# already in the tree for `llm`. Local server ⇒ nothing leaves the host.
+neural-embed = ["dep:reqwest", "reqwest/blocking"]
 
 [dev-dependencies]
 proptest = "1"
@@ -124,6 +131,12 @@ required-features = ["license"]
 [[example]]
 name = "license_sign_pq"
 required-features = ["license-pq"]
+
+# Quarantined-neural-embedder comparison — requires the `neural-embed` feature
+# (and, at runtime, a local embedding server; it degrades gracefully without one).
+[[example]]
+name = "neural_vs_lsa"
+required-features = ["neural-embed"]
 
 # ── Cargo workspace ─────────────────────────────────────────────────
 # CCOS is the root package; the opt-in SLHAv2 memory backend lives in its own
