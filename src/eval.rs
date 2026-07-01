@@ -77,6 +77,18 @@ const STRATEGIES: [&str; 6] = [
     "ccos-region",
 ];
 
+/// The strategies to evaluate. With the `scirust-retrieval` feature enabled,
+/// `scirust-dense` is appended: an exact, full-precision dense index (from the
+/// external `scirust-retrieval` crate) over CCOS's own TF-IDF embeddings, to
+/// contrast against the lexical `rag-dense` baseline and CCOS's INT4 `nearest_k`.
+fn strategies() -> Vec<&'static str> {
+    #[allow(unused_mut)]
+    let mut s = STRATEGIES.to_vec();
+    #[cfg(feature = "scirust-retrieval")]
+    s.push("scirust-dense");
+    s
+}
+
 /// Per `(strategy, diameter)` tally: `(solved, hallucinations, covered, token_sum, n)`.
 type Tally = (usize, usize, usize, f32, usize);
 
@@ -369,6 +381,19 @@ fn select(strategy: &str, task: &Task, g: &MemoryGraph, budget: usize) -> Vec<St
         "graphrag-bfs" => take_budget(bfs(g, &best_hit(task))),
         "ccos-from-query" => take_budget(region_ordered(g, &region_of(g, &best_hit(task)))),
         "ccos-region" => take_budget(region_ordered(g, &region_of(g, &task.anchor))),
+        // A *genuine* dense retriever (unlike the lexical `rag-dense` above):
+        // CCOS TF-IDF embeddings ranked by scirust-retrieval's exact, full-precision
+        // `DenseIndex`. Deterministic, so the replay invariant holds.
+        #[cfg(feature = "scirust-retrieval")]
+        "scirust-dense" => {
+            let docs: Vec<(&str, &str)> = task
+                .files
+                .iter()
+                .map(|f| (f.id.as_str(), f.text.as_str()))
+                .collect();
+            let query = task.query.iter().cloned().collect::<Vec<_>>().join(" ");
+            take_budget(crate::scirust_bridge::dense_rank(&docs, &query))
+        }
         _ => Vec::new(),
     }
 }
@@ -661,10 +686,11 @@ pub async fn run_eval(cfg: &EvalConfig) -> EvalReport {
     let scenario = if cfg.noisy { "noisy" } else { "clean" };
 
     // strategy → diameter → tally
+    let strats = strategies();
     let mut acc: BTreeMap<(String, u32), Tally> = BTreeMap::new();
     for (ti, task) in tasks.iter().enumerate() {
         let (g, _text) = build_graph(task);
-        for strat in STRATEGIES {
+        for strat in strats.iter().copied() {
             let sel = select(strat, task, &g, cfg.budget_tokens);
             let covered = task.required.iter().all(|r| sel.contains(r));
             let (prompt, toks) = assemble_prompt(task, &sel);
@@ -686,7 +712,7 @@ pub async fn run_eval(cfg: &EvalConfig) -> EvalReport {
                 "\r  [{scenario}] {}/{} tasks ({} calls each)…   ",
                 ti + 1,
                 tasks.len(),
-                STRATEGIES.len()
+                strats.len()
             );
             let _ = std::io::stderr().flush();
         }
@@ -720,7 +746,7 @@ pub async fn run_eval(cfg: &EvalConfig) -> EvalReport {
     let mut per_diameter = Vec::new();
     for &d in &cfg.diameters {
         let mut row = Vec::new();
-        for strat in STRATEGIES {
+        for strat in strats.iter().copied() {
             if let Some((s, h, c, t, n)) = acc.get(&(strat.to_string(), d)) {
                 if *n > 0 {
                     row.push(mk(*s, *h, *c, *t, *n, strat));
@@ -732,7 +758,7 @@ pub async fn run_eval(cfg: &EvalConfig) -> EvalReport {
         }
     }
     let mut overall = Vec::new();
-    for strat in STRATEGIES {
+    for strat in strats.iter().copied() {
         let (mut s, mut h, mut c, mut t, mut n) = (0, 0, 0, 0.0, 0);
         for &d in &cfg.diameters {
             if let Some((ss, hh, cc, tt, nn)) = acc.get(&(strat.to_string(), d)) {
@@ -864,7 +890,8 @@ mod tests {
             ..Default::default()
         })
         .await;
-        assert_eq!(report.overall.len(), 6);
+        // One row per strategy; the `scirust-retrieval` feature adds `scirust-dense`.
+        assert_eq!(report.overall.len(), strategies().len());
         assert!(report.provider.starts_with("none"));
         for s in &report.overall {
             assert_eq!(s.solved, 0, "offline stub solves nothing");

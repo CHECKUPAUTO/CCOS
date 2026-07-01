@@ -146,6 +146,15 @@ pub mod experiment;
 pub mod region_engine;
 pub mod region_metrics;
 
+// ── Optional external retrieval backend (scirust-retrieval) ─────────
+//
+// Off by default: the `scirust-retrieval` feature pulls the pure core of the
+// external crate and bridges CCOS's TF-IDF embeddings into its exact full-precision
+// `DenseIndex` (see the `scirust-dense` eval strategy). The default build is
+// byte-identical and pulls neither the crate nor its dependencies.
+#[cfg(feature = "scirust-retrieval")]
+pub mod scirust_bridge;
+
 // ── Core re-exports ─────────────────────────────────────────────────
 //
 // The handful of entry types a library consumer needs, lifted to the crate root
