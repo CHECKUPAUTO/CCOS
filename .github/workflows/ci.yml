@@ -7,6 +7,16 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Keep the single consolidated build's disk footprint small enough for a
+  # GitHub-hosted runner. The all-features debug build of the whole workspace —
+  # every example and test binary — was exhausting the runner disk at link time
+  # ("No space left on device" / ld Bus error). Debug info is the bulk of
+  # `target/` and is irrelevant to `clippy -D warnings`, test pass/fail, and doc
+  # builds, so stripping it (and disabling incremental artifacts) changes no
+  # result — it only shrinks `target/`.
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
 
 # A single consolidated job keeps GitHub Actions minute usage low on this private
 # repo: one checkout, one toolchain setup, and one shared `target/` so
@@ -21,6 +31,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+
+      # Reclaim ~20 GB of runner disk (large preinstalled SDKs this build never
+      # uses) so the consolidated all-features compile cannot exhaust the device.
+      # Pure shell — no third-party action, matching this workflow's policy.
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /usr/share/dotnet /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          df -h /
 
       - name: Set up Rust
         run: |
