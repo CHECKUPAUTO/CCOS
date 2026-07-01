@@ -6,6 +6,20 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Removed
+
+- **Dead Neural Store source files (`src/brain`, `src/core`, `src/ffi`, `src/storage`) — 1065 LOC of
+  uncompiled orphan code.** An unrelated-histories merge flattened a separate "Neural Store" crate
+  (SIMD engine, LSM-tree, brain workers, zero-copy FFI) into `src/`, but its own `Cargo.toml`/`lib.rs`
+  were dropped in the merge, so the files were **never wired into the crate**: not declared in
+  `lib.rs`, not in `Cargo.toml` (no `rayon` dependency despite `src/core/search.rs` importing it),
+  never referenced, and provably **not compiled** (`cargo check --all-features` passed *because* they
+  were dead). A moat audit confirmed `replay == live`, the zero-dependency / air-gappable identity, and
+  the FFI-free build were all untouched — but 1065 LOC carrying `extern "C"`, `rayon`, SIMD intrinsics,
+  and `unsafe` sat in `src/` as misleading cruft. Removed to keep the tree honest and matching CCOS's
+  deterministic, no-FFI identity. (The subsystem remains in git history if ever wanted — it would
+  return **feature-gated**, off by default, so the default build stays pure.)
+
 ### Added
 
 - **External dense-retrieval backend (`scirust-retrieval` feature).** An optional bridge to the
