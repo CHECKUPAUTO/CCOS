@@ -583,7 +583,7 @@ mod tests {
             let s = format!("s{i}");
             g.upsert_node(
                 s.clone().into(),
-                s.clone().into(),
+                s.clone(),
                 String::new(),
                 NodeType::ContextBlock,
             );

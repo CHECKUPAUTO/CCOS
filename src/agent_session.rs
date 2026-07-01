@@ -171,6 +171,23 @@ impl CustomAuthorityMap {
     }
 }
 
+/// The recorded operation a node's causal-score drift is attributed to, from
+/// [`AgentSession::attribute_drift`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct DriftCause {
+    /// The node whose trajectory was analysed.
+    pub node: String,
+    /// Absolute timeline step of the culprit operation (the `t=` index in [`AgentSession::timeline`]).
+    pub step: usize,
+    /// Signed score change across the break: positive = the node's score rose (it was pulled *into*
+    /// the working set), negative = it fell (drifted *out*).
+    pub delta: f64,
+    /// The CUSUM statistic — how pronounced the level shift is.
+    pub cusum: f64,
+    /// The human-readable journal line for the culprit operation.
+    pub op: String,
+}
+
 /// An event-sourced agent memory session: every operation is recorded so the
 /// state is replayable and auditable. See the [module docs](crate::agent_session).
 pub struct AgentSession {
@@ -920,6 +937,55 @@ impl AgentSession {
         }
     }
 
+    /// **Causal-of-drift attribution.** Reconstruct a node's causal-score trajectory across the
+    /// replayable history — [`replay_to`](Self::replay_to) at every step — then locate the single
+    /// most pronounced level shift with a deterministic CUSUM change-point
+    /// ([`crate::drift::changepoint`]) and charge it to the recorded operation applied at that step.
+    /// Turns the post-mortem's descriptive "score drifted" into "op *X* moved it, by Δ, at step *k*".
+    ///
+    /// Returns `None` when the node never drifts (a flat trajectory) or the break falls **below the
+    /// compaction floor** (those ops are folded into the baseline and are no longer individually
+    /// attributable — reported honestly rather than mis-charged). Read-only and deterministic (built
+    /// purely from `replay_to`, which is byte-reproducible), so it adds no snapshot state and
+    /// `replay == live` is untouched. Offline by nature: it does one replay per step, so keep it to
+    /// the post-mortem path, not a hot loop. A capability a stateless retriever cannot have — it has
+    /// no per-item trajectory and no operation log to attribute a change to.
+    pub fn attribute_drift(&self, node: &str) -> Option<DriftCause> {
+        let id = crate::memory::NodeId(node.to_string());
+        let n = self.len();
+        // The node's score at each step of the replayable history (0 ops … n ops).
+        let mut series = Vec::with_capacity(n + 1);
+        for step in 0..=n {
+            let mem = self.replay_to(step);
+            let g = mem.graph();
+            let s = g
+                .node(&id)
+                .map(|gn| g.compute_node_score(gn))
+                .unwrap_or(0.0);
+            series.push(s);
+        }
+        let cp = crate::drift::changepoint(&series)?;
+        // `series[k]` is the state after `k` ops, so the shift into `series[cp.index]` was caused by
+        // the op at absolute step `cp.index` (the timeline lists it as `t=<index>`).
+        let step = cp.index;
+        if step <= self.folded {
+            return None; // below the compaction floor: the culprit op is no longer retained
+        }
+        let op = self.timeline().into_iter().find(|l| {
+            l.strip_prefix("t=")
+                .and_then(|r| r.split_whitespace().next())
+                .and_then(|x| x.parse::<usize>().ok())
+                == Some(step)
+        })?;
+        Some(DriftCause {
+            node: node.to_string(),
+            step,
+            delta: cp.delta,
+            cusum: cp.cusum,
+            op,
+        })
+    }
+
     /// A human-readable journal of the cognitive timeline. If compaction has folded
     /// older ops into the baseline, a leading marker stands in for them (their
     /// details are no longer retained); the live tail follows at its absolute step.
@@ -984,6 +1050,62 @@ mod tests {
         );
         s.signal_failure("file:src/api.rs", 3).unwrap();
         s
+    }
+
+    #[test]
+    fn attribute_drift_charges_a_score_move_to_a_real_op_deterministically() {
+        let s = chain_session();
+        // api.rs's causal score moves over the history (it is created, then the failure lands on it).
+        let cause = s
+            .attribute_drift("file:src/api.rs")
+            .expect("api.rs has a non-flat score trajectory");
+        assert!(
+            (1..=s.len()).contains(&cause.step),
+            "attributed to a real timeline step: {}",
+            cause.step
+        );
+        // The change-point → op wiring is exact: the culprit line is the timeline op at that step.
+        assert!(
+            cause.op.starts_with(&format!("t={}", cause.step)),
+            "op line matches the attributed step: {}",
+            cause.op
+        );
+        assert!(cause.delta.abs() > 0.0, "a real level shift was found");
+        // Read-only and reconstructed from replay ⇒ byte-identical every call (replay == live).
+        assert_eq!(
+            s.attribute_drift("file:src/api.rs"),
+            Some(cause),
+            "attribution is deterministic"
+        );
+        // A node that never existed has no trajectory to attribute.
+        assert!(s.attribute_drift("file:src/nope.rs").is_none());
+    }
+
+    #[test]
+    fn attribute_drift_pins_a_late_failure_on_the_failure_op() {
+        // Keep a node flat for a long plateau (read-only recalls do not move its score), then land a
+        // direct failure. With the plateau dominating the mean, the CUSUM break falls on the failure.
+        let mut s = AgentSession::new();
+        s.ingest("src/a.rs", "pub fn a() -> i64 { 0 }\n"); // t1: a appears
+        for _ in 0..12 {
+            s.recall(Recall::working_set(), 512); // t2..t13: recorded, read-only ⇒ a stays flat
+        }
+        let fail_step = s.len() + 1;
+        s.signal_failure("file:src/a.rs", 0).unwrap(); // final op: a's score jumps
+        let cause = s
+            .attribute_drift("file:src/a.rs")
+            .expect("a.rs drifts on the failure");
+        assert_eq!(
+            cause.step, fail_step,
+            "the score shift is charged to the failure op, not the ingest (op = {})",
+            cause.op
+        );
+        assert!(
+            cause.op.contains("SignalFailure"),
+            "culprit is the failure: {}",
+            cause.op
+        );
+        assert!(cause.delta > 0.0, "failure pressure raises the score");
     }
 
     // ── slice C: self-improving retrieval from the replayable log ─────────────
