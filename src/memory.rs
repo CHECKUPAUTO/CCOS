@@ -2322,10 +2322,12 @@ impl MemoryGraph {
     /// link contributes little and `B`'s induced belief is always weaker than `A`'s. Self-loops and
     /// unresolved causes (`belief` near `0`) are skipped.
     ///
-    /// **One hop only** in this slice: the derived edges are not themselves propagated onward — a
-    /// chain `A → B → C` needs a second call. Multi-hop propagation with damping-to-convergence and a
-    /// scheduler (to bound the cascade) is a later slice, as is recording it as a replayable op when
-    /// wired into the agent loop. Deterministic: candidates are collected read-only, **sorted**, then
+    /// **One hop only** in this call: the derived edges are not themselves propagated onward — a
+    /// chain `A → B → C` needs a second call.
+    /// [`propagate_beliefs_converge`](Self::propagate_beliefs_converge) runs this sweep to a bounded
+    /// fixpoint so the whole chain revises in a single call; a priority scheduler (topological order,
+    /// fewer rounds) and recording it as a replayable `Op::Propagate` when wired into the agent loop
+    /// remain later slices. Deterministic: candidates are collected read-only, **sorted**, then
     /// added (so iteration order cannot leak in) and [`add_edge`](Self::add_edge) dedups, so the pass
     /// is **idempotent**. Returns the number of derived edges added. `resolve_threshold` is clamped to
     /// `[0.0, 1.0]` (a distance from the neutral `0`), `damping` to `[0.0, 1.0]`.
@@ -2364,6 +2366,44 @@ impl MemoryGraph {
             }
         }
         added
+    }
+
+    /// **Multi-hop belief propagation to a bounded fixpoint.** Repeatedly applies the single
+    /// [`propagate_beliefs`](Self::propagate_beliefs) sweep until it **converges** — a round derives
+    /// no new edge — or `max_rounds` is reached. Each sweep advances the belief wavefront exactly one
+    /// causal hop (round *k* resolves a claim *k* `Causes`-hops downstream of a resolved cause), so a
+    /// chain `A → B → C` fully revises in one call instead of a manual sweep per hop — the belief
+    /// revision a static evidence store cannot do, now across the *whole* causal chain.
+    ///
+    /// The attenuation is what makes it safe: every hop multiplies the induced weight by
+    /// `damping · |belief| < 1`, so a claim's inherited belief shrinks each hop and the wavefront
+    /// **stops on its own** once it falls below `resolve_threshold` — a single resolved source cannot
+    /// cascade into a storm.
+    ///
+    /// Deterministic and guaranteed to terminate. Every round reuses `propagate_beliefs`'
+    /// collect → sort → dedup → [`add_edge`](Self::add_edge) discipline, and `add_edge` dedups on
+    /// `(source, target, type)` (weight is not a key), so once a derived edge exists re-deriving it
+    /// is a no-op — which makes "a round added zero new edges" a well-defined **fixpoint**. Since
+    /// each directed `(cause, effect, polarity)` triple derives at most one edge, the total work is
+    /// bounded no matter how large `max_rounds` is; the cap only backstops a `Causes` **cycle**,
+    /// where mutual causation could otherwise keep re-resolving. Returns the total number of derived
+    /// edges added across all rounds. `resolve_threshold` and `damping` are clamped per sweep by
+    /// `propagate_beliefs`.
+    pub fn propagate_beliefs_converge(
+        &mut self,
+        resolve_threshold: f64,
+        damping: f64,
+        max_rounds: usize,
+    ) -> usize {
+        let mut total = 0;
+        for _ in 0..max_rounds {
+            let added = self.propagate_beliefs(resolve_threshold, damping);
+            if added == 0 {
+                break; // fixpoint: this sweep derived nothing new
+            }
+            total += added;
+        }
+        total
     }
 
     /// The evidence nodes pointing at `claim` with a given **polarity** —
@@ -4657,6 +4697,110 @@ mod tests {
         );
         let (_, _, belief2) = build();
         assert_eq!(belief, belief2, "deterministic across rebuilds");
+    }
+
+    /// The multi-hop fixture: `A → B → C` (`Causes`), `A` resolved-true (belief +0.75), `B` and `C`
+    /// carrying no direct evidence of their own.
+    fn belief_chain() -> MemoryGraph {
+        let mut g = MemoryGraph::new(0.0, usize::MAX);
+        add_evidence(&mut g, "A", 3, 0); // belief +0.75
+        for c in ["B", "C"] {
+            g.upsert_node(c.into(), c.into(), String::new(), NodeType::ContextBlock);
+        }
+        g.add_edge("A".into(), "B".into(), 1.0, EdgeType::Causes);
+        g.add_edge("B".into(), "C".into(), 1.0, EdgeType::Causes);
+        g
+    }
+
+    #[test]
+    fn converge_resolves_a_chain_where_one_hop_stops() {
+        // Low threshold + high damping keep the induced belief above the resolve bar for two hops,
+        // so convergence resolves BOTH B and C — one derived edge per hop.
+        let mut g = belief_chain();
+        let total = g.propagate_beliefs_converge(0.2, 0.9, 8);
+        assert_eq!(total, 2, "one derived edge per hop: A→B then B→C");
+        assert!(g.qbelief(&"B".into()).belief > 0.0, "B inherits from A");
+        assert!(
+            g.qbelief(&"C".into()).belief > 0.0,
+            "C inherits belief two hops from A under convergence"
+        );
+
+        // Contrast: a single sweep resolves only the direct effect B; C is never reached.
+        let mut one = belief_chain();
+        assert_eq!(one.propagate_beliefs(0.2, 0.9), 1);
+        assert_eq!(
+            one.qbelief(&"C".into()).belief,
+            0.0,
+            "single hop stops at B; C stays neutral"
+        );
+    }
+
+    #[test]
+    fn converge_reaches_a_fixpoint_and_is_idempotent() {
+        let mut g = belief_chain();
+        let first = g.propagate_beliefs_converge(0.2, 0.9, 8);
+        assert!(first > 0, "the first convergence derives edges");
+        let second = g.propagate_beliefs_converge(0.2, 0.9, 8);
+        assert_eq!(
+            second, 0,
+            "at the fixpoint, re-converging derives nothing new"
+        );
+    }
+
+    #[test]
+    fn converge_halts_when_belief_attenuates_below_threshold() {
+        // A high threshold: B's inherited belief (~0.31) never clears 0.7, so the wavefront stops at
+        // B exactly as a single hop would — attenuation bounds the cascade without the round cap.
+        let mut g = belief_chain();
+        let total = g.propagate_beliefs_converge(0.7, 0.6, 8);
+        assert_eq!(
+            total, 1,
+            "only A→B; B never resolves, so C is never reached"
+        );
+        assert!(g.qbelief(&"B".into()).belief > 0.0);
+        assert_eq!(
+            g.qbelief(&"C".into()).belief,
+            0.0,
+            "the wavefront halts below threshold"
+        );
+    }
+
+    #[test]
+    fn converge_terminates_on_a_causes_cycle() {
+        // Mutual causation A → B → A with A resolved. Convergence must TERMINATE: each directed
+        // (cause, effect, polarity) triple derives at most one edge, so the cycle cannot spin — the
+        // max_rounds cap is only a backstop.
+        let mut g = MemoryGraph::new(0.0, usize::MAX);
+        add_evidence(&mut g, "A", 3, 0);
+        g.upsert_node(
+            "B".into(),
+            "B".into(),
+            String::new(),
+            NodeType::ContextBlock,
+        );
+        g.add_edge("A".into(), "B".into(), 1.0, EdgeType::Causes);
+        g.add_edge("B".into(), "A".into(), 1.0, EdgeType::Causes);
+        let total = g.propagate_beliefs_converge(0.2, 0.9, 8);
+        assert!(
+            total <= 2,
+            "each directed causal pair derives at most one edge; the cycle cannot spin (got {total})"
+        );
+        // Idempotent even through the cycle.
+        assert_eq!(g.propagate_beliefs_converge(0.2, 0.9, 8), 0);
+    }
+
+    #[test]
+    fn converge_is_bit_deterministic_across_rebuilds() {
+        let mut a = belief_chain();
+        let ta = a.propagate_beliefs_converge(0.2, 0.9, 8);
+        let mut b = belief_chain();
+        let tb = b.propagate_beliefs_converge(0.2, 0.9, 8);
+        assert_eq!(ta, tb, "same edge count across rebuilds");
+        assert_eq!(
+            a.qbelief(&"C".into()).belief.to_bits(),
+            b.qbelief(&"C".into()).belief.to_bits(),
+            "the converged belief is bit-identical across runs (replay == live holds)"
+        );
     }
 
     #[test]
