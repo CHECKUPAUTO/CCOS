@@ -117,6 +117,7 @@ pub mod hashing_tokenizer;
 pub mod incremental;
 pub mod injection_classifier;
 pub mod license;
+pub mod lingam;
 #[cfg(feature = "llm")]
 pub mod llm;
 pub mod lsa;

@@ -1009,6 +1009,37 @@ impl AgentSession {
         crate::dtw::align(&mine, &theirs, divergence_threshold)
     }
 
+    /// **Fork the timeline** at `step`: a new, independent session whose history is this one's
+    /// baseline plus `ops[..step]`, and whose live memory is exactly [`replay_to(step)`](Self::replay_to).
+    /// Append *counterfactual* operations to the branch through the ordinary public API
+    /// (`ingest` / `signal_failure` / `assert_support` / …) — they are recorded as real ops on the
+    /// branch's own op-log, so `replay == live` holds for the alternate history **by construction**
+    /// (no op parser, no new replay machinery). Compare the two worlds with
+    /// [`align_node_trajectory`](Self::align_node_trajectory) — together they are the
+    /// *branch-and-align* primitive: "what if the failure had landed earlier / the assertion had
+    /// never been made?", answered replayably.
+    ///
+    /// The trunk is untouched (history stays append-only and tamper-evident); the branch is
+    /// **in-memory** (`oplog_path = None`), so a checkpoint of the branch can never clobber the
+    /// trunk's sidecar — persist it explicitly to a new path if wanted. `step` is clamped to
+    /// `[compaction floor, len]`: ops folded into the baseline cannot be forked *within* (their
+    /// individual effects are no longer retained — the same honesty as `replay_to`). A stateless
+    /// retriever has one corpus and no history: it cannot fork, inject, and replay a divergent past.
+    pub fn fork_at(&self, step: usize) -> AgentSession {
+        let step = step.min(self.len()).max(self.folded);
+        let tail = step - self.folded;
+        AgentSession {
+            live: self.replay_to(step),
+            ops: self.ops[..tail].to_vec(),
+            baseline: self.baseline.clone(),
+            folded: self.folded,
+            oplog_path: None,
+            compressor: CausalCompressor::new(),
+            licensing: self.licensing.clone(),
+            custom_authorities: self.custom_authorities.clone(),
+        }
+    }
+
     /// A human-readable journal of the cognitive timeline. If compaction has folded
     /// older ops into the baseline, a leading marker stands in for them (their
     /// details are no longer retained); the live tail follows at its absolute step.
@@ -1153,6 +1184,54 @@ mod tests {
         let self_al = a.align_node_trajectory(&a, "file:src/a.rs", 0.1);
         assert_eq!(self_al.distance, 0.0);
         assert!(self_al.divergence.is_none());
+    }
+
+    #[test]
+    fn fork_reconstructs_the_past_and_leaves_the_trunk_untouched() {
+        let trunk = chain_session(); // 3 ingests + a failure (len 4)
+        let trunk_len = trunk.len();
+        // Fork before the failure: the branch's history is exactly the first 3 ops.
+        let branch = trunk.fork_at(3);
+        assert_eq!(branch.len(), 3);
+        // Its live state matches the trunk's replay at that step (same working-set trajectory).
+        assert_eq!(
+            branch.score_trajectory("file:src/api.rs"),
+            trunk.score_trajectory("file:src/api.rs")[..=3].to_vec(),
+            "the branch's history is the trunk's prefix"
+        );
+        // The trunk is untouched by forking.
+        assert_eq!(trunk.len(), trunk_len);
+        // Clamping: beyond len collapses to len; a fresh session's floor is 0.
+        assert_eq!(trunk.fork_at(999).len(), trunk_len);
+    }
+
+    #[test]
+    fn branch_and_align_a_counterfactual_history() {
+        // The full primitive: fork the real history before its failure, inject a DIFFERENT
+        // counterfactual op, and DTW-align the two worlds to find where they diverge.
+        let trunk = chain_session(); // ...ends with signal_failure(api.rs)
+        let mut branch = trunk.fork_at(3); // just before the failure
+        branch.signal_failure("file:src/db.rs", 3).unwrap(); // counterfactual: the failure lands on db instead
+                                                             // The counterfactual op is a REAL op on the branch's log ⇒ replay == live for the branch.
+        assert_eq!(branch.len(), 4);
+        assert_eq!(
+            branch.score_trajectory("file:src/db.rs"),
+            branch.score_trajectory("file:src/db.rs"),
+            "branch trajectories are deterministic"
+        );
+        // The two worlds diverge on db.rs (pressured only in the branch).
+        let al = trunk.align_node_trajectory(&branch, "file:src/db.rs", 0.05);
+        assert!(
+            al.divergence.is_some(),
+            "the counterfactual failure moves db.rs differently: dist={}",
+            al.distance
+        );
+        // And the trunk's own history still ends with the REAL failure (append-only, untouched).
+        assert!(trunk
+            .timeline()
+            .last()
+            .unwrap()
+            .contains("SignalFailure(file:src/api.rs"));
     }
 
     // ── slice C: self-improving retrieval from the replayable log ─────────────
