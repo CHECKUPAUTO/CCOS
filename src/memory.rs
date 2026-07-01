@@ -2406,6 +2406,159 @@ impl MemoryGraph {
         total
     }
 
+    /// **`do(X)` — the interventional impact of changing `origin`.** Returns the nodes that
+    /// (transitively) **depend on** `origin` — the ones a change to it structurally forces — each
+    /// weighted by the attenuated strength of the dependency path. This is a Pearl-style intervention,
+    /// not a similarity query: `origin`'s own inputs are *severed* (it is pinned to `magnitude` and
+    /// never re-driven), and impact flows strictly to its dependents.
+    ///
+    /// In CCOS's edge convention an edge `A → B` means **A depends on B** (`propagate_failure` walks
+    /// out-edges as "downstream dependencies"; the reverse are the "upstream causes / callers"). So
+    /// `do(X)` walks **in-edges** of the directional dependency subset ([`Calls`](EdgeType::Calls) /
+    /// [`DependsOn`](EdgeType::DependsOn) / [`DataFlow`](EdgeType::DataFlow)): the callers/importers of
+    /// `origin`, then *their* callers, up to `max_depth` hops, attenuating by `damping < 1` per hop.
+    ///
+    /// Bounded and always-terminating (a fixed `max_depth` wavefront, `origin` severed each round so a
+    /// dependency cycle cannot re-drive it) and deterministic (edges iterated in canonical
+    /// `(source, target)` order, impact accumulated in a [`BTreeMap`] — no `HashMap` order leaks in).
+    /// Read-only: it mutates nothing, so it is `derived-not-stored` and `replay == live` is untouched.
+    /// Returns `(node, impact)` pairs (excluding `origin`), sorted by impact descending then id. A
+    /// probabilistic retriever has no such operator — it cannot sever a variable's inputs and
+    /// enumerate the set its change forces.
+    pub fn intervene(
+        &self,
+        origin: &NodeId,
+        magnitude: f64,
+        damping: f64,
+        max_depth: usize,
+    ) -> Vec<(NodeId, f64)> {
+        if !self.nodes.contains_key(origin) {
+            return Vec::new();
+        }
+        let damping = damping.clamp(0.0, 1.0);
+        let orphan = |id: &NodeId| {
+            self.nodes
+                .get(id)
+                .map(|n| n.state == NodeState::Orphan)
+                .unwrap_or(true)
+        };
+        // The directional dependency edges, in canonical order, both endpoints live.
+        let mut dep_edges: Vec<&GraphEdge> = self
+            .edges
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.edge_type,
+                    EdgeType::Calls | EdgeType::DependsOn | EdgeType::DataFlow
+                ) && !orphan(&e.source)
+                    && !orphan(&e.target)
+            })
+            .collect();
+        dep_edges.sort_by(|a, b| a.source.cmp(&b.source).then(a.target.cmp(&b.target)));
+
+        let mut impact: BTreeMap<NodeId, f64> = BTreeMap::new();
+        let mut current: BTreeMap<NodeId, f64> = BTreeMap::new();
+        current.insert(origin.clone(), magnitude.max(0.0));
+        for _ in 0..max_depth {
+            let mut next: BTreeMap<NodeId, f64> = BTreeMap::new();
+            for e in &dep_edges {
+                // `e.source` depends on `e.target`; if the target carries impact, its dependent
+                // (the source, a caller/importer) is forced by it.
+                if let Some(&mass) = current.get(&e.target) {
+                    let contrib = mass * e.weight * damping;
+                    if contrib > 0.0 {
+                        *next.entry(e.source.clone()).or_insert(0.0) += contrib;
+                    }
+                }
+            }
+            next.remove(origin); // severed: the intervened node is never re-driven (cycle-safe)
+            if next.is_empty() {
+                break;
+            }
+            for (n, add) in &next {
+                *impact.entry(n.clone()).or_insert(0.0) += add;
+            }
+            current = next;
+        }
+        let mut out: Vec<(NodeId, f64)> = impact.into_iter().collect();
+        out.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        out
+    }
+
+    /// **`blame(X)` — the candidate root causes of a failure at `origin`.** The dual of
+    /// [`intervene`](Self::intervene): where `do(X)` walks *in-edges* to find what **depends on** `X`,
+    /// `blame` walks *out-edges* of the same directional dependency subset ([`Calls`](EdgeType::Calls)
+    /// / [`DependsOn`](EdgeType::DependsOn) / [`DataFlow`](EdgeType::DataFlow)) to find what `X`
+    /// **depends on** — its transitive dependencies, the nodes a bug in `X` could actually live in.
+    /// This is the differentiated bug-resolution direction: the culprit of a symptom is usually an
+    /// upstream dependency of low similarity, which a cosine retriever ranks poorly and a directed
+    /// dependency walk ranks first.
+    ///
+    /// Same guarantees as [`intervene`](Self::intervene): bounded (`max_depth` wavefront, `origin`
+    /// severed so a cycle cannot re-drive it), deterministic (canonical edge order, [`BTreeMap`]
+    /// accumulation), and read-only. Returns `(node, weight)` pairs (excluding `origin`), sorted by
+    /// weight descending then id.
+    pub fn blame(&self, origin: &NodeId, damping: f64, max_depth: usize) -> Vec<(NodeId, f64)> {
+        if !self.nodes.contains_key(origin) {
+            return Vec::new();
+        }
+        let damping = damping.clamp(0.0, 1.0);
+        let orphan = |id: &NodeId| {
+            self.nodes
+                .get(id)
+                .map(|n| n.state == NodeState::Orphan)
+                .unwrap_or(true)
+        };
+        let mut dep_edges: Vec<&GraphEdge> = self
+            .edges
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.edge_type,
+                    EdgeType::Calls | EdgeType::DependsOn | EdgeType::DataFlow
+                ) && !orphan(&e.source)
+                    && !orphan(&e.target)
+            })
+            .collect();
+        dep_edges.sort_by(|a, b| a.source.cmp(&b.source).then(a.target.cmp(&b.target)));
+
+        let mut blame: BTreeMap<NodeId, f64> = BTreeMap::new();
+        let mut current: BTreeMap<NodeId, f64> = BTreeMap::new();
+        current.insert(origin.clone(), 1.0);
+        for _ in 0..max_depth {
+            let mut next: BTreeMap<NodeId, f64> = BTreeMap::new();
+            for e in &dep_edges {
+                // Forward along a dependency: if `e.source` carries blame, its dependency `e.target`
+                // (what it relies on) is a candidate cause.
+                if let Some(&mass) = current.get(&e.source) {
+                    let contrib = mass * e.weight * damping;
+                    if contrib > 0.0 {
+                        *next.entry(e.target.clone()).or_insert(0.0) += contrib;
+                    }
+                }
+            }
+            next.remove(origin);
+            if next.is_empty() {
+                break;
+            }
+            for (n, add) in &next {
+                *blame.entry(n.clone()).or_insert(0.0) += add;
+            }
+            current = next;
+        }
+        let mut out: Vec<(NodeId, f64)> = blame.into_iter().collect();
+        out.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        out
+    }
+
     /// The evidence nodes pointing at `claim` with a given **polarity** —
     /// [`EdgeType::Supports`] for the affirmative surface, [`EdgeType::Contradicts`] for the
     /// negative one. Returned **sorted and deduped**, so the surface is deterministic. A
@@ -4801,6 +4954,111 @@ mod tests {
             b.qbelief(&"C".into()).belief.to_bits(),
             "the converged belief is bit-identical across runs (replay == live holds)"
         );
+    }
+
+    /// A call chain `api → repo → db` (each node depends on the next): `api` calls `repo` calls `db`.
+    fn dependency_chain() -> MemoryGraph {
+        let mut g = MemoryGraph::new(0.0, usize::MAX);
+        for n in ["api", "repo", "db"] {
+            g.upsert_node(n.into(), n.into(), String::new(), NodeType::Module);
+        }
+        g.add_edge("api".into(), "repo".into(), 1.0, EdgeType::Calls); // api depends on repo
+        g.add_edge("repo".into(), "db".into(), 1.0, EdgeType::Calls); // repo depends on db
+        g
+    }
+
+    #[test]
+    fn intervene_reaches_dependents_not_dependencies() {
+        let g = dependency_chain();
+        // do(db): repo (1 hop) and api (2 hops) depend on db, so both are impacted…
+        let impact = g.intervene(&"db".into(), 1.0, 0.8, 4);
+        let m = |name: &str| {
+            impact
+                .iter()
+                .find(|(n, _)| n.0 == name)
+                .map(|(_, v)| *v)
+                .unwrap_or(0.0)
+        };
+        assert!(
+            m("repo") > 0.0 && m("api") > 0.0,
+            "dependents of db are impacted"
+        );
+        assert!(
+            m("repo") > m("api"),
+            "the closer dependent feels a larger impact ({} vs {})",
+            m("repo"),
+            m("api")
+        );
+        assert!(
+            !impact.iter().any(|(n, _)| n.0 == "db"),
+            "the intervened node is excluded from its own impact set"
+        );
+        // …but do(api) forces nothing: nothing depends on the top of the chain.
+        assert!(
+            g.intervene(&"api".into(), 1.0, 0.8, 4).is_empty(),
+            "a change to the top-level caller forces no dependents"
+        );
+    }
+
+    #[test]
+    fn intervene_is_depth_bounded() {
+        let g = dependency_chain();
+        // One hop reaches only the direct dependent (repo), not api two hops away.
+        let one = g.intervene(&"db".into(), 1.0, 0.8, 1);
+        assert!(one.iter().any(|(n, _)| n.0 == "repo"));
+        assert!(
+            !one.iter().any(|(n, _)| n.0 == "api"),
+            "depth 1 stops at repo"
+        );
+    }
+
+    #[test]
+    fn intervene_terminates_on_a_cycle_and_is_deterministic() {
+        let mut g = MemoryGraph::new(0.0, usize::MAX);
+        for n in ["a", "b"] {
+            g.upsert_node(n.into(), n.into(), String::new(), NodeType::Module);
+        }
+        g.add_edge("a".into(), "b".into(), 1.0, EdgeType::Calls);
+        g.add_edge("b".into(), "a".into(), 1.0, EdgeType::Calls); // a mutual-dependency cycle
+                                                                  // Terminates (the test completing proves it) and is byte-identical run to run.
+        let i1 = g.intervene(&"a".into(), 1.0, 0.5, 8);
+        let i2 = g.intervene(&"a".into(), 1.0, 0.5, 8);
+        assert_eq!(i1, i2, "deterministic under a cycle");
+        assert!(
+            i1.iter().any(|(n, _)| n.0 == "b"),
+            "b depends on a ⇒ impacted"
+        );
+        // An absent origin has no impact set.
+        assert!(g.intervene(&"ghost".into(), 1.0, 0.5, 4).is_empty());
+    }
+
+    #[test]
+    fn blame_reaches_dependencies_the_dual_of_intervene() {
+        let g = dependency_chain(); // api → repo → db
+        let b = g.blame(&"api".into(), 0.8, 4);
+        let w = |name: &str| {
+            b.iter()
+                .find(|(n, _)| n.0 == name)
+                .map(|(_, v)| *v)
+                .unwrap_or(0.0)
+        };
+        // api depends on repo (1 hop) and db (2 hops) — its candidate root causes.
+        assert!(
+            w("repo") > 0.0 && w("db") > 0.0,
+            "dependencies of api are blamed"
+        );
+        assert!(w("repo") > w("db"), "the nearer dependency ranks first");
+        // db is a leaf dependency ⇒ nothing to blame beneath it.
+        assert!(g.blame(&"db".into(), 0.8, 4).is_empty());
+        // Exact duality: do(db) reaches api (dependent); blame(api) reaches db (dependency).
+        assert!(g
+            .intervene(&"db".into(), 1.0, 0.8, 4)
+            .iter()
+            .any(|(n, _)| n.0 == "api"));
+        assert!(g
+            .blame(&"api".into(), 0.8, 4)
+            .iter()
+            .any(|(n, _)| n.0 == "db"));
     }
 
     #[test]
