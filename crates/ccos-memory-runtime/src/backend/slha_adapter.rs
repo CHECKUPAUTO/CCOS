@@ -5,8 +5,9 @@
 //! This adapter is **self-contained**: it knows the 128-byte SLHAv2 tile ABI and
 //! decodes it with its own minimal grouped-INT4 logic, so it does **not** depend
 //! on `scirust`. CCOS therefore works without scirust, and so does this SLHA
-//! option. (Exact kernel parity + NF4 could be added later as an opt-in
-//! `scirust-kernel` feature — off by default — but is not required here.)
+//! option. (For bit-exact kernel parity + NF4, apply the opt-in patch in
+//! `INTEGRATION.md` → "Optional exact-kernel decode" — it pulls `scirust` and is
+//! meant for the standalone SLHA build, not CCOS.)
 //!
 //! # Isolation
 //! All SLHAv2 knowledge is confined to this module; the public surface exposes
@@ -209,8 +210,8 @@ impl MemoryProvider for SlhaAdapter {
 // ── self-contained SLHAv2 tile logic — no dependencies, no `unsafe` ───────────
 
 /// Grouped-INT4 latent decode: `value(d) = (nibble(d) − 8) · scale ·
-/// group_scales[d/16] / 255`. Self-contained; for exact kernel parity / NF4 use
-/// the (future, opt-in) `scirust-kernel` path.
+/// group_scales[d/16] / 255`. Self-contained; for exact kernel parity / NF4 see
+/// the `scirust-kernel` opt-in patch in `INTEGRATION.md`.
 fn decode_latent(b: &[u8; 128]) -> [f32; 128] {
     let scale = read_f32(b, OFF_SCALE);
     let mut out = [0.0f32; 128];
@@ -218,8 +219,7 @@ fn decode_latent(b: &[u8; 128]) -> [f32; 128] {
         let byte = b[OFF_LATENT + d / 2];
         let nibble = if d % 2 == 0 { byte & 0x0F } else { byte >> 4 };
         let group_scale = b[OFF_GROUPS + d / GROUP_DIM] as f32;
-        let eff = scale * group_scale / 255.0;
-        *slot = (nibble as i32 - 8) as f32 * eff;
+        *slot = (nibble as i32 - 8) as f32 * (scale * group_scale / 255.0);
     }
     out
 }

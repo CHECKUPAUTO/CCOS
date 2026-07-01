@@ -94,9 +94,58 @@ Commit on a feature branch and open a **draft** PR:
   runtime license flag `Feature::SlhAv2Embeddings`, rename the Cargo feature to
   `slha-backend` consistently (manifest only).
 
-## Optional future extension (do NOT enable now)
+## Optional: exact-kernel decode (`scirust-kernel`) — STANDALONE SLHA build only
 
-If exact kernel parity (bit-identical dequant, NF4 codebook, SIMD scoring) is
-ever wanted, add an **opt-in** `scirust-kernel` feature that pulls `scirust` and
-routes `decode_latent` through `scirust::…::dequant_latent`. It must remain
-**off by default** so the zero-dependency guarantee holds.
+**Do NOT apply this when integrating into CCOS.** Declaring `scirust` — even as an
+*optional* dependency — pulls it into CCOS's resolution graph and breaks the
+"CCOS builds without scirust" guarantee. Use it only when building
+`ccos-memory-runtime` on its own and you want bit-exact kernel parity + the NF4
+codebook. This variant is verified: `cargo test --features scirust-kernel` → 5/5,
+`cargo tree` = crate only by default, crate + scirust with the feature.
+
+1. `Cargo.toml` — add the optional dep + feature:
+   ```toml
+   [dependencies]
+   scirust = { git = "https://github.com/CHECKUPAUTO/SLHAv2", optional = true }
+
+   [features]
+   default = []
+   scirust-kernel = ["dep:scirust"]
+   ```
+
+2. In `src/backend/slha_adapter.rs`, cfg-split `decode_latent` and add a tile
+   reconstructor (move `const GROUP_DIM` into the non-feature `decode_latent`, or
+   `#[cfg(not(feature = "scirust-kernel"))]`-gate it, so it isn't unused):
+   ```rust
+   #[cfg(not(feature = "scirust-kernel"))]
+   fn decode_latent(b: &[u8; 128]) -> [f32; 128] { /* existing self-contained body */ }
+
+   #[cfg(feature = "scirust-kernel")]
+   fn decode_latent(b: &[u8; 128]) -> [f32; 128] { tile_from_payload(b).dequant_latent() }
+
+   #[cfg(feature = "scirust-kernel")]
+   fn tile_from_payload(b: &[u8; 128]) -> scirust::attention::slha_v2::SciRustSlhaTile {
+       use scirust::attention::slha_v2::SciRustSlhaTile;
+       const OFF_TOKEN: usize = OFF_SIGMA + 4;
+       const OFF_POS: usize = OFF_TOKEN + 4;
+       const OFF_HEAD: usize = OFF_POS + 4;
+       let mut latent_kv = [0u8; LATENT_BYTES];
+       latent_kv.copy_from_slice(&b[OFF_LATENT..OFF_LATENT + LATENT_BYTES]);
+       let mut residual_bitmap = [0u64; RESIDUAL_WORDS];
+       for (w, c) in residual_bitmap.iter_mut().zip(b[OFF_RESIDUAL..OFF_SCALE].chunks_exact(8)) {
+           *w = u64::from_le_bytes(c.try_into().unwrap());
+       }
+       let mut group_scales = [0u8; 8];
+       group_scales.copy_from_slice(&b[OFF_GROUPS..OFF_GROUPS + 8]);
+       SciRustSlhaTile {
+           latent_kv, residual_bitmap,
+           scale: read_f32(b, OFF_SCALE), dynamic_lambda: read_f32(b, OFF_LAMBDA),
+           residual_sigma: read_f32(b, OFF_SIGMA),
+           token_id: read_u32(b, OFF_TOKEN), position: read_u32(b, OFF_POS),
+           head_id: read_u16(b, OFF_HEAD), flags: read_u16(b, OFF_FLAGS), group_scales,
+       }
+   }
+   #[cfg(feature = "scirust-kernel")]
+   #[inline]
+   fn read_u32(b: &[u8; 128], o: usize) -> u32 { u32::from_le_bytes(b[o..o + 4].try_into().unwrap()) }
+   ```
