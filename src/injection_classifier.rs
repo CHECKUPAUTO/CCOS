@@ -225,6 +225,59 @@ impl LinearModel {
         }
         s
     }
+
+    /// **Certified robustness radius** of the `inj`-vs-`ben` verdict at feature vector `x`: the
+    /// smallest number of unit changes to the (non-negative) feature-count vector that *could* flip
+    /// the sign of the decision margin `m(x) = (bias[inj] − bias[ben]) + Σ_d g[d]·x[d]`, where
+    /// `g[d] = weights[inj][d] − weights[ben][d]`. Returns `None` when the verdict is **provably
+    /// unflippable** (no perturbation can cross the boundary).
+    ///
+    /// Because the model is a single linear layer, the worst case is closed-form — the exact interval
+    /// an IBP pass would compute for one layer, so no solver or dependency is needed. Each added token
+    /// occurrence in bucket `d` moves the margin by `g[d]` (unbounded); each removed occurrence from a
+    /// present bucket (`x[d] > 0`) moves it by `−g[d]` (one unit available). The adversary picks the
+    /// single strongest lever per unit of budget, so the per-unit rate toward the boundary is the max
+    /// over *both* levers — which makes the radius a **sound lower bound**: it never over-states
+    /// robustness. Deterministic (fixed-order f32 over the SHA-256-pinned weights), read-only, and
+    /// allocation-light. This is a certificate a non-linear neural re-ranker cannot produce.
+    pub fn certified_radius(&self, x: &[f32], inj: usize, ben: usize) -> Option<u64> {
+        assert_eq!(x.len(), self.dim, "feature vector dim mismatch");
+        let wi = &self.weights[inj];
+        let wb = &self.weights[ben];
+        let prior = self.bias[inj] - self.bias[ben];
+        // g[d] and the running extremes, plus the removal levers (which need x[d] > 0).
+        let mut margin = prior;
+        let mut max_g = f32::NEG_INFINITY; // strongest add-up (raises margin)
+        let mut min_g = f32::INFINITY; // strongest add-down (lowers margin)
+        let mut rm_up = f32::NEG_INFINITY; // remove a present bucket to raise: −g[d], g[d] < 0
+        let mut rm_down = f32::NEG_INFINITY; // remove a present bucket to lower: g[d], g[d] > 0
+        for d in 0..self.dim {
+            let g = wi[d] - wb[d];
+            margin += g * x[d];
+            max_g = max_g.max(g);
+            min_g = min_g.min(g);
+            if x[d] > 0.0 {
+                rm_up = rm_up.max(-g);
+                rm_down = rm_down.max(g);
+            }
+        }
+        if margin < 0.0 {
+            // Currently benign; the adversary must raise the margin to ≥ 0.
+            let up = max_g.max(rm_up);
+            if up <= 0.0 {
+                return None; // no perturbation can raise the margin ⇒ provably robust
+            }
+            Some((-margin / up).ceil().max(1.0) as u64)
+        } else {
+            // Currently injection; the adversary must push the margin below 0.
+            let down = (-min_g).max(rm_down);
+            if down <= 0.0 {
+                return None;
+            }
+            // Need margin − K·down < 0 ⇒ K > margin/down ⇒ K = ⌊margin/down⌋ + 1.
+            Some(((margin / down).floor() + 1.0) as u64)
+        }
+    }
 }
 
 /// The result of scoring a feature vector.
@@ -260,6 +313,11 @@ pub struct Explanation {
     pub margin: f32,
     /// `bias[injection] − bias[benign]` (the prior's share of the margin).
     pub prior_margin: f32,
+    /// **Certified robustness radius**: the smallest number of feature-count changes that could flip
+    /// this verdict (`None` ⇒ provably unflippable). A sound lower bound — the audit log can state
+    /// "no ≤`r`-change perturbation would have altered this decision". See
+    /// [`LinearModel::certified_radius`].
+    pub certified_radius: Option<u64>,
     /// The features that moved the margin most, largest |contribution| first.
     pub top_terms: Vec<TermContribution>,
 }
@@ -336,6 +394,9 @@ impl InjectionDetector {
 
         let margin = scores.logits[inj] - scores.logits.get(ben).copied().unwrap_or(0.0);
         let prior_margin = self.model.bias[inj] - self.model.bias.get(ben).copied().unwrap_or(0.0);
+        let certified_radius =
+            self.model
+                .certified_radius(&self.tokenizer.count_vector(text), inj, ben);
 
         // Aggregate per-feature contribution to (injection − benign).
         let wi = &self.model.weights[inj];
@@ -370,8 +431,23 @@ impl InjectionDetector {
             injection_probability: self.injection_probability(text),
             margin,
             prior_margin,
+            certified_radius,
             top_terms,
         }
+    }
+
+    /// The [certified robustness radius](LinearModel::certified_radius) of the verdict on `text`:
+    /// the smallest number of feature-count changes that could flip benign↔injection (`None` ⇒
+    /// provably unflippable). Read-only, deterministic — an auditable adversarial guarantee.
+    pub fn certified_radius(&self, text: &str) -> Option<u64> {
+        let inj = self.injection_index()?;
+        let ben = self.model.class_index("benign").unwrap_or_else(|| {
+            (0..self.model.n_classes())
+                .find(|&c| c != inj)
+                .unwrap_or(inj)
+        });
+        self.model
+            .certified_radius(&self.tokenizer.count_vector(text), inj, ben)
     }
 }
 
@@ -499,6 +575,76 @@ mod tests {
         let top = &ex.top_terms[0].feature;
         assert!(top == "w:ignore" || top == "w:instructions", "top = {top}");
         assert!(ex.top_terms[0].contribution > 0.0);
+    }
+
+    #[test]
+    fn certified_radius_hand_computed_both_directions() {
+        // g[d] = W_inj[d] − W_ben[d] = [+2, −1] built directly via the weights.
+        let m = LinearModel {
+            version: 1,
+            dim: 2,
+            classes: vec!["benign".into(), "injection".into()],
+            weights: vec![vec![0.0, 0.0], vec![2.0, -1.0]],
+            bias: vec![0.0, -1.0],
+        };
+        // INJECTION: margin = −1 + 2·1 = +1. down rate = max(−min_g=1, rm_down=g[0]=2) = 2 ⇒ ⌊1/2⌋+1 = 1.
+        assert_eq!(m.certified_radius(&[1.0, 0.0], 1, 0), Some(1));
+        // BENIGN: same weights, prior −4 ⇒ margin = −4 + 2 = −2. up rate = max(max_g=2, rm_up=−2) = 2 ⇒ ⌈2/2⌉ = 1.
+        let benign = LinearModel {
+            bias: vec![0.0, -4.0],
+            ..m.clone()
+        };
+        assert_eq!(benign.certified_radius(&[1.0, 0.0], 1, 0), Some(1));
+    }
+
+    #[test]
+    fn certified_radius_scales_with_the_margin_and_is_sound() {
+        // dim=1, g=[1]. x=[2], prior −4.5 ⇒ margin = −2.5 (benign); up rate 1 ⇒ radius 3.
+        let m = LinearModel {
+            version: 1,
+            dim: 1,
+            classes: vec!["benign".into(), "injection".into()],
+            weights: vec![vec![0.0], vec![1.0]],
+            bias: vec![0.0, -4.5],
+        };
+        let r = m.certified_radius(&[2.0], 1, 0).unwrap();
+        assert_eq!(r, 3);
+        // Soundness: adding to the strongest bucket r−1 times must NOT flip; r times must.
+        let flips = |k: u64| {
+            let x = 2.0 + k as f32; // add k occurrences to the injection-favouring bucket
+            (m.bias[1] - m.bias[0]) + (m.weights[1][0] - m.weights[0][0]) * x >= 0.0
+        };
+        assert!(!flips(r - 1), "r−1 changes must not flip the verdict");
+        assert!(flips(r), "r changes flip the verdict");
+    }
+
+    #[test]
+    fn certified_radius_is_none_when_unflippable() {
+        // g ≡ 0 on every bucket ⇒ no perturbation can move the margin ⇒ provably robust.
+        let m = LinearModel {
+            version: 1,
+            dim: 3,
+            classes: vec!["benign".into(), "injection".into()],
+            weights: vec![vec![0.3, 0.3, 0.3], vec![0.3, 0.3, 0.3]],
+            bias: vec![0.1, -0.1],
+        };
+        assert_eq!(m.certified_radius(&[1.0, 2.0, 0.0], 1, 0), None);
+    }
+
+    #[test]
+    fn certified_radius_is_deterministic_and_surfaced_in_explain() {
+        let tok = small_tok();
+        let model = toy_model(&tok);
+        let det = InjectionDetector::new(tok, model).unwrap();
+        let a = det.certified_radius("let total = sum(items);");
+        let b = det.certified_radius("let total = sum(items);");
+        assert_eq!(a, b, "certified radius is deterministic");
+        assert!(a.is_some(), "a benign verdict has a finite flip radius");
+        assert_eq!(
+            det.explain("let total = sum(items);").certified_radius,
+            a,
+            "explain() surfaces the same radius"
+        );
     }
 
     #[test]
