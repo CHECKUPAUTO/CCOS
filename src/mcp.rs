@@ -6,9 +6,13 @@
 //! memory lives in an [`AgentSession`], so the whole interaction is event-sourced
 //! and replayable.
 //!
-//! Nine tools: `ingest`, `recall`, `signal_failure`, `page_fault`, `stats`,
-//! `verify`, the time-travel pair `timeline` / `recall_what_if`, and
-//! `ccos_retrieve` (fetch the original of a compressed item). It also exposes two
+//! Thirteen tools: `ingest`, `recall`, `signal_failure`, `page_fault`, `stats`,
+//! `verify`, the time-travel pair `timeline` / `recall_what_if`, `ccos_retrieve`
+//! (fetch the original of a compressed item), the causal-intervention pair
+//! `causal_intervene` (do(X): what a change forces) / `causal_blame` (candidate
+//! root causes), `drift_cause` (which recorded op moved a node's score —
+//! change-point attribution), and `retrodict_belief` (the RTS-smoothed belief
+//! trajectory: future evidence folded back into past steps). It also exposes two
 //! read-only **resources** — `ccos://session/context` (the current
 //! self-bounding working set, linearised for direct injection into a system
 //! prompt) and `ccos://session/timeline` (the cognitive journal).
@@ -118,6 +122,59 @@ fn tool_specs() -> Value {
                 },
                 "required": ["ccr_ref"]
             }
+        },
+        {
+            "name": "causal_intervene",
+            "description": "do(X): the interventional impact of changing a node — the nodes that (transitively) DEPEND on it, each with an attenuated impact weight. Read-only; a Pearl-style intervention over the resolved dependency graph, not a similarity query.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "node id / file path (bare paths get a file: prefix)"},
+                    "magnitude": {"type": "number", "description": "intervention magnitude (default 1.0)"},
+                    "damping": {"type": "number", "description": "per-hop attenuation (default 0.75)"},
+                    "depth": {"type": "integer", "description": "max hops (default 4)"}
+                },
+                "required": ["node"]
+            }
+        },
+        {
+            "name": "causal_blame",
+            "description": "The candidate root causes of a failure at a node — what it (transitively) DEPENDS ON, ranked by attenuated dependency weight. The dual of causal_intervene: the principled 'the culprit is upstream in a different file'. Read-only.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "node id / file path (bare paths get a file: prefix)"},
+                    "damping": {"type": "number", "description": "per-hop attenuation (default 0.75)"},
+                    "depth": {"type": "integer", "description": "max hops (default 4)"}
+                },
+                "required": ["node"]
+            }
+        },
+        {
+            "name": "drift_cause",
+            "description": "Causal-of-drift attribution: reconstruct a node's score trajectory across the replayable history, locate the dominant level shift (CUSUM change-point), and name the recorded operation that caused it. Read-only but replays the whole timeline — an offline post-mortem query, not a hot-path call.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "node id / file path (bare paths get a file: prefix)"}
+                },
+                "required": ["node"]
+            }
+        },
+        {
+            "name": "retrodict_belief",
+            "description": "Retrodiction: a claim's belief/tension trajectory over the replayed timeline, plus the RTS-smoothed reconstruction that folds FUTURE evidence back into every PAST step (what the engine should have believed at t given everything since). Read-only; replays the timeline — offline analysis.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "claim": {"type": "string", "description": "claim node id"},
+                    "stride": {"type": "integer", "description": "sample every N steps (default 1)"},
+                    "half_life": {"type": "number", "description": "knowledge half-life for decayed belief; <= 0 = undecayed (default 0)"},
+                    "q": {"type": "number", "description": "smoother process variance (default 0.02)"},
+                    "r": {"type": "number", "description": "smoother measurement variance (default 0.1)"}
+                },
+                "required": ["claim"]
+            }
         }
     ])
 }
@@ -151,6 +208,22 @@ fn str_arg(args: &Value, k: &str) -> String {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string()
+}
+
+/// Read an f64 argument with a default.
+fn f64_arg(args: &Value, k: &str, default: f64) -> f64 {
+    args.get(k).and_then(Value::as_f64).unwrap_or(default)
+}
+
+/// Prefix a bare path with `file:`; leave known node-id prefixes untouched (the
+/// same convenience the post-mortem REPL applies, so hosts can pass either form).
+fn normalize_node(s: &str) -> String {
+    const PREFIXES: [&str; 5] = ["file:", "sym:", "mod:", "use:", "dep:"];
+    if PREFIXES.iter().any(|p| s.starts_with(p)) {
+        s.to_string()
+    } else {
+        format!("file:{s}")
+    }
 }
 
 /// Build a [`Recall`] strategy from `{strategy, anchor, text}` arguments. Shared
@@ -212,6 +285,86 @@ fn call_tool(session: &mut AgentSession, params: &Value) -> Result<Value, (i64, 
             let step = args.get("step").and_then(Value::as_u64).unwrap_or(0) as usize;
             let window = session.recall_what_if(step, &recall_from_args(&args), budget);
             serde_json::to_string(&window).unwrap_or_default()
+        }
+        "causal_intervene" => {
+            let node = str_arg(&args, "node");
+            if node.is_empty() {
+                return Err((-32602, "causal_intervene requires 'node'".into()));
+            }
+            let id = crate::memory::NodeId(normalize_node(&node));
+            let impact = session.memory().graph().intervene(
+                &id,
+                f64_arg(&args, "magnitude", 1.0),
+                f64_arg(&args, "damping", 0.75),
+                args.get("depth").and_then(Value::as_u64).unwrap_or(4) as usize,
+            );
+            let rows: Vec<Value> = impact
+                .iter()
+                .map(|(n, v)| json!({ "node": n.0, "impact": v }))
+                .collect();
+            json!({ "origin": id.0, "forced": rows }).to_string()
+        }
+        "causal_blame" => {
+            let node = str_arg(&args, "node");
+            if node.is_empty() {
+                return Err((-32602, "causal_blame requires 'node'".into()));
+            }
+            let id = crate::memory::NodeId(normalize_node(&node));
+            let causes = session.memory().graph().blame(
+                &id,
+                f64_arg(&args, "damping", 0.75),
+                args.get("depth").and_then(Value::as_u64).unwrap_or(4) as usize,
+            );
+            let rows: Vec<Value> = causes
+                .iter()
+                .map(|(n, v)| json!({ "node": n.0, "weight": v }))
+                .collect();
+            json!({ "origin": id.0, "candidate_causes": rows }).to_string()
+        }
+        "drift_cause" => {
+            let node = str_arg(&args, "node");
+            if node.is_empty() {
+                return Err((-32602, "drift_cause requires 'node'".into()));
+            }
+            match session.attribute_drift(&normalize_node(&node)) {
+                Some(c) => json!({
+                    "node": c.node,
+                    "step": c.step,
+                    "delta": c.delta,
+                    "cusum": c.cusum,
+                    "op": c.op,
+                })
+                .to_string(),
+                None => json!({
+                    "node": normalize_node(&node),
+                    "cause": Value::Null,
+                    "note": "no attributable drift (flat trajectory, or the break is below the compaction floor)",
+                })
+                .to_string(),
+            }
+        }
+        "retrodict_belief" => {
+            let claim = str_arg(&args, "claim");
+            if claim.is_empty() {
+                return Err((-32602, "retrodict_belief requires 'claim'".into()));
+            }
+            let id = crate::memory::NodeId(claim.clone());
+            let stride = args.get("stride").and_then(Value::as_u64).unwrap_or(1) as usize;
+            let profile = session.belief_tension_timeline(
+                std::slice::from_ref(&id),
+                stride,
+                f64_arg(&args, "half_life", 0.0),
+            );
+            let (q, r) = (f64_arg(&args, "q", 0.02), f64_arg(&args, "r", 0.1));
+            json!({
+                "claim": claim,
+                "stride": stride,
+                "belief": profile.belief_series(&id),
+                "belief_retrodicted": profile.retrodicted_belief(&id, q, r),
+                "tension": profile.tension_series(&id),
+                "tension_retrodicted": profile.retrodicted_tension(&id, q, r),
+            })
+            .to_string()
         }
         "ccos_retrieve" => {
             let key = str_arg(&args, "ccr_ref");
@@ -485,6 +638,10 @@ mod tests {
             "timeline",
             "recall_what_if",
             "ccos_retrieve",
+            "causal_intervene",
+            "causal_blame",
+            "drift_cause",
+            "retrodict_belief",
         ] {
             assert!(names.contains(&n), "missing tool {n}");
         }
@@ -536,6 +693,151 @@ mod tests {
         let mut s = AgentSession::new();
         let r = handle(&mut s, &req(9, "frobnicate", Value::Null)).unwrap();
         assert_eq!(r["error"]["code"], -32601);
+    }
+
+    /// A session with the import chain api → repo → db (each depends on the next).
+    fn chain(s: &mut AgentSession) {
+        ingest(s, 1, "src/db.rs", "pub fn timeout() -> i64 { 30 }\n");
+        ingest(
+            s,
+            2,
+            "src/repo.rs",
+            "use crate::db;\npub fn fetch() -> i64 { db::timeout() }\n",
+        );
+        ingest(
+            s,
+            3,
+            "src/api.rs",
+            "use crate::repo;\npub fn handle() -> i64 { repo::fetch() }\n",
+        );
+    }
+
+    #[test]
+    fn causal_intervene_and_blame_answer_over_mcp() {
+        let mut s = AgentSession::new();
+        chain(&mut s);
+        // do(db): repo and api depend on it, so both are forced (bare path is normalized).
+        let r = handle(
+            &mut s,
+            &req(
+                4,
+                "tools/call",
+                json!({ "name": "causal_intervene", "arguments": { "node": "src/db.rs" } }),
+            ),
+        )
+        .unwrap();
+        let text = r["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("file:src/repo.rs") && text.contains("file:src/api.rs"),
+            "do(db) forces its dependents: {text}"
+        );
+        // blame(api): its dependencies are the candidate causes.
+        let r = handle(
+            &mut s,
+            &req(
+                5,
+                "tools/call",
+                json!({ "name": "causal_blame", "arguments": { "node": "src/api.rs" } }),
+            ),
+        )
+        .unwrap();
+        let text = r["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("file:src/repo.rs") && text.contains("file:src/db.rs"),
+            "blame(api) surfaces its dependencies: {text}"
+        );
+        // A missing 'node' argument is a JSON-RPC invalid-params error.
+        let r = handle(
+            &mut s,
+            &req(6, "tools/call", json!({ "name": "causal_intervene" })),
+        )
+        .unwrap();
+        assert_eq!(r["error"]["code"], -32602);
+    }
+
+    #[test]
+    fn drift_cause_names_the_culprit_op_over_mcp() {
+        let mut s = AgentSession::new();
+        chain(&mut s);
+        handle(
+            &mut s,
+            &req(
+                4,
+                "tools/call",
+                json!({ "name": "signal_failure", "arguments": { "node": "file:src/api.rs", "depth": 2 } }),
+            ),
+        )
+        .unwrap();
+        let r = handle(
+            &mut s,
+            &req(
+                5,
+                "tools/call",
+                json!({ "name": "drift_cause", "arguments": { "node": "src/api.rs" } }),
+            ),
+        )
+        .unwrap();
+        let text = r["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("\"op\"") && text.contains("\"step\""),
+            "a drift attribution names the op and step: {text}"
+        );
+        // A node with no trajectory reports honestly instead of erroring.
+        let r = handle(
+            &mut s,
+            &req(
+                6,
+                "tools/call",
+                json!({ "name": "drift_cause", "arguments": { "node": "src/ghost.rs" } }),
+            ),
+        )
+        .unwrap();
+        let text = r["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("no attributable drift"),
+            "honest null: {text}"
+        );
+    }
+
+    #[test]
+    fn retrodict_belief_returns_raw_and_smoothed_series() {
+        let mut s = AgentSession::new();
+        // Build a claim whose belief grows over the timeline.
+        for (i, ev) in ["e0", "e1", "e2"].iter().enumerate() {
+            handle(
+                &mut s,
+                &req(
+                    i as i64 + 1,
+                    "tools/call",
+                    json!({ "name": "ingest", "arguments": {
+                        "uri": format!("src/{ev}.rs"), "source": "pub fn x() {}\n" } }),
+                ),
+            )
+            .unwrap();
+            s.assert_support(&format!("file:src/{ev}.rs"), "claim:db-is-slow", 1.0);
+        }
+        let r = handle(
+            &mut s,
+            &req(
+                9,
+                "tools/call",
+                json!({ "name": "retrodict_belief", "arguments": { "claim": "claim:db-is-slow" } }),
+            ),
+        )
+        .unwrap();
+        let text = r["result"]["content"][0]["text"].as_str().unwrap();
+        let v: Value = serde_json::from_str(text).unwrap();
+        let raw = v["belief"].as_array().unwrap();
+        let smooth = v["belief_retrodicted"].as_array().unwrap();
+        assert_eq!(
+            raw.len(),
+            smooth.len(),
+            "same sampling for raw and smoothed"
+        );
+        assert!(!raw.is_empty());
+        // The belief ends positive (three supports) in both views.
+        assert!(raw.last().unwrap().as_f64().unwrap() > 0.0);
+        assert!(smooth.last().unwrap().as_f64().unwrap() > 0.0);
     }
 
     fn ingest(s: &mut AgentSession, id: i64, uri: &str, src: &str) {
@@ -682,6 +984,11 @@ mod tests {
         assert!(!mutating("stats"));
         assert!(!mutating("recall_what_if"));
         assert!(!mutating("ccos_retrieve"));
+        // The causal/temporal analysis tools are read-only: no checkpoint after them.
+        assert!(!mutating("causal_intervene"));
+        assert!(!mutating("causal_blame"));
+        assert!(!mutating("drift_cause"));
+        assert!(!mutating("retrodict_belief"));
         // Non-tools/call messages never checkpoint.
         assert!(!is_mutating_call(&json!({ "method": "resources/read" })));
     }
