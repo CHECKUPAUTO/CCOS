@@ -106,6 +106,7 @@ pub mod conformal;
 pub mod consensus;
 pub mod distributed_event_log;
 pub mod drift;
+pub mod dtw;
 pub mod embeddings;
 pub mod event_log;
 pub mod eviction_policy;
