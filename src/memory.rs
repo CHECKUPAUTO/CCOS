@@ -2988,18 +2988,42 @@ impl MemoryGraph {
                 }
             }
 
+            // Renamed-import index (`use m::X as Y` ⇒ file → { Y: "m::X" }), mirroring
+            // `resolve_symbol_calls`. First binding wins (deterministic: sorted `pending_aliases`).
+            let mut alias_index: HashMap<&str, HashMap<&str, &str>> = HashMap::new();
+            for (f, aliases) in &self.pending_aliases {
+                let m = alias_index.entry(f.as_str()).or_default();
+                for (local, target) in aliases {
+                    m.entry(local.as_str()).or_insert(target.as_str());
+                }
+            }
+            let empty_aliases: HashMap<&str, &str> = HashMap::new();
+
             let mut acc: Vec<(NodeId, NodeId)> = Vec::new();
             for (file, refs) in &self.pending_data_refs {
                 let (fcrate, fmodule) = crate_and_module(file).unwrap_or_default();
+                let file_alias = alias_index.get(file.as_str()).unwrap_or(&empty_aliases);
                 for (reader, name, _line) in refs {
                     let reader_sym = NodeId(format!("sym:{file}:{reader}"));
                     if !self.nodes.contains_key(&reader_sym) {
                         continue;
                     }
-                    let target: Option<NodeId> = if name.contains("::") {
+                    // Renamed-import rewrite: `use m::X as Y` binds local `Y` to target `m::X`. If the
+                    // ref's leading segment is such a local, rewrite it onto the target and resolve the
+                    // rewritten path (mirrors resolve_call's alias handling), so an aliased data ref
+                    // links to its real `static`/`const`. An alias is applied at most once.
+                    let first = name.split("::").next().unwrap_or(name);
+                    let rewritten: String = match file_alias.get(first) {
+                        Some(target) => match name.split_once("::") {
+                            Some((_, rest)) => format!("{target}::{rest}"),
+                            None => (*target).to_string(),
+                        },
+                        None => name.clone(),
+                    };
+                    let target: Option<NodeId> = if rewritten.contains("::") {
                         // Qualified `m::…::X` — resolve exactly like a qualified call, against the
                         // data-symbol-only `defs` so the result is guaranteed a `static`/`const`.
-                        resolve_qualified(file, name, &fcrate, &scope, &file_index, &defs)
+                        resolve_qualified(file, &rewritten, &fcrate, &scope, &file_index, &defs)
                     } else {
                         // Bare `X` — the data-flow analogue of the call resolver's Tier A→B→C ladder
                         // (import-scoped → reader's own module → global-unique), against the
@@ -3007,7 +3031,7 @@ impl MemoryGraph {
                         // `use m::X` — or defined in the reader's module — links even when `X` is not
                         // globally unique. resolve-uniquely-or-skip at every tier.
                         resolve_bare_data(
-                            name,
+                            &rewritten,
                             file,
                             &fcrate,
                             &fmodule,
@@ -4483,6 +4507,48 @@ mod tests {
         assert!(
             data_flow_of(&g).is_empty(),
             "ambiguous imports for a bare global skip — never a guessed edge: {:?}",
+            data_flow_of(&g)
+        );
+    }
+
+    #[test]
+    fn resolve_data_flow_bare_ref_resolves_through_renamed_import() {
+        // `use crate::cfg::MAX as LIMIT; … LIMIT` — the renamed-import alias binds local `LIMIT` to
+        // `crate::cfg::MAX`; the bare data ref is rewritten onto the target and resolves to cfg's
+        // const (mirrors the call resolver's alias handling).
+        let mut g = graph_with_defs(&[("src/cfg.rs", "MAX"), ("src/api.rs", "reader")]);
+        g.mark_data_symbol(NodeId("sym:src/cfg.rs:MAX".into()));
+        g.set_pending_aliases(
+            "src/api.rs",
+            vec![("LIMIT".into(), "crate::cfg::MAX".into())],
+        );
+        g.set_pending_data_refs("src/api.rs", vec![("reader".into(), "LIMIT".into(), 1)]);
+        g.resolve_data_flow();
+        assert_eq!(
+            data_flow_of(&g),
+            vec![(
+                "sym:src/api.rs:reader".to_string(),
+                "sym:src/cfg.rs:MAX".to_string()
+            )],
+            "a renamed const import (use MAX as LIMIT) resolves the aliased ref to the real const"
+        );
+    }
+
+    #[test]
+    fn resolve_data_flow_renamed_import_to_non_data_symbol_skips() {
+        // The alias target resolves to a real symbol, but it was never marked a static/const (e.g. a
+        // SCREAMING-named fn). A data ref must resolve only to a data symbol ⇒ no edge, no false link.
+        let mut g = graph_with_defs(&[("src/cfg.rs", "MAX"), ("src/api.rs", "reader")]);
+        // deliberately do NOT mark MAX as a data symbol
+        g.set_pending_aliases(
+            "src/api.rs",
+            vec![("LIMIT".into(), "crate::cfg::MAX".into())],
+        );
+        g.set_pending_data_refs("src/api.rs", vec![("reader".into(), "LIMIT".into(), 1)]);
+        g.resolve_data_flow();
+        assert!(
+            data_flow_of(&g).is_empty(),
+            "an aliased ref to a non-static/const target is not a data-flow edge: {:?}",
             data_flow_of(&g)
         );
     }

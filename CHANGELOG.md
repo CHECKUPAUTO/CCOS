@@ -32,6 +32,16 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Data-flow resolution now follows *renamed* imports (`use m::MAX as LIMIT; … LIMIT`).** A renamed
+  const/static import bound a local alias the data-flow pass didn't understand, so the reference
+  resolved to nothing — even though the call resolver already handled renamed imports. `resolve_data_flow`
+  now builds the same per-file alias index and rewrites an aliased leading segment onto its target
+  before resolving (mirroring `resolve_call`), so an aliased data ref links to its real `static`/`const`.
+  The rewrite is applied at most once, feeds the existing resolve-uniquely-or-skip resolvers (no new
+  false-edge surface), and is deterministic (sorted `pending_aliases`, first-binding-wins); non-aliased
+  refs are byte-identical. Two precision tests (resolves-through-alias, and skips when the target is not
+  a data symbol).
+
 - **Call graph now resolves non-`use` local module-path calls (`submod::fn()`, `outer::inner::fn()`).**
   Previously a qualified call resolved only when crate-rooted (`crate::…`) or mediated by a matching
   `use` import; the very common idiom of calling through a bare **local submodule** path with no `use`
