@@ -325,6 +325,7 @@ for the full list.
 cargo run --release --example flagship             # the one-run tour: replay==live, contested beliefs, LSA-beats-RAG
 cargo run --release --example resolution_coverage  # the call/data-flow resolver, measured: 10/10 idioms, 963+43 edges on src/
 cargo run -p ccos-memory-runtime --example slha_backend   # opt-in SLHAv2 tile memory: HOT→WARM 128→96 B, zero-dep
+cargo run --release --example beir_eval            # standard IR benchmark (BEIR): BM25 0.662 vs 0.665 published on SciFact
 ```
 
 `flagship` demonstrates, measured and bit-for-bit reproducible, three things a similarity-only

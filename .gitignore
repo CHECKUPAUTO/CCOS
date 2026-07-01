@@ -1,5 +1,9 @@
 /target
 
+# External benchmark datasets (BEIR etc.) — fetched locally, never committed
+# (size + licensing; see examples/beir_eval.rs for the download one-liner).
+/data/
+
 # Causal-validation harness output (reproducible)
 scripts/causal_validation/results*.jsonl
 
