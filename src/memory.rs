@@ -3377,6 +3377,33 @@ fn resolve_module_exact(
     index.get(&(target_crate, segs.join("::"))).cloned()
 }
 
+/// Bare (non-`crate`-rooted, non-imported) module-path fallback for `m::…::name` whose leading path is
+/// a LOCAL submodule of the **caller's own crate** — the common `submod::fn()` / `outer::inner::fn()`
+/// idiom with no `use`. The prefix must be a REAL submodule file of the caller's crate (matched
+/// EXACTLY — no ancestor shortening); its existence is authoritative (a local `mod prefix;` **shadows**
+/// a same-named extern crate in Rust path resolution), so a present-but-symbol-less module yields
+/// `None` (skip). Only the caller's OWN crate is consulted: a bare path is deliberately NOT resolved
+/// into an unrelated ingested EXTERNAL crate — an external reading would mint an edge the compiler
+/// never picks. (Adversarial review confirmed the two failures an external interpretation caused: a
+/// symbol-less local module + a same-named extern crate produced a false edge, and a crate named like
+/// a type stole a valid type-method edge — so the external reading is excluded.) Present-module-then-
+/// symbol gating ⇒ resolve-uniquely-or-skip. Reads only the sorted-built `file_index`/`defs` ⇒
+/// order-independent (replay == live); never consults `name_count`/`name_first` ⇒ no bare-name guess.
+fn resolve_bare_modpath(
+    prefix: &str,
+    name: &str,
+    fcrate: &str,
+    file_index: &HashMap<(String, String), NodeId>,
+    defs: &HashMap<(String, String, String), NodeId>,
+) -> Option<NodeId> {
+    // The prefix must be a real submodule file of the CALLER'S crate (exact — no ancestor shortening).
+    // Its mere existence is authoritative (shadow rule), so the symbol is then looked up in exactly
+    // that module and a miss yields None — never a fall-through to a same-named extern crate.
+    file_index.get(&(fcrate.to_string(), prefix.to_string()))?;
+    defs.get(&(fcrate.to_string(), prefix.to_string(), name.to_string()))
+        .cloned()
+}
+
 /// Resolve a **qualified** path `mod::…::name` to its definition symbol — the shared machinery
 /// behind both qualified CALLS (`m::func()`) and qualified DATA references (`m::CONST`). Pins the
 /// module prefix to its defining file (crate-rooted directly, else by expanding the leading segment
@@ -3406,6 +3433,12 @@ fn resolve_qualified(
             .filter(|u| u.rsplit("::").next() == Some(first));
         match (hits.next(), hits.next()) {
             (Some(use_path), None) => Some(format!("{use_path}{rest}")),
+            // NO matching import ⇒ try the bare same-crate submodule-path fallback. It performs the
+            // full file_index→defs lookup itself (returning a SYMBOL, not a module path), so
+            // short-circuit here rather than flow into the resolve_module_exact tail below.
+            (None, None) => return resolve_bare_modpath(prefix, name, fcrate, file_index, defs),
+            // 2+ matching imports (ambiguous) still skips — never fall to the bare guess, which would
+            // contradict a scope the imports already made ambiguous (Tier-A discipline).
             _ => None,
         }
     };
@@ -5143,6 +5176,288 @@ mod tests {
                 "sym:src/db.rs:connect".to_string()
             )],
             "the import scopes the otherwise-ambiguous call to db::connect (Tier A)"
+        );
+    }
+
+    // ── Non-`use` module-path fallback (submod::fn(), extern::fn(), a::b::fn()) ──────────────────
+    #[test]
+    fn resolve_symbol_calls_bare_local_module_path_resolves() {
+        // Gap A: `mod helpers; helpers::work()` with NO use. Leading `helpers` is a local module
+        // (crate "", module "helpers") — resolve exactly via file_index then defs.
+        let mut g = graph_with_defs(&[("src/helpers.rs", "work"), ("src/api.rs", "run")]);
+        g.set_pending_calls(
+            "src/api.rs",
+            vec![("run".into(), "helpers::work".into(), 1)],
+        );
+        g.resolve_symbol_calls();
+        assert_eq!(
+            calls_of(&g),
+            vec![(
+                "sym:src/api.rs:run".to_string(),
+                "sym:src/helpers.rs:work".to_string()
+            )],
+            "bare local module path helpers::work resolves via file_index"
+        );
+    }
+
+    #[test]
+    fn resolve_symbol_calls_bare_extern_crate_path_is_not_resolved() {
+        // A bare `othercrate::helper()` (no use, no local module `othercrate`) is deliberately NOT
+        // resolved into an unrelated ingested external crate: the fallback consults only the caller's
+        // OWN crate, so an external reading can never mint an edge Rust's shadow rule would forbid.
+        // (Cross-crate calls resolve via an explicit `use` — see the import tests.)
+        let mut g = graph_with_defs(&[("othercrate/src/lib.rs", "helper"), ("src/api.rs", "run")]);
+        g.set_pending_calls(
+            "src/api.rs",
+            vec![("run".into(), "othercrate::helper".into(), 1)],
+        );
+        g.resolve_symbol_calls();
+        assert!(
+            calls_of(&g).is_empty(),
+            "a bare extern-crate path is conservatively not resolved: {:?}",
+            calls_of(&g)
+        );
+    }
+
+    #[test]
+    fn resolve_symbol_calls_bare_nested_module_path_resolves() {
+        // Gap F: `outer::inner::work()` with NO use. Full prefix `outer::inner` is an exact module.
+        let mut g = graph_with_defs(&[("src/outer/inner.rs", "work"), ("src/api.rs", "run")]);
+        g.set_pending_calls(
+            "src/api.rs",
+            vec![("run".into(), "outer::inner::work".into(), 1)],
+        );
+        g.resolve_symbol_calls();
+        assert_eq!(
+            calls_of(&g),
+            vec![(
+                "sym:src/api.rs:run".to_string(),
+                "sym:src/outer/inner.rs:work".to_string()
+            )],
+            "bare nested module path resolves via exact full-prefix module match"
+        );
+    }
+
+    #[test]
+    fn resolve_symbol_calls_bare_module_path_symbolless_local_module_does_not_fall_to_extern() {
+        // Adversarial-review defect 1: a local module `sib` exists but lacks `helper`, while an
+        // ingested external crate `sib` HAS `helper`. In Rust `mod sib;` shadows extern crate `sib`,
+        // so `sib::helper()` binds to the (symbol-less) local module ⇒ SKIP. The fallback must NOT
+        // fall through to the external crate (that was a false edge before the fix).
+        let mut g = graph_with_defs(&[
+            ("src/sib.rs", "other"), // local module sib: ("", "sib", "other") — NO `helper`
+            ("sib/src/lib.rs", "helper"), // extern crate sib: ("sib", "", "helper")
+            ("src/api.rs", "run"),
+        ]);
+        g.set_pending_calls("src/api.rs", vec![("run".into(), "sib::helper".into(), 1)]);
+        g.resolve_symbol_calls();
+        assert!(
+            calls_of(&g).is_empty(),
+            "a symbol-less local module shadows the extern crate ⇒ skip, no false extern edge: {:?}",
+            calls_of(&g)
+        );
+    }
+
+    #[test]
+    fn resolve_symbol_calls_bare_module_path_local_symbol_wins_over_extern_crate() {
+        // Both a local module `sib` and a same-named extern crate define `helper`. Rust binds
+        // `sib::helper` to the LOCAL module ⇒ resolve to the local symbol, never the extern crate's.
+        let mut g = graph_with_defs(&[
+            ("src/sib.rs", "helper"),     // local ("", "sib", "helper")
+            ("sib/src/lib.rs", "helper"), // extern ("sib", "", "helper")
+            ("src/api.rs", "run"),
+        ]);
+        g.set_pending_calls("src/api.rs", vec![("run".into(), "sib::helper".into(), 1)]);
+        g.resolve_symbol_calls();
+        assert_eq!(
+            calls_of(&g),
+            vec![(
+                "sym:src/api.rs:run".to_string(),
+                "sym:src/sib.rs:helper".to_string()
+            )],
+            "a local module shadows a same-named extern crate — resolve to the local symbol"
+        );
+    }
+
+    #[test]
+    fn resolve_symbol_calls_bare_module_path_missing_submodule_skips() {
+        // `outer::inner::work` where `outer` exists but `outer::inner` has no file ⇒ SKIP; never
+        // shorten to an ancestor `outer::work`.
+        let mut g = graph_with_defs(&[
+            ("src/outer.rs", "work"), // only ("", "outer") exists, NOT ("", "outer::inner")
+            ("src/api.rs", "run"),
+        ]);
+        g.set_pending_calls(
+            "src/api.rs",
+            vec![("run".into(), "outer::inner::work".into(), 1)],
+        );
+        g.resolve_symbol_calls();
+        assert!(
+            calls_of(&g).is_empty(),
+            "missing nested submodule ⇒ no ancestor fallback: {:?}",
+            calls_of(&g)
+        );
+    }
+
+    #[test]
+    fn resolve_symbol_calls_bare_module_path_unknown_prefix_no_name_fallback_skips() {
+        // `nope::work` where neither a local module `nope` nor an external crate `nope` has a file,
+        // yet a globally-unique free `work` exists. The fallback must NOT degrade into a bare
+        // final-name (Tier C) lookup.
+        let mut g = graph_with_defs(&[("src/other.rs", "work"), ("src/api.rs", "run")]);
+        g.set_pending_calls("src/api.rs", vec![("run".into(), "nope::work".into(), 1)]);
+        g.resolve_symbol_calls();
+        assert!(
+            calls_of(&g).is_empty(),
+            "unknown prefix must not fall back to a free `work`: {:?}",
+            calls_of(&g)
+        );
+    }
+
+    #[test]
+    fn resolve_symbol_calls_bare_module_path_missing_symbol_skips() {
+        // Module resolves but the target symbol is absent ⇒ SKIP (no fall-through to global).
+        let mut g = graph_with_defs(&[("src/helpers.rs", "work"), ("src/api.rs", "run")]);
+        g.set_pending_calls(
+            "src/api.rs",
+            vec![("run".into(), "helpers::missing".into(), 1)],
+        );
+        g.resolve_symbol_calls();
+        assert!(
+            calls_of(&g).is_empty(),
+            "real module but missing symbol ⇒ skip: {:?}",
+            calls_of(&g)
+        );
+    }
+
+    #[test]
+    fn resolve_symbol_calls_bare_module_path_type_method_still_wins() {
+        // `Foo::bar` where (Foo,bar) is a unique type method and there is NO module `Foo`. The
+        // fallback contributes no module_hit; the type side resolves — the new branch must not
+        // perturb it (caller in a different module, no use).
+        let mut g = graph_with_defs(&[("src/a.rs", "bar"), ("src/api.rs", "run")]);
+        g.set_pending_methods("src/a.rs", vec![("Foo".into(), "bar".into())]);
+        g.set_pending_calls("src/api.rs", vec![("run".into(), "Foo::bar".into(), 1)]);
+        g.resolve_symbol_calls();
+        assert_eq!(
+            calls_of(&g),
+            vec![(
+                "sym:src/api.rs:run".to_string(),
+                "sym:src/a.rs:bar".to_string()
+            )],
+            "type method still resolves; the module-path fallback adds no spurious module_hit"
+        );
+    }
+
+    #[test]
+    fn resolve_symbol_calls_bare_module_path_type_method_wins_over_same_named_extern_crate() {
+        // Adversarial-review defect 2: `Registry::get` is a receiver-inferred TYPE method, and an
+        // ingested external crate is (coincidentally) named `Registry` with a `get` fn. Because the
+        // fallback consults only the caller's own crate (no module `Registry` there), it contributes
+        // no module_hit — so the type method still resolves; the extern crate does not steal the edge.
+        let mut g = graph_with_defs(&[
+            ("src/a.rs", "get"),            // the real type method Registry::get
+            ("Registry/src/lib.rs", "get"), // unrelated extern crate literally named `Registry`
+            ("src/api.rs", "run"),
+        ]);
+        g.set_pending_methods("src/a.rs", vec![("Registry".into(), "get".into())]);
+        g.set_pending_calls(
+            "src/api.rs",
+            vec![("run".into(), "Registry::get".into(), 1)],
+        );
+        g.resolve_symbol_calls();
+        assert_eq!(
+            calls_of(&g),
+            vec![(
+                "sym:src/api.rs:run".to_string(),
+                "sym:src/a.rs:get".to_string()
+            )],
+            "type method resolves; a same-named extern crate does not steal the edge"
+        );
+    }
+
+    #[test]
+    fn resolve_symbol_calls_bare_module_path_type_tail_not_stripped_skips() {
+        // `db::Conn::open` where module `db` exists but `db::Conn` does not (Conn is a type). The
+        // exact module `db::Conn` is absent ⇒ SKIP; must NOT strip the type tail to link `db::open`.
+        let mut g = graph_with_defs(&[
+            ("src/db.rs", "open"), // ("", "db", "open") exists; ("", "db::Conn") does NOT
+            ("src/api.rs", "run"),
+        ]);
+        g.set_pending_calls(
+            "src/api.rs",
+            vec![("run".into(), "db::Conn::open".into(), 1)],
+        );
+        g.resolve_symbol_calls();
+        assert!(
+            calls_of(&g).is_empty(),
+            "type tail must not be stripped to a free db::open: {:?}",
+            calls_of(&g)
+        );
+    }
+
+    #[test]
+    fn resolve_symbol_calls_bare_module_path_import_wins_over_local_module() {
+        // A file has `use crate::other::helpers;` AND a local `mod helpers`, both with `work`. The
+        // unique import must pin `crate::other::helpers`; the local-module fallback must NOT fire.
+        let mut g = graph_with_defs(&[
+            ("src/other/helpers.rs", "work"), // import target ("", "other::helpers", "work")
+            ("src/helpers.rs", "work"),       // local ("", "helpers", "work")
+            ("src/api.rs", "run"),
+        ]);
+        let uid = NodeId("use:src/api.rs:crate::other::helpers".into());
+        g.upsert_node(uid.clone(), "use".into(), "".into(), NodeType::Module);
+        g.add_edge(
+            NodeId("file:src/api.rs".into()),
+            uid,
+            0.5,
+            EdgeType::DependsOn,
+        );
+        g.set_pending_calls(
+            "src/api.rs",
+            vec![("run".into(), "helpers::work".into(), 1)],
+        );
+        g.resolve_symbol_calls();
+        assert_eq!(
+            calls_of(&g),
+            vec![(
+                "sym:src/api.rs:run".to_string(),
+                "sym:src/other/helpers.rs:work".to_string()
+            )],
+            "a unique import wins; the bare fallback does not fire when an import matches"
+        );
+    }
+
+    #[test]
+    fn resolve_symbol_calls_bare_module_path_is_order_independent() {
+        // replay == live: local submodule + nested-submodule calls resolved with defs registered in
+        // two different orders ⇒ identical (indices are built over sorted node ids, not order).
+        let build = |rev: bool| {
+            let mut defs = vec![
+                ("src/helpers.rs", "work"),
+                ("src/outer/inner.rs", "work"),
+                ("src/api.rs", "run"),
+            ];
+            if rev {
+                defs.reverse();
+            }
+            let mut g = graph_with_defs(&defs);
+            g.set_pending_calls(
+                "src/api.rs",
+                vec![
+                    ("run".into(), "helpers::work".into(), 1),
+                    ("run".into(), "outer::inner::work".into(), 2),
+                ],
+            );
+            g.resolve_symbol_calls();
+            calls_of(&g)
+        };
+        let a = build(false);
+        assert_eq!(a.len(), 2, "both bare submodule-path calls resolve: {a:?}");
+        assert_eq!(
+            a,
+            build(true),
+            "resolution is independent of def-registration order (replay == live)"
         );
     }
 
