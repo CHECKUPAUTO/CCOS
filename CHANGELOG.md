@@ -137,6 +137,16 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`LsaEncoder` — semantic retrieval that *beats* lexical RAG on synonym recall.** The dense retriever
+  over ccos's TF-IDF *ties* the lexical RAG (same signal); swapping the encoder to project TF-IDF
+  through ccos's deterministic **LSA** latent space (`crate::lsa`) captures the synonymy a literal-term
+  retriever structurally cannot. On a corpus where each query and its answer share **zero vocabulary**
+  (linked only by co-occurrence *bridge* docs), `examples/semantic_retrieval_crux.rs` measures
+  **Recall@3 17% → 83%, MRR 0.185 → 0.458 (2.5×)**: lexical RAG cannot retrieve the answer, LSA recovers
+  it, bit-for-bit reproducibly. This is RAG's *own* turf — semantic recall — won by a deterministic,
+  zero-dependency encoder. Always-compiled; the encoder chooses the axis (TF-IDF lexical / LSA semantic)
+  over the same index / fusion / metrics machinery. See `docs/MEASUREMENT_pure_retrieval.md`.
+
 - **Adaptive retrieval — the self-improving `ImprovementLoop` (premium tier) + license gate.** The
   `ccos::retrieval` core (dense/BM25/hybrid + metrics) is free; the **premium** tier learns a linear
   projection of the embedding space from confirmed `(query, relevant-doc)` pairs by deterministic

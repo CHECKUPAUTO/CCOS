@@ -503,6 +503,56 @@ impl Encoder for CcosEncoder {
     }
 }
 
+/// CCOS's **semantic** bridge to the [`Encoder`] trait: a TF-IDF embedder whose vectors are projected
+/// through a rank-`rank` **LSA** latent space ([`crate::lsa`]) fitted on the same corpus. Unlike the
+/// literal-term [`CcosEncoder`], it captures **synonymy / transitivity** — two documents that never
+/// share a word still encode to nearby vectors when their terms co-occur with a common third — so
+/// dense/hybrid retrieval over it can *out-recall* a lexical RAG on a paraphrase corpus (measured in
+/// `examples/semantic_retrieval_crux.rs`). Deterministic: the LSA projection is a fixed-order Jacobi
+/// solve on the corpus Gram matrix.
+pub struct LsaEncoder {
+    embedder: TfidfEmbedder,
+    projection: Vec<Vec<f32>>, // rank × dim latent basis
+    out_dim: usize,
+}
+
+impl LsaEncoder {
+    /// Fit a TF-IDF + rank-`rank` LSA encoder on `corpus` over a `dim`-wide term space. Degenerate
+    /// projections (empty corpus / `rank == 0`) fall back to passing the raw TF-IDF vector through.
+    pub fn fit(corpus: &[String], dim: usize, rank: usize) -> Self {
+        let toks: Vec<Vec<String>> = corpus.iter().map(|t| tokenize(t)).collect();
+        let mut embedder = TfidfEmbedder::new(dim);
+        embedder.fit(&toks);
+        let rows: Vec<Vec<f32>> = toks.iter().map(|t| embedder.embed(t)).collect();
+        let projection = crate::lsa::lsa_projection(&rows, rank);
+        let out_dim = if projection.is_empty() {
+            dim
+        } else {
+            projection.len()
+        };
+        Self {
+            embedder,
+            projection,
+            out_dim,
+        }
+    }
+}
+
+impl Encoder for LsaEncoder {
+    fn embedding_dim(&self) -> usize {
+        self.out_dim
+    }
+
+    fn encode(&mut self, text: &str) -> Vec<f32> {
+        let tfidf = self.embedder.embed_str(text);
+        if self.projection.is_empty() {
+            tfidf
+        } else {
+            crate::lsa::project(&tfidf, &self.projection)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -649,6 +699,37 @@ mod tests {
             "the same text encodes to the same vector, bit for bit"
         );
         assert_eq!(a.len(), 64, "vector has the reported dimension");
+    }
+
+    #[test]
+    fn lsa_encoder_bridges_a_synonym_that_lexical_scores_zero() {
+        // "car" and "automobile" co-occur in doc 0, so the LSA latent space links them. The lexical
+        // encoder gives "automobile" vs "car wheel tire" a cosine of exactly 0 (no shared term); the
+        // LSA encoder gives it a positive cosine — the synonym bridge that beats RAG on semantic recall.
+        let corpus = [
+            "car automobile vehicle".to_string(), // bridges car ↔ automobile
+            "car wheel tire".to_string(),         // has "car", never "automobile"
+            "automobile engine motor".to_string(),
+            "banana fruit yellow".to_string(), // distractor
+        ];
+        let mut lexical = CcosEncoder::fit(&corpus, 64);
+        let mut semantic = LsaEncoder::fit(&corpus, 64, 3);
+        let lex_cos = vector::cosine(
+            &lexical.encode("automobile"),
+            &lexical.encode("car wheel tire"),
+        );
+        let sem_cos = vector::cosine(
+            &semantic.encode("automobile"),
+            &semantic.encode("car wheel tire"),
+        );
+        assert!(
+            lex_cos.abs() < 1e-6,
+            "lexical: 'automobile' vs 'car wheel tire' share no term → cosine 0, got {lex_cos}"
+        );
+        assert!(
+            sem_cos > 0.05,
+            "LSA bridges the synonym → positive cosine, got {sem_cos}"
+        );
     }
 
     #[test]

@@ -70,6 +70,37 @@ the digit, and every run is bit-for-bit identical.)
   is no hallucinating generator between query and result, and the index serialises and audits. A neural
   / generative RAG stage offers none of that.
 
+## Beating RAG on its own turf — semantic recall (the LSA encoder)
+
+The result above is honest but unflattering: pure dense over TF-IDF *equals* lexical RAG because it is
+the same lexical signal. The win is the **encoder**. `LsaEncoder` projects the TF-IDF vector through
+CCOS's deterministic **LSA latent space** (`crate::lsa`, a fixed-order Jacobi solve on the corpus Gram
+matrix), so two documents that never share a word still encode to nearby vectors when their terms
+co-occur with a common third — the **synonymy** a literal-term retriever structurally cannot represent.
+
+`examples/semantic_retrieval_crux.rs` makes the gap concrete: a corpus where each query and its answer
+share **zero vocabulary** (the query says "car vehicle drive", the answer "automobile motor sedan"),
+linked only by *bridge* documents where both vocabularies co-occur. Real output of the run:
+
+```
+  retriever                Recall@1  @3    @5     MRR
+  lexical RAG (TF-IDF)         0%      17%   50%    0.185
+  LSA semantic (dense)        17%      83%  100%    0.458
+  LSA semantic (hybrid)        0%      83%  100%    0.319
+```
+
+The lexical RAG, needing a literal match, **cannot retrieve the answer** (it ranks the bridge /
+distractor docs instead); the LSA encoder learns "car ≈ automobile" from the bridges' co-occurrence and
+recovers it — **Recall@3 17% → 83%, MRR 2.5×**. This is RAG's *own* turf — semantic recall — and a
+deterministic, dependency-free LSA wins it, bit-for-bit reproducibly (a transformer embedder would too,
+but could not be replayed bit-exact). (Honest sub-reading: the *hybrid* row trades Recall@1 because its
+BM25 half is lexical and dead weight when query and answer share no term — fuse BM25 only when there is
+a lexical signal to fuse.)
+
+**So the full picture:** pure dense over TF-IDF **ties** ccos's lexical RAG; pure dense over LSA
+**beats** it on semantic recall — same deterministic, zero-dependency machinery, the encoder chooses
+the axis.
+
 ## Adaptive retrieval — the improvement loop (premium tier)
 
 The retrieval **core** above (dense / BM25 / hybrid + metrics) is free and fully functional, exactly
@@ -107,11 +138,10 @@ deterministic, no-FFI license rather than linking `scirust-license` — one fewe
 node-locked `$1/machine/month` model would come from the clean `scirust-license` crate, which *is*
 safely linkable — `serde`/`sha2` only — if that commercial scheme is wanted.)
 
-## Scope & next axis
+## The headline
 
-The dense column equals lexical *because the encoder is TF-IDF* — pure dense over a lexical embedding
-cannot out-recall lexical. The genuine semantic lift would come from encoding through CCOS's
-**`learned-embed` LSA projection** (synonymy/transitivity TF-IDF cannot see); `CcosEncoder` is the seam
-where that swaps in. The headline this work establishes: **pure retrieval ties ccos's RAG on relevance,
-wins decisively on reproducibility, and — premium — improves itself from feedback**, deterministically,
-all with zero new dependencies.
+**Pure retrieval ties ccos's RAG on lexical relevance, *beats* it on semantic recall (the `LsaEncoder`),
+wins decisively on reproducibility, and — premium — improves itself from feedback** — all
+deterministically, bit-for-bit replayable, with **zero new dependencies**, and SciRust never modified.
+The encoder chooses the axis (TF-IDF for lexical, LSA for semantic); the index, fusion, metrics, and
+improvement loop are the same auditable, dependency-free machinery underneath.
