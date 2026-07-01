@@ -62,6 +62,18 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Research paper (`docs/PAPER.md`) brought up to date with the current system.** The paper
+  described an earlier CCOS (line-based heuristic parser, no semantic edges, ~6 KLoC, 364 tests). It
+  now reflects reality: the `syn` AST as the default parser, the call-graph + data-flow semantic edges,
+  the **Q-Page dual-evidence belief** layer (§4.10, with decay + propagation + the temporal "fever
+  curve"), **deterministic semantic retrieval** (§4.11, TF-IDF/LSA encoders + causal-topology-weighted
+  LSA), and a new evaluation section **§6.7 "Retrieval: challenging RAG, deterministically"** with the
+  measured results — ties lexical RAG, **beats it on semantic recall** (Recall@3 17%→83%), suppresses a
+  refuted contradiction (precision@1 2/2 vs 1/2), and self-improves (Recall@1 8%→100%), all bit-for-bit
+  reproducible with zero extra dependencies. Solved items removed from Limitations / Future work, and
+  the numbers refreshed (~35 KLoC, 480+ tests). The `docs/paper/` multilingual `ccos_regions.*`
+  versions remain a follow-up re-render.
+
 - **SLHAv2 grouped-INT4 embeddings are now a Pro feature (`Feature::SlhAv2Embeddings`).** The
   adaptive per-group INT4 quantization (group size 16, the "SLHAv2 two-level INT4" distilled from
   SCIRUST's KV-cache) that powers semantic recall is now gated behind the Pro license. A
