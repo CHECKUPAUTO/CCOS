@@ -241,6 +241,6 @@ fn main() {
          vector RAG index has no representation of. The parsed-but-unresolved remainder is dominated by\n\
          calls into `std`/external crates, method chains on non-inferable receivers, and macro paths —\n\
          all **correctly** left unresolved: resolve-uniquely-or-skip means CCOS never asserts a causal\n\
-         edge it cannot prove. Deterministic and replay-exact; see docs/MEASUREMENT_ast.md."
+         edge it cannot prove. Deterministic and replay-exact; see docs/MEASUREMENT_resolution_coverage.md."
     );
 }
