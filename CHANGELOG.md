@@ -32,6 +32,12 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`docs/MEASUREMENT_resolution_coverage.md`** — the resolver arc's capstone doc: the 10/10 resolving
+  idioms (each tagged with the slice that added it: #113 → #122 → #124 → #126), the 3/3 deliberate
+  precision-skips and why each is Rust-correct, the structural yield on CCOS's own `src/` (2474 call
+  refs → 963 `Calls` edges; 80 data refs → 43 `DataFlow` edges; the `&T` fix alone: 903 → 963, ≈ +7 %),
+  and the adversarial-review provenance. The example's footer now cross-references this doc.
+
 - **Resolution-coverage measurement (`examples/resolution_coverage.rs`).** A deterministic example that
   enumerates every Rust path shape the call/data-flow resolver handles — crate-rooted, `use`-import
   (fn and module), local submodule path, nested submodule, receiver-type method, `Self::` method, bare
