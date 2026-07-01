@@ -124,6 +124,7 @@ dependencies = [
 name = "ccos"
 version = "0.3.0"
 dependencies = [
+ "ccos-memory-runtime",
  "chrono",
  "criterion",
  "ed25519-dalek",
@@ -141,6 +142,10 @@ dependencies = [
  "tokio",
  "uuid",
 ]
+
+[[package]]
+name = "ccos-memory-runtime"
+version = "0.1.0"
 
 [[package]]
 name = "cfg-if"

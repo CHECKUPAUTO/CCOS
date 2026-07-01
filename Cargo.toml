@@ -61,6 +61,14 @@ lattice-slh-dsa = { version = "0.3", default-features = false, optional = true }
 # full-precision dense index against CCOS's INT4-quantized `nearest_k`.
 scirust-retrieval = { git = "https://github.com/CHECKUPAUTO/scirust", default-features = false, optional = true }
 
+# Opt-in SLHAv2 memory backend. A **zero-dependency** middleware crate: it exposes
+# a backend-neutral `MemoryProvider` API and a self-contained SLHAv2 tile backend
+# that vendors the minimal grouped-INT4 tile decode — so **neither `ccos` nor this
+# crate ever depends on `scirust`, in any configuration**. Behind the `slhav2`
+# feature; the default build does not pull it. See `crates/ccos-memory-runtime`
+# (and its INTEGRATION.md) and the `[workspace]` block at the bottom.
+ccos-memory-runtime = { path = "crates/ccos-memory-runtime", optional = true }
+
 [features]
 # Default = the **sync core** (causal memory, hash-chained event log, recall) plus
 # the real `syn` **AST parser**, now the default ingestion path: it is 36.5% more
@@ -98,6 +106,12 @@ license-pq = ["dep:lattice-slh-dsa"]
 # no new dependency. The eval strategy also needs `llm` (the harness lives there):
 # `cargo run --features "llm,scirust-retrieval" -- eval`. See `src/scirust_bridge.rs`.
 scirust-retrieval = ["dep:scirust-retrieval"]
+# Opt-in **SLHAv2 memory backend**: pulls the `ccos-memory-runtime` middleware
+# crate — a **zero-dependency** SLHAv2 tile backend (HOT→WARM tile compression:
+# 128→96 B, latent preserved) that vendors the minimal decode logic, so it pulls
+# **no `scirust`** (verify: `cargo tree --features slhav2 | grep scirust` → none).
+# Off by default → the default build is byte-identical. `cargo build --features slhav2`.
+slhav2 = ["dep:ccos-memory-runtime"]
 
 [dev-dependencies]
 proptest = "1"
@@ -128,3 +142,12 @@ required-features = ["license"]
 [[example]]
 name = "license_sign_pq"
 required-features = ["license-pq"]
+
+# ── Cargo workspace ─────────────────────────────────────────────────
+# CCOS is the root package; the opt-in SLHAv2 memory backend lives in its own
+# member crate `crates/ccos-memory-runtime`. That crate is **zero-dependency** and
+# pulls no `scirust`, so making CCOS a workspace adds no external dependency and
+# leaves the default `ccos` build behaviorally unchanged — SLHAv2 enters only
+# through the opt-in `slhav2` feature above.
+[workspace]
+members = ["crates/ccos-memory-runtime"]
