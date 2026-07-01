@@ -32,6 +32,21 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Call graph now resolves non-`use` local module-path calls (`submod::fn()`, `outer::inner::fn()`).**
+  Previously a qualified call resolved only when crate-rooted (`crate::…`) or mediated by a matching
+  `use` import; the very common idiom of calling through a bare **local submodule** path with no `use`
+  produced **no `Calls` edge** (measured: three of six common call shapes were unresolved).
+  `resolve_qualified` now falls back — only when no import matches — to `resolve_bare_modpath`, which
+  resolves the leading path as a submodule of the **caller's own crate** (module-file-must-exist,
+  exact — no ancestor shortening — then symbol-must-exist; a present-but-symbol-less module skips).
+  Only the caller's crate is consulted: a bare path is deliberately **not** resolved into an unrelated
+  external crate, because a local `mod` shadows a same-named extern crate in Rust — an adversarial
+  multi-agent review proved the external reading minted false edges (a symbol-less local module falling
+  through to a same-named crate) and stole valid type-method edges, so it is excluded. Composes with
+  the module-vs-type reconciliation (type methods unaffected) and applies to qualified data-flow refs
+  too. **resolve-uniquely-or-skip**, deterministic (indices over sorted ids → replay == live), no new
+  dependencies. Designed and adversarially reviewed via multi-agent workflows; 13 new precision tests.
+
 - **Flagship end-to-end example (`examples/flagship.rs`).** One deterministic run that demonstrates,
   on a single event-sourced agent session, three properties a RAG stack cannot offer: (1) **replay ==
   live** — the session is reconstructed bit-for-bit from its op log (auditable, time-travel-debuggable);
