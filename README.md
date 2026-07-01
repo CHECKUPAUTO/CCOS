@@ -319,6 +319,25 @@ ccos regions src --activate file:src/memory.rs     # cluster into causal regions
 See [`docs/USAGE.md`](docs/USAGE.md) for every command with examples, and `ccos --help`
 for the full list.
 
+## See it run — one command each
+
+```bash
+cargo run --release --example flagship             # the one-run tour: replay==live, contested beliefs, LSA-beats-RAG
+cargo run --release --example resolution_coverage  # the call/data-flow resolver, measured: 10/10 idioms, 963+43 edges on src/
+cargo run -p ccos-memory-runtime --example slha_backend   # opt-in SLHAv2 tile memory: HOT→WARM 128→96 B, zero-dep
+```
+
+`flagship` demonstrates, measured and bit-for-bit reproducible, three things a similarity-only
+RAG stack cannot do: reconstruct the exact context an agent saw (`replay == live`), represent a
+lone refutation *as* a refutation (`qbelief.conflict 0.65` flags the contested claim while the
+dissent's cosine sits *inside* the confirmation band), and recover synonym recall a lexical
+retriever structurally misses (LSA 17 % vs lexical 0 % Recall@1). `resolution_coverage` shows the
+precision-first discipline behind the graph those runs walk — every edge resolve-uniquely-or-skip
+([`docs/MEASUREMENT_resolution_coverage.md`](docs/MEASUREMENT_resolution_coverage.md)). The SLHAv2
+backend is an off-by-default Cargo feature (`slhav2`) provided by the **zero-dependency**
+[`crates/ccos-memory-runtime`](crates/ccos-memory-runtime) workspace member — no `scirust` in any
+configuration.
+
 ## Architecture
 
 ```
