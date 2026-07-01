@@ -121,6 +121,18 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Research paper (`docs/PAPER.md`) refreshed with everything landed since its last update.** New
+  **§6.8 "Call/data-flow resolution coverage"** (10/10 path shapes resolve, 3/3 precision-skips hold,
+  963 `Calls` + 43 `DataFlow` edges on CCOS's own `src/`, the adversarial-review provenance); §5 now
+  describes the Cargo **workspace** and the opt-in zero-dependency **SLHAv2 memory backend**
+  (`ccos-memory-runtime`, `slhav2` feature) and drops the stale claim that an optional
+  `scirust-retrieval` bridge still exists (removed when its private pin became unfetchable); §4.6
+  gains the **DTW timeline alignment** (cross-run regression hunting over recorded cognitive
+  histories); §6.5 self-hosting figures re-measured (~2,400 nodes / ~3,900 edges, was ~350/~400);
+  §7/§9 receiver-inference limitation and future-work items updated to the current resolver; counts
+  refreshed (~37 KLoC, **649 tests** across all targets); Reproducibility block gains
+  `resolution_coverage` and `flagship`.
+
 - **Research paper (`docs/PAPER.md`) brought up to date with the current system.** The paper
   described an earlier CCOS (line-based heuristic parser, no semantic edges, ~6 KLoC, 364 tests). It
   now reflects reality: the `syn` AST as the default parser, the call-graph + data-flow semantic edges,
