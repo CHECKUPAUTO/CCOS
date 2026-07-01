@@ -439,9 +439,7 @@ pub fn scan_with(input: &str, cfg: &SanitizerConfig) -> ScanReport {
             .or_insert(0) += 1;
         report.findings.push(f);
     }
-    report
-        .findings
-        .sort_by(|a, b| a.byte_offset.cmp(&b.byte_offset));
+    report.findings.sort_by_key(|f| f.byte_offset);
     report
 }
 
