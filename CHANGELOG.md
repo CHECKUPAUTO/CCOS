@@ -22,6 +22,15 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Flagship end-to-end example (`examples/flagship.rs`).** One deterministic run that demonstrates,
+  on a single event-sourced agent session, three properties a RAG stack cannot offer: (1) **replay ==
+  live** — the session is reconstructed bit-for-bit from its op log (auditable, time-travel-debuggable);
+  (2) **contested knowledge** — a lone refutation is a typed `Contradicts` edge and `qbelief.conflict`
+  flags the claim, where a similarity retriever's cosine puts the dissent *inside* the confirmation
+  band (polarity-blind); (3) **beating RAG on its own turf** — the deterministic LSA encoder recovers
+  synonym recall (17% vs 0% Recall@1, MRR 0.458 vs 0.185) a lexical retriever structurally misses.
+  Pure-Rust, zero external dependencies, byte-exact reproducible. `cargo run --release --example flagship`.
+
 - **Data-flow resolution now links *bare* global refs through imports and same-module scope, not only
   when globally unique.** A bare `static`/`const` reference previously became a `DataFlow` edge
   only when exactly one symbol of that name existed graph-wide, so a common name like
