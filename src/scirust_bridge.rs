@@ -93,13 +93,19 @@ mod tests {
 
         let first = dense_rank(&docs, query);
         let second = dense_rank(&docs, query);
-        assert_eq!(first, second, "ranking must be deterministic (replay invariant)");
+        assert_eq!(
+            first, second,
+            "ranking must be deterministic (replay invariant)"
+        );
         assert_eq!(first.len(), docs.len(), "every doc is ranked");
 
         // The unrelated lorem-ipsum doc shares no query term, so it ranks last;
         // a fox/brown/quick doc ranks first.
         assert_eq!(first.last().map(String::as_str), Some("b"));
-        assert!(matches!(first.first().map(String::as_str), Some("a") | Some("c")));
+        assert!(matches!(
+            first.first().map(String::as_str),
+            Some("a") | Some("c")
+        ));
     }
 
     #[test]
