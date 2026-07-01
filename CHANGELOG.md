@@ -32,6 +32,19 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **BEIR-style benchmark harness (`examples/beir_eval.rs` + `docs/MEASUREMENT_beir.md`).** CCOS's
+  deterministic retrievers evaluated on **standard IR benchmarks** in the native BEIR format
+  (`corpus.jsonl` + `queries.jsonl` + `qrels/test.tsv`; datasets fetched locally, never committed —
+  `/data/` is git-ignored). Four systems over the same corpus — exact BM25, hashed TF-IDF dense, its
+  LSA projection, and their RRF fusion — scored with nDCG@10 / R@10 / R@100 / MRR@10 / MAP. Headline,
+  measured: **CCOS's zero-dependency BM25 scores nDCG@10 0.662 on SciFact vs 0.665 published for the
+  tuned Anserini baseline** (and 0.307 vs 0.325 on NFCorpus) with a plain lowercase tokenizer — no
+  stemming, no stopwords, no tuning. The doc reads the results honestly: BM25 dominates where query
+  and document share vocabulary (the mirror of the synonym crux, where the same LSA encoder wins),
+  hybrid fusion dilutes a dominant system, and the residual gap to Anserini is stemming. Output is
+  bit-for-bit identical across runs (timings on stderr); zero new dependencies. Closes the paper's
+  future-work item 4.
+
 - **README "See it run" section.** The repo's front door now surfaces the three one-command
   demonstrations: `flagship` (replay==live + contested beliefs + LSA-beats-RAG in one deterministic
   run), `resolution_coverage` (the resolver measured: 10/10 idioms, 963+43 edges on `src/`), and the
