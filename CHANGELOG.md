@@ -6,6 +6,26 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Tamper-evident chain on the session op-log — paper §9 item 2 fully landed.** CCOS had three
+  logs and two of them were hash-chained; the third — the `AgentSession` op-log (the
+  `<workspace>.ccos.oplog` sidecar), the timeline that actually carries `replay == live` — was not.
+  It now is: every recorded `Op` links into a canonical SHA-256 chain
+  (`hashᵢ = H(prevᵢ | stepᵢ | opᵢ)`, no wall-clock fields, so the chain is bit-reproducible), the
+  replay **baseline** is pinned by its own commitment (a baseline edit is as detectable as an op
+  edit), and compaction hands the folded prefix's head to the `anchor` — the chain head never moves,
+  so one hash commits to the entire history since genesis. Enforcement has teeth:
+  `AgentSession::open` **refuses** a workspace whose sidecar fails the check (new
+  `MemoryError::TimelineTampered`), leaving the sidecar intact for forensics — previously a
+  tampered op-log was silently *self-healed away*, destroying the evidence. Chain-valid staleness
+  (an out-of-band `ccos memory` write) still self-heals exactly as before, and pre-chain sidecars
+  load unchanged (chain backfilled on open, persisted on the next checkpoint). `ccos verify
+  <workspace>` audits a sidecar *without* opening it (`agent_session::audit_workspace`); replay
+  never reads the chain, so `replay == live` is untouched (the whole property suite passes
+  unmodified). 7 new tests: payload tamper, reorder, mid-deletion, baseline tamper, legacy
+  backfill, head continuity across compaction+restart, fork prefix validity.
+
 ### Removed
 
 - **External dense-retrieval backend (`scirust-retrieval` feature).** Removed the optional bridge to the

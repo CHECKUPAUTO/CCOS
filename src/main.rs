@@ -878,12 +878,46 @@ fn run_analyze(opts: &AnalyzeOpts) -> CliResult {
     Ok(())
 }
 
-/// `ccos verify <snapshot.json>` — re-check a saved snapshot's integrity: the
-/// hash chain must validate and the graph must hold no dangling edges.
+/// `ccos verify <snapshot.json | workspace>` — re-check a saved snapshot's
+/// integrity (both hash chains must validate, no dangling edges), or — when the
+/// argument is an agent workspace with a `.oplog` sidecar — audit the timeline's
+/// tamper-evident chain without opening (or healing) the session.
 fn run_verify(file: Option<&str>) -> CliResult {
     let Some(file) = file else {
-        return Err(CliError::usage("usage: ccos verify <snapshot.json>"));
+        return Err(CliError::usage(
+            "usage: ccos verify <snapshot.json | workspace>",
+        ));
     };
+    // Workspace mode: the argument (a `workspace.ccos` file or its directory)
+    // has a timeline sidecar next to it.
+    if let Some(audit) = ccos::agent_session::audit_workspace(Path::new(file)) {
+        println!("╔══════════════════════════════════════════════╗");
+        println!("║  CCOS verify — {:<30}║", truncate(file, 30));
+        println!("╚══════════════════════════════════════════════╝\n");
+        println!(
+            "  Timeline ops:      {} live tail + {} compacted",
+            audit.ops, audit.folded
+        );
+        if audit.legacy {
+            println!("  Timeline chain:    pre-chain sidecar (established on next checkpoint)");
+        } else {
+            println!(
+                "  Timeline chain:    {} link(s) verified | valid: {}",
+                audit.integrity.verified_events, audit.integrity.valid
+            );
+            println!("  Chain head:        {}", truncate(&audit.head, 24));
+        }
+        for err in audit.integrity.errors.iter().take(10) {
+            println!("    ! {err}");
+        }
+        return if audit.integrity.valid {
+            println!("\n  ✓ timeline verified");
+            Ok(())
+        } else {
+            println!("\n  ✗ verification FAILED (sidecar left untouched for forensics)");
+            Err(CliError::status(1))
+        };
+    }
     let snapshot = match KernelSnapshot::load(file) {
         Ok(s) => s,
         Err(e) => {
