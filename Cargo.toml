@@ -50,6 +50,17 @@ ed25519-dalek = { version = "2", optional = true }
 # stable `sha2`/`sha3`/`subtle`/`zeroize`, so `license` and `license-pq` compose.
 lattice-slh-dsa = { version = "0.3", default-features = false, optional = true }
 
+# Optional external retrieval backend (ROADMAP — "better retrieval"). Behind the
+# `scirust-retrieval` feature so the **default build pulls neither the crate nor
+# any new dependency** and stays byte-identical. We depend on its *pure core*
+# (`default-features = false`): no `scirust-core` autodiff/nn stack — only
+# `serde`/`sha2`, already in our tree — exposing an exact, full-precision
+# `DenseIndex` plus a bring-your-own-embeddings `Encoder` trait. CCOS feeds it its
+# own deterministic TF-IDF vectors (`src/scirust_bridge.rs`), so the replay
+# invariant holds. Used by the `scirust-dense` eval strategy to weigh a
+# full-precision dense index against CCOS's INT4-quantized `nearest_k`.
+scirust-retrieval = { git = "https://github.com/CHECKUPAUTO/scirust", default-features = false, optional = true }
+
 [features]
 # Default = the **sync core** (causal memory, hash-chained event log, recall) plus
 # the real `syn` **AST parser**, now the default ingestion path: it is 36.5% more
@@ -80,6 +91,13 @@ license = ["dep:ed25519-dalek"]
 # `slhdsa.` prefix dispatches which verifier checks a given token). Pulls in
 # `slh-dsa`; still no cryptography in the default build.
 license-pq = ["dep:lattice-slh-dsa"]
+# Opt-in external retrieval backend: pulls the pure core of the `scirust-retrieval`
+# crate (no `scirust-core`, only `serde`/`sha2`) and wires it into the eval harness
+# as the `scirust-dense` strategy — an exact, full-precision `DenseIndex` over CCOS's
+# own TF-IDF embeddings. Off by default → the default build is byte-identical and pulls
+# no new dependency. The eval strategy also needs `llm` (the harness lives there):
+# `cargo run --features "llm,scirust-retrieval" -- eval`. See `src/scirust_bridge.rs`.
+scirust-retrieval = ["dep:scirust-retrieval"]
 
 [dev-dependencies]
 proptest = "1"
