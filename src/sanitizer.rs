@@ -31,10 +31,15 @@
 //! ## What this is — and what it is *not*
 //!
 //! This is a **deterministic normalisation pass**, not an anti-prompt-injection
-//! oracle. It closes the *hidden-character* class completely and verifiably. It
+//! oracle. It closes the *hidden-character* class completely and verifiably, and
+//! surfaces the **mixed-script homoglyph** class (see [`scan_confusables`]). It
 //! deliberately does **not** attempt:
-//! - **homoglyph / confusable** detection (Cyrillic `а` vs Latin `a`) — that
-//!   needs a large confusables table and carries real false-positive risk;
+//! - **exhaustive** homoglyph coverage — [`scan_confusables`] flags only tokens
+//!   that *mix* a real Latin letter with a Cyrillic/Greek look-alike (the
+//!   identifier/URL spoofing signature, `раypal`), over a **curated high-value
+//!   subset** of UTS-39. Pure single-script spoofs and the full confusables table
+//!   are out of scope — the mixed-script rule is what keeps false positives off
+//!   legitimate multilingual prose;
 //! - **semantic** injection ("ignore your instructions" in plain visible text) —
 //!   no character-level pass can catch a paraphrase. That is the job of the
 //!   downstream [`crate::injection_classifier`] *signal*, and ultimately of
@@ -69,6 +74,11 @@ pub enum AnomalyKind {
     /// Other default-ignorable / deprecated format codepoint or variation
     /// selector used as a covert channel. **Low** risk, surfaced for completeness.
     OtherFormat,
+    /// A **confusable** (homoglyph): a Cyrillic/Greek character visually identical to a Latin
+    /// letter, appearing in a token that *mixes* it with real Latin letters — the identifier /
+    /// URL spoofing signature (`раypal`). **High** risk. Appended last so old reports stay
+    /// deserializable. *(Detected per-token; see [`scan_confusables`].)*
+    Confusable,
 }
 
 /// Coarse triage severity.
@@ -88,13 +98,16 @@ impl AnomalyKind {
             AnomalyKind::ZeroWidth => "zero-width",
             AnomalyKind::Control => "control",
             AnomalyKind::OtherFormat => "other-format",
+            AnomalyKind::Confusable => "confusable",
         }
     }
 
     /// Triage severity for the kind.
     pub fn severity(self) -> Severity {
         match self {
-            AnomalyKind::BidiControl | AnomalyKind::TagChar => Severity::High,
+            AnomalyKind::BidiControl | AnomalyKind::TagChar | AnomalyKind::Confusable => {
+                Severity::High
+            }
             AnomalyKind::ZeroWidth | AnomalyKind::Control => Severity::Medium,
             AnomalyKind::OtherFormat => Severity::Low,
         }
@@ -279,6 +292,105 @@ fn other(name: &str) -> Option<(AnomalyKind, String)> {
     Some((AnomalyKind::OtherFormat, name.to_string()))
 }
 
+/// The Latin letter a Cyrillic/Greek character is a **confusable** (homoglyph) of, or `None` if it
+/// is not in the curated set. This is a **high-value curated subset** of Unicode UTS-39 confusables
+/// (the letters actually used in identifier / domain spoofing), not the exhaustive table — honest
+/// scope, matching the rest of the sanitizer. Deterministic pure `const`-style lookup.
+fn confusable_skeleton(c: char) -> Option<char> {
+    Some(match c {
+        // ── Cyrillic → Latin (lowercase) ──
+        '\u{0430}' => 'a', // а
+        '\u{0435}' => 'e', // е
+        '\u{043E}' => 'o', // о
+        '\u{0440}' => 'p', // р
+        '\u{0441}' => 'c', // с
+        '\u{0443}' => 'y', // у
+        '\u{0445}' => 'x', // х
+        '\u{0456}' => 'i', // і (Ukrainian)
+        '\u{0455}' => 's', // ѕ
+        '\u{0458}' => 'j', // ј
+        '\u{04BB}' => 'h', // һ
+        // ── Cyrillic → Latin (uppercase) ──
+        '\u{0410}' => 'A', // А
+        '\u{0412}' => 'B', // В
+        '\u{0415}' => 'E', // Е
+        '\u{041A}' => 'K', // К
+        '\u{041C}' => 'M', // М
+        '\u{041D}' => 'H', // Н
+        '\u{041E}' => 'O', // О
+        '\u{0420}' => 'P', // Р
+        '\u{0421}' => 'C', // С
+        '\u{0422}' => 'T', // Т
+        '\u{0423}' => 'Y', // У
+        '\u{0425}' => 'X', // Х
+        // ── Greek → Latin ──
+        '\u{03BF}' => 'o', // ο
+        '\u{03B1}' => 'a', // α
+        '\u{03C1}' => 'p', // ρ
+        '\u{03BD}' => 'v', // ν
+        '\u{0391}' => 'A', // Α
+        '\u{039F}' => 'O', // Ο
+        '\u{03A1}' => 'P', // Ρ
+        '\u{0392}' => 'B', // Β
+        '\u{0397}' => 'H', // Η
+        '\u{039A}' => 'K', // Κ
+        '\u{03A4}' => 'T', // Τ
+        '\u{03A7}' => 'X', // Χ
+        _ => return None,
+    })
+}
+
+/// Whether a character can be part of an identifier / URL / path token (letters, digits, and the
+/// `. - _` connectors), for the confusable tokenizer.
+fn is_token_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '.' || c == '-' || c == '_'
+}
+
+/// Per-**token** confusable detection: find identifier-like tokens that **mix** a real ASCII-Latin
+/// letter with a Cyrillic/Greek look-alike — the `раypal` spoofing signature — and emit a
+/// [`Finding`] for each confusable character in them. Pure single-script tokens (all-Latin, or
+/// legitimate all-Cyrillic prose) are **not** flagged, so this keeps false positives to the actual
+/// mixed-script attack. Findings come out in ascending byte order.
+pub fn scan_confusables(input: &str) -> Vec<Finding> {
+    let mut out = Vec::new();
+    // Walk tokens: a token is a maximal run of `is_token_char`. Within one, collect its confusable
+    // characters and note whether it also contains a plain ASCII-Latin letter (the mixed-script
+    // signal). On a token boundary, emit the confusables only if the token was mixed.
+    let mut has_ascii_latin = false;
+    let mut confusables: Vec<(usize, usize, char, char)> = Vec::new(); // (byte, char_idx, char, skeleton)
+    let flush = |confusables: &mut Vec<(usize, usize, char, char)>,
+                 has_ascii_latin: &mut bool,
+                 out: &mut Vec<Finding>| {
+        if *has_ascii_latin {
+            for &(byte_offset, char_index, c, skel) in confusables.iter() {
+                out.push(Finding {
+                    byte_offset,
+                    char_index,
+                    codepoint: c as u32,
+                    kind: AnomalyKind::Confusable,
+                    label: format!("→{skel}"),
+                });
+            }
+        }
+        confusables.clear();
+        *has_ascii_latin = false;
+    };
+    for (char_index, (byte_offset, c)) in input.char_indices().enumerate() {
+        if is_token_char(c) {
+            if c.is_ascii_alphabetic() {
+                has_ascii_latin = true;
+            }
+            if let Some(skel) = confusable_skeleton(c) {
+                confusables.push((byte_offset, char_index, c, skel));
+            }
+        } else {
+            flush(&mut confusables, &mut has_ascii_latin, &mut out);
+        }
+    }
+    flush(&mut confusables, &mut has_ascii_latin, &mut out);
+    out
+}
+
 /// Short mnemonic for a C0/DEL/C1 control codepoint.
 fn control_name(cp: u32) -> &'static str {
     const C0: [&str; 32] = [
@@ -317,6 +429,17 @@ pub fn scan_with(input: &str, cfg: &SanitizerConfig) -> ScanReport {
             });
         }
     }
+    // Merge the per-token confusable findings and restore ascending byte order (defang relies on
+    // it). Confusable characters never coincide with a hidden-char finding (disjoint codepoints),
+    // so no offset collides.
+    for f in scan_confusables(input) {
+        *report
+            .counts
+            .entry(f.kind.as_str().to_string())
+            .or_insert(0) += 1;
+        report.findings.push(f);
+    }
+    report.findings.sort_by_key(|f| f.byte_offset);
     report
 }
 
@@ -371,6 +494,55 @@ mod tests {
         // Cow::Borrowed → same backing pointer, no copy.
         assert!(matches!(out, Cow::Borrowed(_)));
         assert_eq!(out.as_ptr(), src.as_ptr());
+    }
+
+    #[test]
+    fn confusable_mixed_script_token_is_flagged_and_surfaced() {
+        // Cyrillic р (U+0440) + а (U+0430) mixed with Latin y,p,a,l — the "paypal" homoglyph spoof.
+        let spoof = "login at \u{0440}\u{0430}ypal.com now";
+        let report = scan(spoof);
+        let confs: Vec<&Finding> = report
+            .findings
+            .iter()
+            .filter(|f| f.kind == AnomalyKind::Confusable)
+            .collect();
+        assert_eq!(
+            confs.len(),
+            2,
+            "both look-alikes flagged: {:?}",
+            report.findings
+        );
+        assert_eq!(report.highest_severity(), Some(Severity::High));
+        // defang surfaces each explicitly (auditable), never silently normalising.
+        let (out, _) = defang(spoof);
+        assert!(
+            out.contains("→p") && out.contains("→a"),
+            "surfaced skeletons: {out}"
+        );
+    }
+
+    #[test]
+    fn legitimate_single_script_text_is_not_a_confusable() {
+        // Pure ASCII: no confusables (and no false positive on a real domain).
+        assert!(scan("please login at paypal.com now")
+            .findings
+            .iter()
+            .all(|f| f.kind != AnomalyKind::Confusable));
+        // Pure Cyrillic prose (привет) — no ASCII-Latin in the token, so not a spoof signature.
+        let russian = "\u{043F}\u{0440}\u{0438}\u{0432}\u{0435}\u{0442}";
+        assert!(
+            scan(russian)
+                .findings
+                .iter()
+                .all(|f| f.kind != AnomalyKind::Confusable),
+            "legitimate Cyrillic text is not flagged"
+        );
+    }
+
+    #[test]
+    fn confusable_scan_is_deterministic() {
+        let s = "\u{0430}dmin panel \u{0440}oot access";
+        assert_eq!(scan(s).findings, scan(s).findings);
     }
 
     #[test]
