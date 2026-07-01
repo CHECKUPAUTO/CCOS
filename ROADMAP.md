@@ -459,3 +459,17 @@ or degraded. See `src/license.rs` and `docs/DEPLOYMENT.md` §4.
 ~~`call-graph polish (renamed imports, cross-impl self-calls)`~~ ✅ → **`#13 spectral`**
 (eigenvector-centrality first slice ✅; spectral regions + temporal tensor deferred to a design pass).
 Remaining call-graph: `x.bar()` receiver-type inference. **All P2/P3 quick wins are done.**
+
+### Design pass — SciRust-distilled causality / security / time-travel
+
+The deferred "temporal tensor + scirust work" design pass is written up in
+[`docs/PROPOSAL_scirust_enhancements.md`](docs/PROPOSAL_scirust_enhancements.md):
+a prioritized set of enhancements that distill mature SciRust algorithms (SCM
+`do()`, RTS Kalman smoother, CUSUM/Mann-Kendall changepoints, conformal
+calibration, IBP certificates, MinHash-LSH, DTW) into CCOS's three moat axes —
+each with an exact integration point, a determinism (`replay == live`) analysis,
+and the structural RAG-differentiation it buys. Tier-1 quick wins: causal-of-drift
+attribution (`cause`/`blame`), convergent multi-hop belief propagation
+(`Op::Propagate`), RTS belief retrodiction, and a certified injection-verdict
+robustness radius. All respect the "distill, don't link" + off-by-default
+discipline; none touch the default-build byte-identity.
