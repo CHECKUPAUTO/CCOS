@@ -32,6 +32,22 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Resolution-coverage measurement (`examples/resolution_coverage.rs`).** A deterministic example that
+  enumerates every Rust path shape the call/data-flow resolver handles — crate-rooted, `use`-import
+  (fn and module), local submodule path, nested submodule, receiver-type method, `Self::` method, bare
+  const, import-scoped const, renamed const — each tagged with the slice that added it, confirms the
+  shapes it *deliberately skips* (bare `extern::fn()` without `use`, globally-ambiguous, unknown
+  module), and reports the structural yield on CCOS's own `src/` (fn→fn `Calls` + fn→const `DataFlow`
+  edges resolved vs. references parsed). The honest "what a RAG index cannot represent" number, replay-
+  exact. (Building this surfaced the reference-receiver gap fixed below.)
+
+- **Receiver-type inference now handles reference-typed receivers (`x: &T`, `x: &mut T`).** Method
+  calls on a reference-annotated receiver (`fn f(x: &T) { x.bar() }`) — the pervasive `&self`/`&T`
+  pattern — previously inferred no type, so `x.bar()` resolved to nothing. `annotation_type` now peels
+  leading references to the underlying type (`&T`/`&mut T`/`&&T`/`&'a T` ⇒ `T`), the same inference and
+  the same precision as the owned `x: T` case: the `(type, method)` cardinality guard still gates every
+  edge, and `&dyn Trait` / `&Box<T>` / `&[T]` / `&GenericParam` remain (correctly) uninferred.
+
 - **Data-flow resolution now follows *renamed* imports (`use m::MAX as LIMIT; … LIMIT`).** A renamed
   const/static import bound a local alias the data-flow pass didn't understand, so the reference
   resolved to nothing — even though the call resolver already handled renamed imports. `resolve_data_flow`

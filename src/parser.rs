@@ -1105,6 +1105,12 @@ mod syn_ast {
     /// [`impl_self_type_name`] keys impl blocks, so a receiver type and its impl agree. References,
     /// wrappers, trait objects, tuples, `impl`/`dyn Trait`, and generic params → `None`.
     fn annotation_type(ty: &syn::Type, generics: &HashSet<String>) -> Option<String> {
+        // Peel leading references: `x: &T` / `x: &mut T` call methods on `T` (auto-ref of `&self`), so
+        // the receiver type is `T` — the same inference, and the same precision, as the owned `x: T`
+        // case (the `(type, method)` index's cardinality guard still gates every resulting edge).
+        if let syn::Type::Reference(r) = ty {
+            return annotation_type(&r.elem, generics);
+        }
         let syn::Type::Path(tp) = ty else {
             return None;
         };
@@ -1808,6 +1814,49 @@ mod syn_tests {
         assert!(
             callees.contains(&"T::helper".to_string()),
             "x.helper() with x: T → T::helper, got {callees:?}"
+        );
+    }
+
+    #[test]
+    fn syn_captures_reference_typed_receiver_method_calls() {
+        // A reference-typed receiver `x: &T` / `y: &mut T` calls methods on `T` (auto-ref of `&self`),
+        // so `x.helper()` / `y.helper()` resolve to `T::helper` — leading `&`/`&mut` are peeled to the
+        // underlying type, the same inference (and precision) as the owned `x: T` case.
+        let src = "struct T;\nimpl T {\n  fn run(x: &T, y: &mut T) { x.helper(); y.helper(); }\n  fn helper(&self) {}\n}";
+        let r = ASTParser::new().parse_source("t.rs", src);
+        let n = r
+            .call_sites
+            .iter()
+            .filter(|c| c.caller == "run" && c.callee == "T::helper")
+            .count();
+        assert_eq!(
+            n,
+            2,
+            "both &T and &mut T receivers resolve x.helper() to T::helper, got {:?}",
+            r.call_sites
+                .iter()
+                .filter(|c| c.caller == "run")
+                .map(|c| &c.callee)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn syn_reference_to_non_type_receiver_still_dropped() {
+        // Peeling references does not loosen precision: a `&dyn Trait` and a `&Box<T>` behind a
+        // reference are still not concrete receiver types, so their method calls are dropped — no
+        // false `T::m` edge.
+        let src = "struct S;\nfn run(a: &dyn std::fmt::Debug, b: &Box<S>) { a.fmt(); b.get(); }";
+        let r = ASTParser::new().parse_source("t.rs", src);
+        let typed: Vec<&String> = r
+            .call_sites
+            .iter()
+            .filter(|c| c.caller == "run" && c.callee.contains("::"))
+            .map(|c| &c.callee)
+            .collect();
+        assert!(
+            typed.is_empty(),
+            "a &dyn Trait / &Box receiver is not a concrete type — dropped, got {typed:?}"
         );
     }
 
