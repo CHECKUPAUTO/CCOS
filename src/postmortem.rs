@@ -41,6 +41,7 @@ commands:
   diff A B | d             which files entered/left the working set between A and B
   energy A B | e           node-level Δscore + failure-pressure between A and B
   missing <node> [budget] | m   the step a node is first evicted from the budgeted window
+  cause <node> | c         which recorded op moved a node's score most (drift attribution)
   stats | s                memory counts at the cursor
   help | h | ?             this help
   quit | q                 leave";
@@ -137,6 +138,10 @@ impl Debugger {
                     Outcome::Print(self.render_missing(node, budget))
                 }
                 None => Outcome::Print("usage: missing <node> [budget]".to_string()),
+            },
+            "cause" | "c" => match rest.first() {
+                Some(node) => Outcome::Print(self.render_cause(node)),
+                None => Outcome::Print("usage: cause <node>".to_string()),
             },
             other => Outcome::Print(format!("unknown command '{other}' (try 'help')")),
         }
@@ -389,6 +394,31 @@ impl Debugger {
         )
     }
 
+    /// Attribute a node's causal-score drift to the recorded operation that moved it most — the
+    /// CUSUM change-point over its replayed trajectory ([`AgentSession::attribute_drift`]). This is
+    /// the auditable "which op did this" that the `missing` watchpoint's raw trigger line only
+    /// guessed at: a tested change-point, not the op that merely happened at the eviction step.
+    fn render_cause(&self, node: &str) -> String {
+        let id = normalize_id(node);
+        match self.session.attribute_drift(&id) {
+            Some(c) => format!(
+                "drift attribution — {id}\n  {} {:+.3} at step {}\n  cause: {}\n  (CUSUM {:.3})",
+                if c.delta >= 0.0 {
+                    "score rose"
+                } else {
+                    "score fell"
+                },
+                c.delta,
+                c.step,
+                c.op,
+                c.cusum,
+            ),
+            None => format!(
+                "{id}: no attributable drift (flat trajectory, or the break is below the compaction floor)"
+            ),
+        }
+    }
+
     /// The journal line for a given logical step (e.g. `t=6  SignalFailure(…)`).
     fn op_at(&self, step: usize) -> Option<String> {
         self.session.timeline().into_iter().find(|l| {
@@ -585,6 +615,20 @@ mod tests {
             report.contains("fail 0.00→"),
             "pressure column present: {report}"
         );
+    }
+
+    #[test]
+    fn cause_attributes_drift_to_a_recorded_op() {
+        let mut d = Debugger::new(demo_session());
+        let report = out(d.command("cause src/db.rs"));
+        assert!(
+            report.contains("drift attribution") && report.contains("cause:"),
+            "reports the culprit op: {report}"
+        );
+        assert!(report.contains("step"), "names the timeline step: {report}");
+        // Bare `cause` prints usage; an unknown node reports no attributable drift.
+        assert_eq!(out(d.command("cause")), "usage: cause <node>");
+        assert!(out(d.command("cause src/ghost.rs")).contains("no attributable drift"));
     }
 
     #[test]

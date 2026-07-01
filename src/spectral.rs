@@ -317,6 +317,24 @@ impl TemporalProfile {
     pub fn peak_temperature(&self) -> f64 {
         self.temperature().into_iter().fold(0.0_f64, f64::max)
     }
+
+    /// **Retrodicted belief** for `claim`: the raw [`belief_series`](Self::belief_series) run through
+    /// a deterministic RTS Kalman smoother ([`crate::retrodict::rts_smooth`]), so each past step's
+    /// belief is reconstructed with the minimum-variance estimate given *all* steps — including
+    /// future ones. Where the raw fever-curve shows what the engine believed moment-to-moment, this
+    /// shows what it *should* have believed at each moment given hindsight — the retrodiction a
+    /// stateless retriever cannot phrase. `q`/`r` are the process/measurement variances (drift speed
+    /// vs reading noise). Empty when the claim is not tracked.
+    pub fn retrodicted_belief(&self, claim: &NodeId, q: f64, r: f64) -> Vec<f64> {
+        crate::retrodict::rts_smooth(&self.belief_series(claim), q, r)
+    }
+
+    /// **Retrodicted tension** for `claim` — the RTS-smoothed [`tension_series`](Self::tension_series),
+    /// the dual of [`retrodicted_belief`](Self::retrodicted_belief). Empty when the claim is not
+    /// tracked.
+    pub fn retrodicted_tension(&self, claim: &NodeId, q: f64, r: f64) -> Vec<f64> {
+        crate::retrodict::rts_smooth(&self.tension_series(claim), q, r)
+    }
 }
 
 /// Build the [`TemporalProfile`] `Θ[claim, {Belief, Tension}, t]` for `claims` across an ordered
@@ -545,5 +563,52 @@ mod tests {
         assert!(prof.peak_temperature() > 0.0);
         // An untracked claim yields an empty series (no panic).
         assert!(prof.tension_series(&"absent".into()).is_empty());
+    }
+
+    #[test]
+    fn retrodicts_belief_over_a_scripted_trajectory() {
+        // A claim that starts unknown, gains support over three steps, then holds. Retrodiction folds
+        // the later, firmer belief back so the early steps read higher than the raw fever-curve did.
+        let claim: NodeId = "claim".into();
+        let mut graphs = Vec::new();
+        let mut g = MemoryGraph::new(0.0, usize::MAX);
+        g.upsert_node(
+            "claim".into(),
+            "claim".into(),
+            String::new(),
+            NodeType::ContextBlock,
+        );
+        graphs.push(g.clone()); // t0: no evidence, belief 0
+        for i in 0..3 {
+            let s = format!("s{i}");
+            g.upsert_node(
+                s.clone().into(),
+                s.clone(),
+                String::new(),
+                NodeType::ContextBlock,
+            );
+            g.add_edge(s.into(), "claim".into(), 1.0, EdgeType::Supports);
+            graphs.push(g.clone()); // t1..t3: belief climbs toward +1
+        }
+        let refs: Vec<&MemoryGraph> = graphs.iter().collect();
+        let prof = temporal_profile(refs, std::slice::from_ref(&claim), 0.0);
+
+        let raw = prof.belief_series(&claim);
+        let smoothed = prof.retrodicted_belief(&claim, 0.02, 0.1);
+        assert_eq!(smoothed.len(), raw.len());
+        assert_eq!(raw[0], 0.0, "starts unknown");
+        assert!(
+            smoothed[0] > raw[0],
+            "retrodiction lifts the initial belief given the firmer future: {smoothed:?}"
+        );
+        // Deterministic (replay == live).
+        let again = prof.retrodicted_belief(&claim, 0.02, 0.1);
+        assert_eq!(
+            smoothed.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            again.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        );
+        assert!(prof
+            .retrodicted_belief(&"absent".into(), 0.02, 0.1)
+            .is_empty());
     }
 }
