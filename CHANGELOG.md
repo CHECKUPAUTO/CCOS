@@ -32,6 +32,11 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **README "See it run" section.** The repo's front door now surfaces the three one-command
+  demonstrations: `flagship` (replay==live + contested beliefs + LSA-beats-RAG in one deterministic
+  run), `resolution_coverage` (the resolver measured: 10/10 idioms, 963+43 edges on `src/`), and the
+  opt-in zero-dependency SLHAv2 backend example (`-p ccos-memory-runtime --example slha_backend`).
+
 - **`docs/MEASUREMENT_resolution_coverage.md`** — the resolver arc's capstone doc: the 10/10 resolving
   idioms (each tagged with the slice that added it: #113 → #122 → #124 → #126), the 3/3 deliberate
   precision-skips and why each is Rust-correct, the structural yield on CCOS's own `src/` (2474 call
