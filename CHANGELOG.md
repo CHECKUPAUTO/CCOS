@@ -32,6 +32,20 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Quarantined neural embedder (`neural-embed` feature, off by default).** Lands the paper's
+  future-work item 1 *as a quarantine*: `src/neural_embed.rs` provides `NeuralEncoder`, a
+  `retrieval::Encoder` over a **local** Ollama-style `/api/embeddings` endpoint, so it drops into any
+  `SemanticRetriever`/`HybridRetriever` unchanged. The contract is explicit — the default build
+  compiles none of it and stays bit-for-bit replayable; the feature pulls **no new crate** (only the
+  in-tree `reqwest`'s blocking client); the endpoint is local, so nothing leaves the host; and the
+  neural path is **not replay-exact** (weights/server/hardware-dependent), which is exactly why it
+  lives behind the flag. Fail-fast constructor (no silent fallback that would fake semantics),
+  visible degradation (`errors()` counter, zero-vector substitution ranks last), response parser
+  accepts both Ollama dialects and is offline-unit-tested. `examples/neural_vs_lsa.rs` compares
+  lexical / LSA / neural on the synonym crux (graceful with setup instructions when no server is
+  running); `docs/NEURAL_EMBED.md` states the quarantine design. No measured neural numbers are
+  committed on purpose — the measurement docs only carry numbers reproducible from the repo alone.
+
 - **BEIR-style benchmark harness (`examples/beir_eval.rs` + `docs/MEASUREMENT_beir.md`).** CCOS's
   deterministic retrievers evaluated on **standard IR benchmarks** in the native BEIR format
   (`corpus.jsonl` + `queries.jsonl` + `qrels/test.tsv`; datasets fetched locally, never committed —
