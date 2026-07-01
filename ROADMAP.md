@@ -400,6 +400,19 @@ honesty code↔docs↔paper, tests/API). **Fixed in this pass:**
      across the causal graph (`docs/MEASUREMENT_propagation_crux.md`: an effect inherits `±0.31` from a
      `±0.75` cause; the wavefront stops at one hop, no cascade). Deterministic, idempotent. Multi-hop +
      scheduler + an `Op::Propagate` for replay are the next slice.
+   - ✅ **Q-Page belief propagation — multi-hop to convergence (slice 4).**
+     `MemoryGraph::propagate_beliefs_converge(threshold, damping, max_rounds)` repeats the single-hop
+     sweep until a **fixpoint** (a round derives no new edge) or `max_rounds`, so a chain `A → B → C`
+     revises in one call instead of a sweep per hop. Bounded and terminating by construction:
+     `add_edge` dedups on `(source, target, type)` so each directed `(cause, effect, polarity)` triple
+     derives at most one edge (the well-defined fixpoint), and the attenuation `damping · |belief| < 1`
+     makes the wavefront **stop on its own** once inherited belief falls below `threshold` — the
+     `max_rounds` cap only backstops a `Causes` cycle. Deterministic (reuses the single-hop
+     collect→sort→dedup→add discipline), `derived-not-stored` (adds no snapshot state), demonstrated in
+     `examples/propagation_crux.rs` (multi-hop lifts `C` where one hop leaves it at 0). A priority
+     scheduler (topological order, fewer rounds) and a replayable `Op::Propagate` — which needs
+     session-level causal-edge authoring first — remain the next slice. See
+     `docs/PROPOSAL_scirust_enhancements.md` §2.1.
 
 ### P2 — Ergonomics
 
