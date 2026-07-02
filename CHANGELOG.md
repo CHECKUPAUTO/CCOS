@@ -8,6 +8,26 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Cryptographic agent identity for the multi-agent store (`signed-sync`, off by default).** The
+  hash chain proves a bundle's *integrity*; only a signature proves *who* recorded it. The new
+  feature adds exactly that: `ccos sync keygen` creates a per-workspace ed25519 identity
+  (`<workspace>.ccos.key` — the seed never travels and never enters the timeline sidecar), `sync
+  export` then signs the bundle's canonical payload automatically, and `sync import` verifies and
+  **TOFU-pins** the key per agent id (persisted additively in the sidecar). From the first signed
+  contact on: a bundle under the same id with a *different* key refuses (`KeyMismatch` — spoof or
+  unannounced swap), an *unsigned* bundle from a pinned agent refuses (`UnsignedFromPinned` — a
+  stripped signature does not bypass pinning), a bad or half-present signature refuses
+  (`BadSignature`, enforced on **every** build), and a signed bundle on a crypto-free build refuses
+  with a rebuild hint (`SignedUnsupported`) rather than being silently accepted unverified. Pinning
+  happens only after the whole import succeeds — a refused bundle changes no state, keys included.
+  Key rotation is an explicit human act (`keygen` refuses to overwrite). Zero new crates: reuses the
+  same optional `ed25519-dalek` as `license` plus the in-tree `getrandom` (uuid already draws from
+  it); the default build stays crypto-free and unsigned federations work unchanged. 5 new tests
+  (signed round-trip + pin persistence across restart, chain-valid-but-forged refused by signature,
+  spoof + stripped-signature refusals, keygen overwrite refusal, field-pairing on every build) +
+  CLI smoke; `docs/SYNC.md` gains the signed-bundles contract; paper §9 item 4 (new list) marked
+  delivered.
+
 - **Distributed multi-agent store (`ccos sync`) — paper §9 item 5 landed; the future-work list is
   now fully cleared.** Every agent keeps exactly one append-only, hash-chained timeline of its own
   ops; sharing is the exchange of **chain-verified segments** (`SyncBundle`, a plain JSON file — any

@@ -39,6 +39,10 @@ mimalloc = { version = "0.1", optional = true }
 # telemetry, nothing leaves the host. The matching private key is the vendor's and
 # never lives in this tree. See `src/license.rs`.
 ed25519-dalek = { version = "2", optional = true }
+# Entropy for `signed-sync` workspace keygen only. Already in the tree transitively
+# (uuid v4 draws from it), so enabling the feature adds **no new crate** — the same
+# reuse argument as `neural-embed`'s reqwest.
+getrandom = { version = "0.2", optional = true }
 # Optional **post-quantum** offline license verifier (NIST FIPS 205 / SLH-DSA,
 # formerly SPHINCS+) behind the orthogonal `license-pq` feature. A second, fully
 # independent verifier: a `slhdsa.`-tagged token is verified with a baked-in
@@ -100,6 +104,14 @@ license = ["dep:ed25519-dalek"]
 # `slhdsa.` prefix dispatches which verifier checks a given token). Pulls in
 # `slh-dsa`; still no cryptography in the default build.
 license-pq = ["dep:lattice-slh-dsa"]
+# **Signed multi-agent sync**: per-workspace ed25519 identity keys; `sync export`
+# signs the canonical bundle payload and `sync import` verifies + TOFU-pins the
+# key per agent id (spoofing and silent key swaps refused). Reuses the SAME
+# optional `ed25519-dalek` as `license` plus the in-tree `getrandom` for keygen —
+# no new crate. The default build stays crypto-free: unsigned bundles work
+# unchanged, and a *signed* bundle is refused with a rebuild hint rather than
+# silently accepted unverified.
+signed-sync = ["dep:ed25519-dalek", "dep:getrandom"]
 # Opt-in **SLHAv2 memory backend**: pulls the `ccos-memory-runtime` middleware
 # crate — a **zero-dependency** SLHAv2 tile backend (HOT→WARM tile compression:
 # 128→96 B, latent preserved) that vendors the minimal decode logic, so it pulls
@@ -173,3 +185,5 @@ required-features = ["octasoma"]
 # through the opt-in `slhav2` feature above.
 [workspace]
 members = ["crates/ccos-memory-runtime"]
+
+

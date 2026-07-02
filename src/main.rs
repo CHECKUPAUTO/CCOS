@@ -885,7 +885,7 @@ fn run_analyze(opts: &AnalyzeOpts) -> CliResult {
 /// bundle is a plain JSON file, so any transport (including sneakernet) works
 /// and the air-gappable posture survives federation.
 fn run_sync(rest: &[String]) -> CliResult {
-    let usage = "usage: ccos sync export <workspace> --agent <id> --out <bundle.json> [--since N]\n       ccos sync import <workspace> <bundle.json>\n       ccos sync status <workspace>\n       ccos sync materialize <workspace> --out <merged.ccos>";
+    let usage = "usage: ccos sync export <workspace> --agent <id> --out <bundle.json> [--since N]\n       ccos sync import <workspace> <bundle.json>\n       ccos sync status <workspace>\n       ccos sync materialize <workspace> --out <merged.ccos>\n       ccos sync keygen <workspace>   (signed-sync builds: create the signing identity)";
     let sub = rest.first().map(String::as_str);
     let arg = |flag: &str| -> Option<String> {
         rest.iter()
@@ -923,10 +923,15 @@ fn run_sync(rest: &[String]) -> CliResult {
             std::fs::write(&out, &json)
                 .map_err(|e| CliError::fail(format!("ccos sync export: write '{out}': {e}")))?;
             println!(
-                "✓ exported {} op(s) of agent '{}' (from step {}) → {}",
+                "✓ exported {} op(s) of agent '{}' (from step {}, {}) → {}",
                 bundle.len(),
                 bundle.agent,
                 bundle.first_seq,
+                if bundle.sig.is_some() {
+                    "signed"
+                } else {
+                    "unsigned — run `ccos sync keygen` on a signed-sync build to sign"
+                },
                 out
             );
             Ok(())
@@ -967,8 +972,18 @@ fn run_sync(rest: &[String]) -> CliResult {
                 s.len(),
                 truncate(&s.timeline_head(), 16)
             );
+            if let Some(pk) = s.signing_pubkey() {
+                println!("signing: enabled (pubkey {})", truncate(&pk, 16));
+            }
             for (id, ops, head) in s.foreign_agents() {
-                println!("foreign: {id} — {ops} op(s), head {}", truncate(&head, 16));
+                let pinned = match s.pinned_keys().get(&id) {
+                    Some(k) => format!(", key pinned {}", truncate(k, 12)),
+                    None => String::new(),
+                };
+                println!(
+                    "foreign: {id} — {ops} op(s), head {}{pinned}",
+                    truncate(&head, 16)
+                );
             }
             let v = s.merged_view();
             let st = v.stats();
@@ -977,6 +992,27 @@ fn run_sync(rest: &[String]) -> CliResult {
                 st.nodes, st.edges, st.files
             );
             Ok(())
+        }
+        Some("keygen") => {
+            let Some(ws) = rest.get(1) else {
+                return Err(CliError::usage(usage));
+            };
+            #[cfg(feature = "signed-sync")]
+            {
+                let pk = ccos::agent_session::generate_workspace_key(ws)
+                    .map_err(|e| CliError::fail(format!("ccos sync keygen: {e}")))?;
+                println!("✓ signing identity created for {ws}");
+                println!("  public key: {pk}");
+                println!("  (the seed lives in <workspace>.ccos.key — back it up, never share it)");
+                Ok(())
+            }
+            #[cfg(not(feature = "signed-sync"))]
+            {
+                let _ = ws;
+                Err(CliError::fail(
+                    "ccos sync keygen: this build has no signature support — rebuild with --features signed-sync",
+                ))
+            }
         }
         Some("materialize") => {
             let Some(ws) = rest.get(1).filter(|a| !a.starts_with("--")) else {

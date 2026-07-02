@@ -46,6 +46,15 @@ idempotent — no consensus protocol needed.
 - **Gaps** — a segment starting past the known end (`SyncError::Gap`): import the earlier bundle
   first (incremental exports via `--since N` are supported and idempotent on overlap).
 - **Self-import** and **identity-less** sessions/bundles.
+- **Bad signature** — a signed bundle whose ed25519 signature does not verify over its canonical
+  payload (`SyncError::BadSignature`) — including a half-present key/signature pair on *every*
+  build, crypto or not.
+- **Key mismatch** — a bundle signed with a different key than the one TOFU-pinned for that agent
+  id (`SyncError::KeyMismatch`): identity spoof or unannounced key swap, both refused.
+- **Stripped signature** — an *unsigned* bundle from an agent whose key is pinned
+  (`SyncError::UnsignedFromPinned`): removing the signature does not bypass pinning.
+- **Signed bundle on a crypto-free build** (`SyncError::SignedUnsupported`) — refused with a
+  rebuild hint, never silently accepted unverified.
 
 ## Contract notes
 
@@ -55,9 +64,38 @@ idempotent — no consensus protocol needed.
 - **The local baseline stays local.** A seeded (`ccos memory`-initialized) baseline is not part of
   the exchanged history — the *log* is the shared truth. The merged view reconstructs the union of
   recorded timelines.
-- **Identity is declarative, honesty is enforced.** Agent ids are plain strings (no PKI — key
-  management would break the zero-dependency posture); what the chain enforces is *consistency*:
-  whoever holds an id cannot maintain two divergent histories under it against the same peer.
+- **Identity is declarative by default, cryptographic on request.** In the default build agent
+  ids are plain strings and the chain enforces *consistency* (no divergent histories under one id
+  against the same peer). The `signed-sync` feature upgrades that to *authenticity* — see below.
+
+## Signed bundles (`--features signed-sync`)
+
+The hash chain proves a segment's **integrity**; only a signature proves **who** recorded it. The
+`signed-sync` feature adds exactly that, without touching the default posture (it reuses the same
+optional `ed25519-dalek` as `license` plus the in-tree `getrandom` — **no new crate**; the default
+build stays crypto-free and keeps working with unsigned federations):
+
+```bash
+cargo build --features llm,signed-sync
+ccos sync keygen  work/a.ccos            # one-time identity: seed → <workspace>.ccos.key
+ccos sync export  work/a.ccos --agent agent-a --out a.json    # now signed automatically
+ccos sync import  work/b.ccos a.json     # verifies, then TOFU-pins agent-a → that key
+ccos sync status  work/b.ccos            # shows "key pinned …" per foreign agent
+```
+
+- **Sign**: the exporter signs the bundle's canonical JSON (signature fields blanked) with the
+  workspace seed; `pubkey`/`sig` ride in the bundle (additive serde — old readers ignore them).
+- **Verify + TOFU pin**: the first *signed* bundle from an agent pins that key (persisted in the
+  sidecar, additively). From then on a different key, or an unsigned bundle, refuses. Pinning
+  happens only after the whole import succeeds — a refused bundle changes no state, keys included.
+- **Key rotation is an explicit human act**: `keygen` refuses to overwrite an existing key, and
+  peers that pinned the old key will refuse the new one until they re-pin (delete + re-import
+  deliberately).
+- **The seed never travels**: it lives in `<workspace>.ccos.key`, next to — never inside — the
+  timeline sidecar, so sharing an `.oplog` or a bundle cannot leak it.
+- **Threat line**: unsigned federation = tamper-evidence + equivocation-evidence (the chain);
+  signed federation adds spoof-refusal and key-swap-refusal. What it deliberately does *not* add:
+  PKI, revocation, or key servers — trust bootstraps on first contact (TOFU), like SSH.
 
 ## The crux measurement (`examples/sync_crux.rs`)
 
