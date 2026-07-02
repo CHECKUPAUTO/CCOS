@@ -150,6 +150,38 @@ fn main() {
                 ),
             ],
         ),
+        (
+            "field receiver self.db.q()",
+            "S4",
+            &[(
+                "src/lib.rs",
+                "pub struct Db;\nimpl Db { pub fn q(&self) -> i64 { 0 } }\npub struct S { db: Db }\nimpl S { pub fn r(&self) -> i64 { self.db.q() } }\n",
+            )],
+        ),
+        (
+            "fn-return      make().q()",
+            "S4",
+            &[(
+                "src/lib.rs",
+                "pub struct B;\nimpl B { pub fn q(&self) -> i64 { 0 } }\npub fn make() -> B { B }\npub fn r() -> i64 { make().q() }\n",
+            )],
+        ),
+        (
+            "method chain   x.b().q()",
+            "S4",
+            &[(
+                "src/lib.rs",
+                "pub struct A;\npub struct B;\nimpl A { pub fn b(&self) -> B { B } }\nimpl B { pub fn q(&self) -> i64 { 0 } }\npub fn r(x: A) -> i64 { x.b().q() }\n",
+            )],
+        ),
+        (
+            "assoc -> Self  A::make().t()",
+            "S4",
+            &[(
+                "src/lib.rs",
+                "pub struct A;\nimpl A { pub fn make() -> Self { A }\n  pub fn t(&self) -> i64 { 0 } }\npub fn r() -> i64 { A::make().t() }\n",
+            )],
+        ),
     ];
 
     // ── Shapes the resolver correctly SKIPS (precision-first: never a guessed edge) ──────────────
@@ -175,6 +207,15 @@ fn main() {
         (
             "unknown module nope::f()",
             &[("src/api.rs", "pub fn r() -> i64 { nope::f() }\n")],
+        ),
+        (
+            "wrapper field  self.v.push() (v: Vec<_>)",
+            // A field whose declared type is a std wrapper is never a concrete receiver — the
+            // method dispatches to the wrapper, so minting an edge could only be wrong (S4).
+            &[(
+                "src/api.rs",
+                "pub struct S { v: Vec<i64> }\nimpl S { pub fn r(&mut self) { self.v.push(1) } }\n",
+            )],
         ),
     ];
 

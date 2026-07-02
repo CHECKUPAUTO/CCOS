@@ -375,8 +375,11 @@ honesty code↔docs↔paper, tests/API). **Fixed in this pass:**
    qualified `m::CONST`** through the shared `resolve_qualified` machinery; `src/memory.rs`,
    resolve-uniquely-or-skip throughout — never a wrong edge). The data-flow blind spot lexical
    retrieval misses (the cross-vocabulary co-reader link) is measured in
-   `docs/MEASUREMENT_data_flow_crux.md`. Remaining: `x.bar()` receiver-type inference (held for
-   careful manual work); data-flow write/read direction.
+   `docs/MEASUREMENT_data_flow_crux.md`. `x.bar()` receiver-type inference **landed** (#23 + #126
+   typed idioms, then Slice 4: field receivers `self.field.bar()` + declared-return chains
+   `f().bar()` / `x.m().bar()` — the paper's "richer receiver inference" item, **+107 Calls edges
+   (+10.6 %)** on the CCOS corpus; trait-object dispatch skipped *by design*, see
+   `docs/MEASUREMENT_resolution_coverage.md`). Remaining: data-flow write/read direction.
 
    - ✅ **Spectral primitive (#13, first slice).** `src/spectral.rs::eigenvector_centrality` — a
      deterministic, dependency-free power-iteration eigenvector centrality over the (symmetrized,
@@ -482,7 +485,8 @@ or degraded. See `src/license.rs` and `docs/DEPLOYMENT.md` §4.
 ~~`P2.4 (config)`~~ ✅ → ~~`P3.9 (Result CLI)`~~ ✅ → ~~`P1.3 data-flow edges (Slices 1–2)`~~ ✅ →
 ~~`call-graph polish (renamed imports, cross-impl self-calls)`~~ ✅ → **`#13 spectral`**
 (eigenvector-centrality first slice ✅; spectral regions + temporal tensor deferred to a design pass).
-Remaining call-graph: `x.bar()` receiver-type inference. **All P2/P3 quick wins are done.**
+Call-graph receiver inference is **complete** (typed idioms #23/#126 + Slice 4 field/chain
+receivers; dynamic trait-object dispatch skipped by design). **All P2/P3 quick wins are done.**
 
 ### Design pass — SciRust-distilled causality / security / time-travel
 

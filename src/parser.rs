@@ -874,8 +874,67 @@ mod syn_ast {
         /// Local name → concrete receiver type (Slice 3 `x.bar()` inference; see
         /// [`local_receiver_types`]). A bare-ident receiver found here emits a `Type::method` callee.
         local_types: &'a std::collections::BTreeMap<String, String>,
+        /// File-scope typing facts (Slice 4): struct-field types and declared return types,
+        /// consumed by [`receiver_type_of`](Self::receiver_type_of) for field/chain receivers.
+        scope: &'a ScopeTypes,
+        /// The enclosing impl's concrete Self type (`None` for free fns, trait default bodies, and
+        /// non-concrete impls) — resolves a `self`-rooted field receiver to its owning type.
+        self_type: Option<&'a str>,
         calls: Vec<CallSite>,
         data_refs: Vec<DataRef>,
+    }
+    impl CallVisitor<'_> {
+        /// The concrete type a **receiver expression** evaluates to, if syntactically certain —
+        /// the Slice 4 extension of Slice 3's bare-ident lookup. Handles, recursively:
+        /// `self` / typed locals (Slice 3's map), field accesses `base.field` (same-scope declared
+        /// field types), calls `f()` / `T::m()` (declared returns / ctor convention), method calls
+        /// `base.m()` (declared returns — single- and multi-hop chains), `&expr`, and parens.
+        /// Anything else — trait objects, generics, wrappers, unknown fields — yields `None`:
+        /// resolve-uniquely-or-skip, never a guess. A returned `"Self"` (a `Self`-typed local) is
+        /// resolved to the enclosing concrete type or refused.
+        fn receiver_type_of(&self, expr: &syn::Expr) -> Option<String> {
+            let concrete = |ty: String| -> Option<String> {
+                if ty == "Self" {
+                    self.self_type.map(str::to_string)
+                } else {
+                    Some(ty)
+                }
+            };
+            match expr {
+                syn::Expr::Paren(p) => self.receiver_type_of(&p.expr),
+                syn::Expr::Reference(r) => self.receiver_type_of(&r.expr),
+                syn::Expr::Path(p) if p.qself.is_none() => {
+                    let id = p.path.get_ident()?;
+                    if id == "self" {
+                        return self.self_type.map(str::to_string);
+                    }
+                    concrete(self.local_types.get(&id.to_string()).cloned()?)
+                }
+                syn::Expr::Field(f) => {
+                    let syn::Member::Named(field) = &f.member else {
+                        return None;
+                    };
+                    let owner = self.receiver_type_of(&f.base)?;
+                    self.scope
+                        .field_types
+                        .get(&(owner, field.to_string()))
+                        .cloned()
+                }
+                syn::Expr::Call(c) => {
+                    // Method's own generics were already applied when the facts were built; the
+                    // ctor-convention fallback only needs the wrapper/PascalCase gate.
+                    call_return_type(c, &HashSet::new(), self.scope, self.self_type)
+                }
+                syn::Expr::MethodCall(mc) => {
+                    let owner = self.receiver_type_of(&mc.receiver)?;
+                    self.scope
+                        .method_returns
+                        .get(&(owner, mc.method.to_string()))
+                        .cloned()
+                }
+                _ => None,
+            }
+        }
     }
     impl<'a, 'ast> Visit<'ast> for CallVisitor<'a> {
         fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
@@ -913,12 +972,15 @@ mod syn_ast {
             //   * `x.method()` where `x`'s concrete type is known (`local_types`, from receiver-type
             //     inference) → `Type::method`, resolved by the `(type, method)` index (unique-or-skip).
             //     A `Self`-typed local routes through the same `Self::` same-module gate as `self`.
-            // `self.field.m()` / `x.y().m()` / a `let`-less-typed `x` have an unknown receiver → drop.
-            if let syn::Expr::Path(p) = &*node.receiver {
+            // Slice 4 — a **compound receiver**: field access (`self.field.m()`, `x.field.m()`),
+            //   a call (`f().m()`, `T::make().m()`), or a method chain (`x.a().m()`), typed via the
+            //   same-scope declared facts ([`ScopeTypes`]) → `Type::method`, through the same index.
+            // An un-inferable receiver still drops — never a guess.
+            let method = node.method.to_string();
+            let callee = if let syn::Expr::Path(p) = &*node.receiver {
                 if p.qself.is_none() {
-                    if let Some(recv) = p.path.get_ident() {
-                        let method = node.method.to_string();
-                        let callee = if recv == "self" {
+                    p.path.get_ident().and_then(|recv| {
+                        if recv == "self" {
                             self.own_methods
                                 .contains(&method)
                                 .then(|| format!("Self::{method}"))
@@ -931,16 +993,21 @@ mod syn_ast {
                                 Some(ty) => Some(format!("{ty}::{method}")),
                                 None => None,
                             }
-                        };
-                        if let Some(callee) = callee {
-                            self.calls.push(CallSite {
-                                caller: self.caller.clone(),
-                                callee,
-                                line: line_of(node.method.span()),
-                            });
                         }
-                    }
+                    })
+                } else {
+                    None
                 }
+            } else {
+                self.receiver_type_of(&node.receiver)
+                    .map(|ty| format!("{ty}::{method}"))
+            };
+            if let Some(callee) = callee {
+                self.calls.push(CallSite {
+                    caller: self.caller.clone(),
+                    callee,
+                    line: line_of(node.method.span()),
+                });
             }
             syn::visit::visit_expr_method_call(self, node);
         }
@@ -1061,6 +1128,111 @@ mod syn_ast {
         map
     }
 
+    /// File-scope typing facts for Slice 4 receiver inference — field receivers
+    /// (`self.field.bar()`) and return-type chains (`f().bar()`, `x.m().bar()`). Collected once per
+    /// scope from the same syntactically-certain annotations Slice 3 trusts ([`annotation_type`]),
+    /// never persisted: they only enrich the `Type::method` callee strings minted during call
+    /// extraction, and every minted callee still passes the graph-wide `(type, method)`
+    /// unique-or-skip index. `BTree*` ⇒ deterministic.
+    #[derive(Default)]
+    struct ScopeTypes {
+        /// `(type name, field name) → concrete field type` — from named-struct declarations whose
+        /// field annotation is concrete (PascalCase, non-generic, non-wrapper; `&T` peeled).
+        field_types: std::collections::BTreeMap<(String, String), String>,
+        /// `free fn name → concrete return type` at this scope.
+        fn_returns: std::collections::BTreeMap<String, String>,
+        /// `(type, method) → concrete return type` (`-> Self` resolved to the impl's concrete
+        /// type). Poison-on-conflict: an inherent method and a same-named trait method with
+        /// different returns yield nothing.
+        method_returns: std::collections::BTreeMap<(String, String), String>,
+        /// Every `(type, method)` DEFINED at this scope, inferable return or not. When the
+        /// definition is visible but its return is not concrete, the `new`/`default`/`with_*`
+        /// returns-`Self` *convention* is contradicted by evidence — so it must not fire.
+        method_known: std::collections::BTreeSet<(String, String)>,
+    }
+
+    /// The concrete type a signature returns, if syntactically certain: the same
+    /// [`annotation_type`] gate as every other Slice 3/4 inference, with `-> Self` resolved to the
+    /// enclosing impl's concrete type (or refused for a free fn / non-concrete impl).
+    fn return_type(
+        output: &syn::ReturnType,
+        generics: &HashSet<String>,
+        self_ty: Option<&str>,
+    ) -> Option<String> {
+        let syn::ReturnType::Type(_, ty) = output else {
+            return None;
+        };
+        let t = annotation_type(ty, generics)?;
+        if t == "Self" {
+            self_ty.map(str::to_string)
+        } else {
+            Some(t)
+        }
+    }
+
+    /// Collect the [`ScopeTypes`] facts for one scope's items (struct fields, free-fn returns,
+    /// method returns). Same-scope name collisions for structs/free fns are impossible in valid
+    /// Rust; the one legal collision — an inherent method and a trait method sharing a name on the
+    /// same type — is poisoned unless their returns agree.
+    fn build_scope_types(items: &[syn::Item]) -> ScopeTypes {
+        let mut st = ScopeTypes::default();
+        let mut poisoned: HashSet<(String, String)> = HashSet::new();
+        for item in items {
+            match item {
+                syn::Item::Struct(s) => {
+                    let sg = generic_type_params(&s.generics);
+                    if let syn::Fields::Named(named) = &s.fields {
+                        for f in &named.named {
+                            if let (Some(id), Some(t)) = (&f.ident, annotation_type(&f.ty, &sg)) {
+                                st.field_types
+                                    .insert((s.ident.to_string(), id.to_string()), t);
+                            }
+                        }
+                    }
+                }
+                syn::Item::Fn(f) => {
+                    let fg = generic_type_params(&f.sig.generics);
+                    if let Some(t) = return_type(&f.sig.output, &fg, None) {
+                        st.fn_returns.insert(f.sig.ident.to_string(), t);
+                    }
+                }
+                syn::Item::Impl(i) => {
+                    let Some(ty) = impl_self_type_name(i) else {
+                        continue;
+                    };
+                    let ig = impl_generic_type_params(i);
+                    for ii in &i.items {
+                        let syn::ImplItem::Fn(m) = ii else { continue };
+                        let key = (ty.clone(), m.sig.ident.to_string());
+                        st.method_known.insert(key.clone());
+                        let mut mg = ig.clone();
+                        mg.extend(generic_type_params(&m.sig.generics));
+                        let ret = return_type(&m.sig.output, &mg, Some(&ty));
+                        if poisoned.contains(&key) {
+                            continue;
+                        }
+                        match (st.method_returns.get(&key), ret) {
+                            (None, Some(r)) => {
+                                st.method_returns.insert(key, r);
+                            }
+                            (Some(prev), Some(r)) if *prev != r => {
+                                st.method_returns.remove(&key);
+                                poisoned.insert(key);
+                            }
+                            (Some(_), None) => {
+                                st.method_returns.remove(&key);
+                                poisoned.insert(key);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        st
+    }
+
     /// Std container/smart-pointer type names we never treat as a method receiver's concrete type:
     /// `x.bar()` on a `Box<Foo>` / `Vec<Foo>` / … dispatches to the wrapper's (or auto-deref'd) method,
     /// not to a local `impl`, so inferring the wrapper — or unwrapping its argument — could only
@@ -1120,31 +1292,78 @@ mod syn_ast {
         receiver_type_name(tp.path.segments.last()?.ident.to_string(), generics)
     }
 
-    /// The concrete receiver type of a binding's **RHS expression**, for the two evidence-only idioms:
-    /// a constructor call `Foo::new(..)` / `Foo::default()` / `Foo::with_*(..)` (the owning type is the
-    /// path's second-to-last segment — these assoc fns return `Self` by overwhelming convention), and a
-    /// **single-segment** struct literal `Foo { .. }` (the type is named literally). A *multi-segment*
-    /// struct-literal path (`Enum::Variant { .. }`, `m::Struct { .. }`) is ambiguous, so it is skipped.
-    /// Everything else (method-chain returns, `from`/`try_from`, arbitrary assoc fns, free fns) → `None`.
-    fn rhs_type(expr: &syn::Expr, generics: &HashSet<String>) -> Option<String> {
+    /// The concrete receiver type of a binding's **RHS expression**:
+    ///
+    /// * a **single-segment** struct literal `Foo { .. }` (the type is named literally; a
+    ///   multi-segment path — `Enum::Variant { .. }`, `m::Struct { .. }` — is ambiguous, skipped);
+    /// * a call — resolved by [`call_return_type`]: a same-scope free fn / method with a concrete
+    ///   declared return (Slice 4), else the `Foo::new()`/`default()`/`with_*()`
+    ///   returns-`Self`-by-convention idiom, which is *suppressed* when the definition is visible
+    ///   at this scope and contradicts it.
+    ///
+    /// Everything else (method-chain RHS on an untyped receiver, `from`/`try_from`, arbitrary
+    /// assoc fns) → `None`.
+    fn rhs_type(
+        expr: &syn::Expr,
+        generics: &HashSet<String>,
+        scope: &ScopeTypes,
+        self_type: Option<&str>,
+    ) -> Option<String> {
         match expr {
-            syn::Expr::Call(call) => {
-                let syn::Expr::Path(p) = &*call.func else {
-                    return None;
-                };
-                if p.qself.is_some() || p.path.leading_colon.is_some() || p.path.segments.len() < 2
-                {
-                    return None;
-                }
-                let last = p.path.segments.last()?.ident.to_string();
-                if !(last == "new" || last == "default" || last.starts_with("with_")) {
-                    return None;
-                }
-                let owner = p.path.segments[p.path.segments.len() - 2].ident.to_string();
-                receiver_type_name(owner, generics)
-            }
+            syn::Expr::Call(call) => call_return_type(call, generics, scope, self_type),
             syn::Expr::Struct(s) if s.qself.is_none() && s.path.segments.len() == 1 => {
                 receiver_type_name(s.path.segments[0].ident.to_string(), generics)
+            }
+            _ => None,
+        }
+    }
+
+    /// The concrete type a call expression evaluates to, if certain. Single-segment `f(..)` reads
+    /// the same-scope free-fn return facts; two-segment `T::m(..)` (with `Self::` resolved to the
+    /// enclosing concrete type) prefers the **declared** same-scope return, refuses when the
+    /// definition is visible but not concretely typed (evidence beats convention), and only then
+    /// falls back to the `new`/`default`/`with_*` returns-`Self` convention for out-of-scope types.
+    fn call_return_type(
+        call: &syn::ExprCall,
+        generics: &HashSet<String>,
+        scope: &ScopeTypes,
+        self_type: Option<&str>,
+    ) -> Option<String> {
+        let syn::Expr::Path(p) = &*call.func else {
+            return None;
+        };
+        if p.qself.is_some() || p.path.leading_colon.is_some() {
+            return None;
+        }
+        match p.path.segments.len() {
+            1 => scope
+                .fn_returns
+                .get(&p.path.segments[0].ident.to_string())
+                .cloned(),
+            2 => {
+                let head = p.path.segments[0].ident.to_string();
+                let method = p.path.segments[1].ident.to_string();
+                let owner = if head == "Self" {
+                    self_type?.to_string()
+                } else {
+                    head
+                };
+                let key = (owner, method);
+                if let Some(ret) = scope.method_returns.get(&key) {
+                    return Some(ret.clone());
+                }
+                let (owner, method) = key;
+                if scope
+                    .method_known
+                    .contains(&(owner.clone(), method.clone()))
+                {
+                    return None; // defined here with a non-concrete return — convention refuted
+                }
+                if method == "new" || method == "default" || method.starts_with("with_") {
+                    receiver_type_name(owner, generics)
+                } else {
+                    None
+                }
             }
             _ => None,
         }
@@ -1158,6 +1377,8 @@ mod syn_ast {
     /// is *certain* of, exactly the precision-first trade the call graph requires).
     struct ReceiverTypeCollector<'g> {
         generics: &'g HashSet<String>,
+        scope: &'g ScopeTypes,
+        self_type: Option<&'g str>,
         types: std::collections::BTreeMap<String, String>,
         poisoned: HashSet<String>,
     }
@@ -1203,9 +1424,9 @@ mod syn_ast {
                 let ty = annot
                     .and_then(|t| annotation_type(t, self.generics))
                     .or_else(|| {
-                        l.init
-                            .as_ref()
-                            .and_then(|i| rhs_type(&i.expr, self.generics))
+                        l.init.as_ref().and_then(|i| {
+                            rhs_type(&i.expr, self.generics, self.scope, self.self_type)
+                        })
                     });
                 self.record(name, ty);
             }
@@ -1232,11 +1453,15 @@ mod syn_ast {
         sig: &syn::Signature,
         block: &syn::Block,
         enclosing_generics: &HashSet<String>,
+        scope: &ScopeTypes,
+        self_type: Option<&str>,
     ) -> std::collections::BTreeMap<String, String> {
         let mut generics = enclosing_generics.clone();
         generics.extend(generic_type_params(&sig.generics));
         let mut c = ReceiverTypeCollector {
             generics: &generics,
+            scope,
+            self_type,
             types: std::collections::BTreeMap::new(),
             poisoned: HashSet::new(),
         };
@@ -1290,22 +1515,27 @@ mod syn_ast {
         c.names
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn collect_calls(
         caller: &str,
         own_methods: &std::collections::HashSet<String>,
         enclosing_generics: &std::collections::HashSet<String>,
         sig: &syn::Signature,
         block: &syn::Block,
+        scope: &ScopeTypes,
+        self_type: Option<&str>,
         calls_out: &mut Vec<CallSite>,
         refs_out: &mut Vec<DataRef>,
     ) {
         let local_bound = local_bound_names(sig, block);
-        let local_types = local_receiver_types(sig, block, enclosing_generics);
+        let local_types = local_receiver_types(sig, block, enclosing_generics, scope, self_type);
         let mut v = CallVisitor {
             caller: caller.to_string(),
             own_methods,
             local_bound: &local_bound,
             local_types: &local_types,
+            scope,
+            self_type,
             calls: Vec::new(),
             data_refs: Vec::new(),
         };
@@ -1339,6 +1569,8 @@ mod syn_ast {
         // (inherent + trait impls). Used below to gate `self.m()` / `Self::m` capture on the type's
         // FULL method set, so a self-call resolves across sibling impl blocks of the same type.
         let type_methods = build_type_method_sets(items);
+        // Declared field/return types at THIS scope (Slice 4 field/chain receiver inference).
+        let scope_types = build_scope_types(items);
         for item in items {
             match item {
                 syn::Item::Mod(m) => {
@@ -1375,6 +1607,8 @@ mod syn_ast {
                         &HashSet::new(),
                         &f.sig,
                         &f.block,
+                        &scope_types,
+                        None,
                         &mut out.calls,
                         &mut out.data_refs,
                     );
@@ -1402,6 +1636,8 @@ mod syn_ast {
                                     &trait_generics,
                                     &method.sig,
                                     body,
+                                    &scope_types,
+                                    None,
                                     &mut out.calls,
                                     &mut out.data_refs,
                                 );
@@ -1459,6 +1695,8 @@ mod syn_ast {
                                 &impl_generics,
                                 &method.sig,
                                 &method.block,
+                                &scope_types,
+                                self_ty.as_deref(),
                                 &mut out.calls,
                                 &mut out.data_refs,
                             );
@@ -1929,6 +2167,114 @@ mod syn_tests {
                 "{src:?} must not infer a receiver type, got {cs:?}"
             );
         }
+    }
+
+    // ── Slice 4: field receivers & return-type chains (precision-first) ──────────
+
+    #[test]
+    fn infers_field_receivers_from_declared_field_types() {
+        // `self.field.m()` and `x.field.m()` type the receiver from the struct's own field
+        // declaration — the paper's "field receivers" future-work item.
+        let decls = "struct Db; impl Db { fn q(&self) {} }\nstruct S { db: Db }\n";
+        for (src, caller) in [
+            (
+                format!("{decls}impl S {{ fn go(&self) {{ self.db.q(); }} }}"),
+                "go",
+            ),
+            (format!("{decls}fn f(s: S) {{ s.db.q(); }}"), "f"),
+            (format!("{decls}fn f(s: &S) {{ s.db.q(); }}"), "f"),
+        ] {
+            let cs = callees_of(&src, caller);
+            assert!(
+                cs.contains(&"Db::q".to_string()),
+                "{src:?} should mint Db::q, got {cs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn infers_call_and_chain_receivers_from_declared_returns() {
+        // `f().m()`, `let x = f(); x.m()`, `T::assoc().m()` (incl. `-> Self`), and single-hop
+        // method chains `x.a().m()` — all typed by same-scope declared returns.
+        let decls = "struct A; struct B;\nimpl A { fn make() -> Self { A } fn b(&self) -> B { B } fn touch(&self) {} }\nimpl B { fn q(&self) {} }\nfn make_b() -> B { B }\n";
+        for (body, want) in [
+            ("fn f() { make_b().q(); }", "B::q"),
+            ("fn f() { let x = make_b(); x.q(); }", "B::q"),
+            ("fn f() { A::make().touch(); }", "A::touch"),
+            ("fn f(a: A) { a.b().q(); }", "B::q"),
+            ("fn f(a: &A) { a.b().q(); }", "B::q"),
+            ("fn f(a: A) { a.b().q(); a.touch(); }", "A::touch"),
+        ] {
+            let src = format!("{decls}{body}");
+            let cs = callees_of(&src, "f");
+            assert!(
+                cs.contains(&want.to_string()),
+                "{src:?} should mint {want}, got {cs:?}"
+            );
+        }
+        // Inside an impl, `Self::make()` resolves through the same declared-return facts.
+        let src = format!("{decls}impl B {{ fn init() {{ let x = A::make(); x.touch(); }} }}");
+        assert!(
+            callees_of(&src, "init").contains(&"A::touch".to_string()),
+            "A::make() -> Self types the local"
+        );
+    }
+
+    #[test]
+    fn field_and_chain_inference_skips_uncertain_shapes() {
+        // Generic/wrapper/undeclared fields, non-concrete returns, and — the key precision rule —
+        // a visible definition contradicting the ctor convention all drop (no ::q / ::go edge).
+        for src in [
+            // generic field type
+            "struct S<T> { x: T }\nimpl S<i32> { fn f(&self) { self.x.go(); } }",
+            // wrapper field type
+            "struct Db; struct S { x: Vec<Db> }\nimpl S { fn f(&self) { self.x.go(); } }",
+            // field not declared on the receiver's type (cross-file struct) — unknown
+            "struct S;\nimpl S { fn f(&self) { self.db.go(); } }",
+            // fn with a non-concrete (wrapper) return
+            "struct C; fn make() -> Option<C> { None }\nfn f() { make().go(); }",
+            // in-file definition refutes the `new` returns-Self convention
+            "struct C; impl C { fn new() -> Option<C> { None } }\nfn f() { let x = C::new(); x.go(); }",
+            // chain hop through a method with no declared return
+            "struct A; impl A { fn b(&self) { } }\nfn f(a: A) { a.b().go(); }",
+            // tuple-field receiver (unnamed member) — no field-type fact
+            "struct P(i32);\nimpl P { fn f(&self) { self.0.go(); } }",
+        ] {
+            let cs = callees_of(src, "f");
+            assert!(
+                !cs.iter().any(|c| c.ends_with("::go") || c.ends_with("::q")),
+                "{src:?} must not infer a receiver, got {cs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn field_receiver_resolves_cross_file_via_the_type_method_index() {
+        // The minted `Db::q` callee resolves through the graph-wide (type, method) index even when
+        // `Db` and its impl live in ANOTHER file — only the field's declared type is same-file.
+        let mut g = crate::memory::MemoryGraph::new(0.2, 5000);
+        let parser = ASTParser::new();
+        let src_a = "pub struct Db; impl Db { pub fn q(&self) {} }\n";
+        let src_b = "use crate::a::Db;\npub struct S { db: Db }\nimpl S { pub fn go(&self) { self.db.q(); } }\n";
+        for (file, src) in [("src/a.rs", src_a), ("src/b.rs", src_b)] {
+            let parsed = parser.parse_source(file, src);
+            parser.update_memory_graph(&parsed, src, &mut g);
+        }
+        g.resolve_all();
+        let has = g.edges.iter().any(|e| {
+            e.edge_type == crate::memory::EdgeType::Calls
+                && e.source.0 == "sym:src/b.rs:go"
+                && e.target.0 == "sym:src/a.rs:q"
+        });
+        assert!(
+            has,
+            "self.db.q() links go → Db::q across files, got {:?}",
+            g.edges
+                .iter()
+                .filter(|e| e.edge_type == crate::memory::EdgeType::Calls)
+                .map(|e| format!("{}→{}", e.source.0, e.target.0))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
