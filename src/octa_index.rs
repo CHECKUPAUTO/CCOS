@@ -29,6 +29,8 @@
 //!   the standard no-silent-downgrade refusal and the free core recall strategies
 //!   (working-set / around / task / INT4 TF-IDF semantic / hybrid) remain fully functional.
 
+use crate::external_memory::{ExternalMemory, Recall, RecallWindow};
+use crate::memory::MemoryGraph;
 use octasoma::{Embedder, FractalMemory3D, ShardedMemory};
 
 /// A semantic index over CCOS nodes: content → embedding → 3-D octree, keyed by
@@ -200,6 +202,92 @@ impl<E: Embedder> ShardedOctaIndex<E> {
     }
 }
 
+// ──────────────── Composition over the causal graph (CCOS-side, not vendored) ────────────────
+
+impl<E: Embedder> ShardedOctaIndex<E> {
+    /// Feeds every content-carrying node of a causal graph into the index,
+    /// **deterministically**: nodes are visited in sorted-id order (never `HashMap`
+    /// iteration order), so with a deterministic embedder the resulting index is
+    /// bit-identical across runs — the same discipline as the rest of CCOS. Each
+    /// node lands in the causal region derived from its URI ([`region_of`]).
+    /// Returns the number of nodes fed.
+    ///
+    /// Intended for a **freshly built** index (octasoma stores are insertion-only:
+    /// re-feeding the same graph into a used index duplicates entries). Rebuild
+    /// after ingest deltas, or mirror your `ingest_source` calls with
+    /// [`ShardedOctaIndex::index_node_in`] instead.
+    pub fn index_graph(&mut self, graph: &MemoryGraph) -> usize {
+        let mut entries: Vec<_> = graph
+            .node_entries()
+            .filter(|(_, n)| !n.content.is_empty())
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        let fed = entries.len();
+        for (id, node) in entries {
+            let region = region_of(&id.0);
+            self.index_node_in(&region, &id.0, &node.content);
+        }
+        fed
+    }
+}
+
+/// **Anchor-first semantic recall** over any [`ExternalMemory`]: OctaSoma resolves the
+/// entry node semantically, then CCOS expands it causally — the window comes from
+/// [`Recall::Around`] on the anchor, with the same region membership, proximity decay,
+/// token budget, and determinism as every other window (the event log and replay
+/// invariant are untouched, since this composes the public recall surface).
+///
+/// Degradation is **visible, never silent**: when no anchor is available (empty index,
+/// or the embedder failed on the query) the window comes from the free lexical
+/// [`Recall::Task`] entry and `strategy` says so.
+pub fn recall_semantic<E: Embedder, M: ExternalMemory + ?Sized>(
+    mem: &M,
+    idx: &ShardedOctaIndex<E>,
+    text: &str,
+    budget_tokens: usize,
+) -> RecallWindow {
+    finish_with_anchor(mem, idx.semantic_anchors(text, 1), text, budget_tokens)
+}
+
+/// Region-scoped [`recall_semantic`] — the validated cascade shape when the causal
+/// scope is already known: the anchor is resolved **within** `region`'s shard only
+/// (exact 3-D rerank inside a small region, the 99 %-hit deployment), then expanded
+/// causally exactly like [`recall_semantic`].
+pub fn recall_semantic_in<E: Embedder, M: ExternalMemory + ?Sized>(
+    mem: &M,
+    idx: &ShardedOctaIndex<E>,
+    region: &str,
+    text: &str,
+    budget_tokens: usize,
+) -> RecallWindow {
+    finish_with_anchor(
+        mem,
+        idx.semantic_anchors_in(region, text, 1),
+        text,
+        budget_tokens,
+    )
+}
+
+fn finish_with_anchor<M: ExternalMemory + ?Sized>(
+    mem: &M,
+    anchors: Vec<(String, f64)>,
+    text: &str,
+    budget_tokens: usize,
+) -> RecallWindow {
+    match anchors.into_iter().next() {
+        Some((anchor, _score)) => {
+            let mut w = mem.recall(&Recall::Around(anchor), budget_tokens);
+            w.strategy = "octa-semantic".into();
+            w
+        }
+        None => {
+            let mut w = mem.recall(&Recall::Task(text.to_string()), budget_tokens);
+            w.strategy = "octa-semantic-fallback-task".into();
+            w
+        }
+    }
+}
+
 // ───────────────────────── CCOS-side premium gate (not vendored) ─────────────────────────
 
 /// **Premium gate** for the OctaSoma semantic-memory tier. Compiling the backend is the
@@ -230,6 +318,20 @@ impl SemanticMemoryAccess {
     /// behind [`Self::unlock`].
     pub fn sharded_index<E: Embedder>(&self, embedder: E) -> ShardedOctaIndex<E> {
         ShardedOctaIndex::new(embedder)
+    }
+
+    /// Build the sharded index from a causal graph in one deterministic pass
+    /// (see [`ShardedOctaIndex::index_graph`]) — the one-call path from an
+    /// ingested [`CcosMemory`](crate::external_memory::CcosMemory) to semantic
+    /// recall via [`recall_semantic`].
+    pub fn sharded_index_from_graph<E: Embedder>(
+        &self,
+        embedder: E,
+        graph: &MemoryGraph,
+    ) -> ShardedOctaIndex<E> {
+        let mut idx = ShardedOctaIndex::new(embedder);
+        idx.index_graph(graph);
+        idx
     }
 
     /// Reopen a previously saved sharded index (mirror of CCOS's `checkpoint`).
@@ -315,5 +417,53 @@ mod tests {
 
         // The other region's nodes never leak into an in-region query.
         assert!(anchors.iter().all(|(u, _)| u.starts_with("sym:src/db.rs")));
+    }
+
+    #[test]
+    fn recall_semantic_expands_the_anchor_through_the_causal_graph() {
+        use crate::external_memory::CcosMemory;
+
+        let mut mem = CcosMemory::new();
+        mem.ingest_source(
+            "src/db.rs",
+            "pub fn query() -> i64 { 1 }\npub fn pool() -> i64 { 2 }\n",
+        );
+        mem.ingest_source("src/cache.rs", "pub fn get() -> i64 { 3 }\n");
+
+        let access = SemanticMemoryAccess::unlock(&pro(), NOW).expect("pro unlocks octasoma");
+        let idx = access.sharded_index_from_graph(HashEmbedder::new(128), mem.graph());
+        assert!(!idx.is_empty());
+
+        // Query with a real node's exact content: HashEmbedder anchors on that node
+        // (distance 0), and the window is its causal region — assembled by CCOS's own
+        // Recall::Around machinery, so budgets/determinism are the usual ones.
+        let (_, node) = mem
+            .graph()
+            .node_entries()
+            .find(|(id, n)| id.0.contains("db.rs") && !n.content.is_empty())
+            .expect("db.rs produced content-carrying nodes");
+        let query = node.content.clone();
+
+        let w = recall_semantic(&mem, &idx, &query, 512);
+        assert_eq!(w.strategy, "octa-semantic");
+        assert!(
+            w.items.iter().any(|i| i.uri.contains("db.rs")),
+            "the window covers the anchor's causal region: {:?}",
+            w.items.iter().map(|i| &i.uri).collect::<Vec<_>>()
+        );
+
+        // Determinism: the same query yields the same window.
+        let w2 = recall_semantic(&mem, &idx, &query, 512);
+        assert_eq!(w.strategy, w2.strategy);
+        assert_eq!(
+            w.items.iter().map(|i| &i.uri).collect::<Vec<_>>(),
+            w2.items.iter().map(|i| &i.uri).collect::<Vec<_>>()
+        );
+
+        // No anchor available (empty index) → the visible lexical fallback, never a
+        // silent one.
+        let empty = access.sharded_index(HashEmbedder::new(128));
+        let fallback = recall_semantic(&mem, &empty, "query", 512);
+        assert_eq!(fallback.strategy, "octa-semantic-fallback-task");
     }
 }
