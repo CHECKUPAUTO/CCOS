@@ -70,9 +70,10 @@ ccos-memory-runtime = { path = "crates/ccos-memory-runtime", optional = true }
 # The crate is `#![forbid(unsafe_code)]` with one dependency (`lz4_flex`);
 # replay-exactness then depends only on the chosen embedder — `HashEmbedder` is
 # bit-replayable, a neural embedder is not (the same quarantine boundary as
-# `neural-embed`). Pinned to a reviewed rev; behind the `octasoma` feature so the
-# default build is byte-identical. See `src/octa_index.rs`.
-octasoma = { git = "https://github.com/CHECKUPAUTO/octasoma", rev = "96a39d1fe515fbcda0f80d7e4764751aad939969", optional = true }
+# `neural-embed`). Pinned to a reviewed release tag (the lockfile records the
+# resolved commit, so a moved tag cannot slip through `--locked` builds); behind
+# the `octasoma` feature so the default build is byte-identical. See `src/octa_index.rs`.
+octasoma = { git = "https://github.com/CHECKUPAUTO/octasoma", tag = "v0.4.0", optional = true }
 
 [features]
 # Default = the **sync core** (causal memory, hash-chained event log, recall) plus
