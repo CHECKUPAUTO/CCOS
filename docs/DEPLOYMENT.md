@@ -135,6 +135,13 @@ causal graph, Q-Page, and recall are **never** gated):
 - **slhav2-embeddings** — the adaptive **grouped** INT4 quantization (group size 16) for the
   semantic embedding store. A community session falls back to **uniform** INT4 (a single per-vector
   scale); the core recall path is unchanged, only the embedding precision reflects the tier.
+- **adaptive-retrieval** — the `ccos::retrieval` self-improving feedback loop (`ImprovementLoop`).
+  The core retrieval (dense / BM25 / hybrid + metrics) is free and fully functional; only the
+  continuous-improvement tier is gated.
+- **octasoma-memory** — the OctaSoma-backed, region-sharded semantic-anchor index
+  (`ccos::octa_index`, compiled behind the `octasoma` cargo feature). The free core recall
+  strategies (working-set / around / task / INT4 TF-IDF semantic / hybrid) are untouched; only the
+  true-embedding OctaSoma backend is Pro.
 
 `ccos license` enumerates the active set; `ccos doctor` reports the compiled verifier scheme(s).
 
