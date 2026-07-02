@@ -8,6 +8,25 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Richer receiver inference (Slice 4) — paper §9 item 3 landed.** The `syn` call graph now types
+  **compound receivers** from the same syntactically-certain declarations Slice 3 trusts, via two
+  new per-scope fact families (never persisted — they only enrich the minted `Type::method`
+  callees): struct **field types** and declared **return types** (`-> Self` resolved to the impl's
+  concrete type). New shapes, all resolve-uniquely-or-skip: field receivers `self.field.m()` /
+  `x.field.m()` (the dominant method-call shape in real Rust), call returns `f().m()` /
+  `let x = f(); x.m()`, assoc-fn chains `A::make().t()`, and single/multi-hop method chains
+  `x.b().q()`. Two precision rules: *evidence beats convention* (an in-scope `C::new() -> Option<C>`
+  refutes the returns-`Self` convention → skip) and *wrappers never unwrap* (`Vec<_>`/`Option<_>`/
+  generic fields and returns are never receivers). Minted callees resolve through the existing
+  graph-wide `(type, method)` unique-or-skip index, so field receivers link **across files** with no
+  new false-edge surface. Measured on CCOS's own `src/` (51 files, identical corpus):
+  **1007 → 1114 `Calls` edges (+107, ≈ +10.6 %)** — the single largest recall gain of the whole
+  call-graph arc (the `&T` peel gave +7 %). `examples/resolution_coverage.rs` grows to **14/14
+  resolving idioms + 4/4 precision-skips**; 4 new parser tests (field/chain positives, uncertainty
+  skips, cross-file resolution). Trait-object dynamic dispatch remains skipped *by design* — a
+  `dyn Trait` receiver has no statically-certain concrete type. See
+  `docs/MEASUREMENT_resolution_coverage.md`.
+
 - **Tamper-evident chain on the session op-log — paper §9 item 2 fully landed.** CCOS had three
   logs and two of them were hash-chained; the third — the `AgentSession` op-log (the
   `<workspace>.ccos.oplog` sidecar), the timeline that actually carries `replay == live` — was not.
