@@ -297,6 +297,133 @@ fn finish_with_anchor<M: ExternalMemory + ?Sized>(
     }
 }
 
+// ──────── Explicit relevance feedback + conformal anchor gating (CCOS-side, not vendored) ────────
+
+/// The **explicit relevance-feedback channel** for the semantic tier — CCOS's half of the
+/// design decision recorded in octasoma's `feedback` module: calibration labels come from
+/// the agent loop (*which anchors actually helped*), never from self-retrieval, which is
+/// the documented way to overstate every statistical guarantee.
+///
+/// The log is in-memory and per session/process, deliberately **not** persisted with the
+/// store: feedback describes a *workload*, not the corpus, and stale labels silently void
+/// the very guarantees they exist to support. Wraps [`octasoma::RelevanceFeedback`],
+/// adding the anchor-level calibration view CCOS consumes
+/// ([`certified_score_floor`](Self::certified_score_floor)).
+#[derive(Default)]
+pub struct SemanticFeedback {
+    log: octasoma::RelevanceFeedback,
+}
+
+impl SemanticFeedback {
+    /// An empty log.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records one verdict from the agent loop: after resolving `query`, the anchor
+    /// `uri` (returned with similarity `score` in `(0, 1]`) was — or was not — actually
+    /// useful. Rejected anchors may be labelled too: a `relevant = true` on one is
+    /// exactly how an over-tight floor recovers.
+    pub fn record(&mut self, query: &str, uri: &str, score: f64, relevant: bool) {
+        self.log.record(query, uri, score as f32, relevant);
+    }
+
+    /// All observations, in arrival order.
+    pub fn entries(&self) -> &[octasoma::FeedbackEntry] {
+        self.log.entries()
+    }
+
+    /// Number of labels recorded.
+    pub fn len(&self) -> usize {
+        self.log.len()
+    }
+
+    /// Whether nothing has been recorded yet.
+    pub fn is_empty(&self) -> bool {
+        self.log.is_empty()
+    }
+
+    /// How many labels are positive.
+    pub fn relevant_count(&self) -> usize {
+        self.log.relevant_count()
+    }
+
+    /// The **certified anchor-score floor** at miscoverage `alpha`: trusting only anchors
+    /// scoring at or above the floor keeps the relevant anchor with probability
+    /// `≥ 1 − alpha`, for workloads exchangeable with the recorded labels
+    /// (split-conformal quantile over the confirmed-relevant nonconformities,
+    /// finite-sample corrected — octasoma's `conformal_quantile`). `None` while the log
+    /// is too small for the asked `alpha` — never a fabricated threshold.
+    pub fn certified_score_floor(&self, alpha: f64) -> Option<f64> {
+        let nc: Vec<f64> = self
+            .log
+            .nonconformity()
+            .into_iter()
+            .map(f64::from)
+            .collect();
+        let q = octasoma::conformal_quantile(&nc, alpha);
+        q.is_finite().then_some(1.0 - q)
+    }
+
+    /// Calibrated probability that an anchor with similarity `score` is relevant, via a
+    /// temperature fitted on this log's `(score, label)` pairs (octasoma's
+    /// `fit_temperature`, B3). `None` while the log cannot identify a temperature
+    /// (fewer than 2 labels, or a single class) — never a fake probability.
+    pub fn calibrated_probability(&self, score: f64) -> Option<f64> {
+        let t = self.log.fit_temperature()?;
+        Some(f64::from(octasoma::calibrated_probability(score as f32, t)))
+    }
+}
+
+/// Feedback-calibrated [`recall_semantic`]: the semantic anchor is trusted only when its
+/// score clears the conformal floor for `alpha` — otherwise the window comes from the free
+/// lexical [`Recall::Task`] entry. Degradation is **visible, never silent** — `strategy`
+/// names the exact path taken:
+///
+/// - `"octa-semantic-certified"` — floor active, anchor score ≥ floor: the coverage
+///   statement holds (see [`SemanticFeedback::certified_score_floor`]).
+/// - `"octa-semantic-below-floor-fallback-task"` — an anchor existed but scored below the
+///   certified floor; trusting it would be unwarranted, so the lexical fallback is taken.
+/// - `"octa-semantic"` — the feedback log cannot support `alpha` yet: baseline
+///   [`recall_semantic`] behavior, calibration inactive (record more labels).
+/// - `"octa-semantic-fallback-task"` — no anchor at all (empty index / embed failure),
+///   exactly as in [`recall_semantic`].
+pub fn recall_semantic_calibrated<E: Embedder, M: ExternalMemory + ?Sized>(
+    mem: &M,
+    idx: &ShardedOctaIndex<E>,
+    fb: &SemanticFeedback,
+    text: &str,
+    budget_tokens: usize,
+    alpha: f64,
+) -> RecallWindow {
+    match (
+        idx.semantic_anchors(text, 1).into_iter().next(),
+        fb.certified_score_floor(alpha),
+    ) {
+        (Some((anchor, score)), Some(floor)) => {
+            if score >= floor {
+                let mut w = mem.recall(&Recall::Around(anchor), budget_tokens);
+                w.strategy = "octa-semantic-certified".into();
+                w
+            } else {
+                let mut w = mem.recall(&Recall::Task(text.to_string()), budget_tokens);
+                w.strategy = "octa-semantic-below-floor-fallback-task".into();
+                w
+            }
+        }
+        (Some((anchor, _score)), None) => {
+            let mut w = mem.recall(&Recall::Around(anchor), budget_tokens);
+            w.strategy = "octa-semantic".into();
+            w
+        }
+        (None, _) => {
+            let mut w = mem.recall(&Recall::Task(text.to_string()), budget_tokens);
+            w.strategy = "octa-semantic-fallback-task".into();
+            w
+        }
+    }
+}
+
 // ───────────────────────── CCOS-side premium gate (not vendored) ─────────────────────────
 
 /// **Premium gate** for the OctaSoma semantic-memory tier. Compiling the backend is the
@@ -474,5 +601,81 @@ mod tests {
         let empty = access.sharded_index(HashEmbedder::new(128));
         let fallback = recall_semantic(&mem, &empty, "query", 512);
         assert_eq!(fallback.strategy, "octa-semantic-fallback-task");
+    }
+
+    #[test]
+    fn feedback_certifies_a_score_floor_and_never_fakes_one() {
+        let mut fb = SemanticFeedback::new();
+        // Too few labels for alpha → no floor, never a fabricated threshold.
+        assert_eq!(fb.certified_score_floor(0.5), None);
+
+        // Four confirmed-relevant anchors at scores 0.9/0.8/0.7/0.6 → nonconformities
+        // 0.1/0.2/0.3/0.4; alpha = 0.5 → k = ⌈5·0.5⌉ = 3 → q̂ = 0.3 → floor = 0.7.
+        for (i, s) in [0.9, 0.8, 0.7, 0.6].into_iter().enumerate() {
+            fb.record(&format!("q{i}"), &format!("sym:a.rs:f{i}"), s, true);
+        }
+        // Irrelevant labels never calibrate the radius.
+        fb.record("qx", "sym:a.rs:noise", 0.99, false);
+        assert_eq!(fb.len(), 5);
+        assert_eq!(fb.relevant_count(), 4);
+        let floor = fb
+            .certified_score_floor(0.5)
+            .expect("n=4 supports alpha=0.5");
+        assert!((floor - 0.7).abs() < 1e-6, "floor = {floor}");
+        // A stricter alpha this small log cannot support → None again.
+        assert_eq!(fb.certified_score_floor(0.05), None);
+    }
+
+    #[test]
+    fn calibrated_recall_gates_the_anchor_on_the_certified_floor() {
+        use crate::external_memory::CcosMemory;
+
+        let mut mem = CcosMemory::new();
+        mem.ingest_source(
+            "src/db.rs",
+            "pub fn query() -> i64 { 1 }\npub fn pool() -> i64 { 2 }\n",
+        );
+
+        let access = SemanticMemoryAccess::unlock(&pro(), NOW).expect("pro unlocks octasoma");
+        let idx = access.sharded_index_from_graph(HashEmbedder::new(128), mem.graph());
+        let (_, node) = mem
+            .graph()
+            .node_entries()
+            .find(|(id, n)| id.0.contains("db.rs") && !n.content.is_empty())
+            .expect("db.rs produced content-carrying nodes");
+        let exact = node.content.clone();
+
+        // Empty log → calibration inactive: baseline octa-semantic, visibly unnamed as
+        // certified.
+        let fb = SemanticFeedback::new();
+        let w = recall_semantic_calibrated(&mem, &idx, &fb, &exact, 512, 0.25);
+        assert_eq!(w.strategy, "octa-semantic");
+
+        // Three exact-hit labels (score 1.0) → nonconformities all 0 → floor = 1.0 at
+        // alpha = 0.25 (k = ⌈4·0.75⌉ = 3 ≤ n).
+        let mut fb = SemanticFeedback::new();
+        for q in ["a", "b", "c"] {
+            fb.record(q, "sym:src/db.rs:query", 1.0, true);
+        }
+        let floor = fb
+            .certified_score_floor(0.25)
+            .expect("n=3 supports alpha=0.25");
+        assert!((floor - 1.0).abs() < 1e-9);
+
+        // An exact-content query anchors at distance 0 → score 1.0 ≥ floor → certified.
+        let w = recall_semantic_calibrated(&mem, &idx, &fb, &exact, 512, 0.25);
+        assert_eq!(w.strategy, "octa-semantic-certified");
+        assert!(w.items.iter().any(|i| i.uri.contains("db.rs")));
+
+        // A non-matching query still yields *some* nearest anchor, but its score is
+        // below the certified floor → the anchor is refused visibly and the window
+        // comes from the lexical fallback.
+        let w = recall_semantic_calibrated(&mem, &idx, &fb, "unrelated gibberish", 512, 0.25);
+        assert_eq!(w.strategy, "octa-semantic-below-floor-fallback-task");
+
+        // Empty index → the no-anchor fallback, same as recall_semantic.
+        let none = access.sharded_index(HashEmbedder::new(128));
+        let w = recall_semantic_calibrated(&mem, &none, &fb, "query", 512, 0.25);
+        assert_eq!(w.strategy, "octa-semantic-fallback-task");
     }
 }

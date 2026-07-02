@@ -72,7 +72,7 @@ ccos-memory-runtime = { path = "crates/ccos-memory-runtime", optional = true }
 # bit-replayable, a neural embedder is not (the same quarantine boundary as
 # `neural-embed`). Pinned to a reviewed rev; behind the `octasoma` feature so the
 # default build is byte-identical. See `src/octa_index.rs`.
-octasoma = { git = "https://github.com/CHECKUPAUTO/octasoma", rev = "fe2d8b965a0ff33b554eccbdb3ae242e43b8700c", optional = true }
+octasoma = { git = "https://github.com/CHECKUPAUTO/octasoma", rev = "96a39d1fe515fbcda0f80d7e4764751aad939969", optional = true }
 
 [features]
 # Default = the **sync core** (causal memory, hash-chained event log, recall) plus

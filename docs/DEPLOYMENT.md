@@ -141,7 +141,12 @@ causal graph, Q-Page, and recall are **never** gated):
 - **octasoma-memory** — the OctaSoma-backed, region-sharded semantic-anchor index
   (`ccos::octa_index`, compiled behind the `octasoma` cargo feature). The free core recall
   strategies (working-set / around / task / INT4 TF-IDF semantic / hybrid) are untouched; only the
-  true-embedding OctaSoma backend is Pro.
+  true-embedding OctaSoma backend is Pro. The tier includes the **explicit relevance-feedback
+  channel** (`SemanticFeedback`, and the `octa_feedback` MCP tool): labels from the agent loop
+  certify a conformal anchor-score floor (miscoverage ≤ α), and `recall_semantic_calibrated` /
+  the MCP `octa-semantic` strategy then trust an anchor only when it clears the floor — refusals
+  are visible (`octa-semantic-below-floor-fallback-task`), never a silent downgrade, and with too
+  few labels no floor is fabricated.
 
 `ccos license` enumerates the active set; `ccos doctor` reports the compiled verifier scheme(s).
 
