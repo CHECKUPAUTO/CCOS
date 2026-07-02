@@ -495,11 +495,13 @@ dispatch** in the call graph, currently skipped *by design* (a `dyn Trait`
 receiver has no statically-certain concrete type — any sound treatment needs
 trait-impl sets and points-to reasoning); (3) the **spectral design pass** —
 region clustering and the temporal tensor over eigenvector centrality;
-(4) optional **cryptographic agent identity** for the multi-agent store (the
-chain today enforces consistency of a claimed identity, not its ownership —
-signatures would add the latter at the cost of key management); (5) **belief
-fusion semantics** — Q-Page merge policies beyond union when federated agents
-assert contradictory evidence about the same claim.
+(4) ~~optional **cryptographic agent identity** for the multi-agent store~~ —
+*delivered*: the `signed-sync` feature signs each bundle with a per-workspace
+ed25519 key and the importer TOFU-pins the key per agent id (spoofing, key
+swaps, and stripped-signature downgrades all refuse; the default build stays
+crypto-free and unsigned federations keep working); (5) **belief fusion
+semantics** — Q-Page merge policies beyond union when federated agents assert
+contradictory evidence about the same claim.
 
 ## 10. Conclusion
 

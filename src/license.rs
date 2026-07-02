@@ -189,9 +189,9 @@ struct TokenPayload {
 
 /// URL-safe base64 **without padding** (RFC 4648 §5: `-`/`_`, no `=`). Hand-rolled so neither license
 /// feature's only new dependency is its signature primitive — the same reason CCOS hand-rolls its hex.
-/// Shared by the ed25519 and SLH-DSA verifiers.
-#[cfg(any(feature = "license", feature = "license-pq"))]
-fn b64url_encode(bytes: &[u8]) -> String {
+/// Shared by the ed25519 and SLH-DSA verifiers, and by `signed-sync` bundle signatures.
+#[cfg(any(feature = "license", feature = "license-pq", feature = "signed-sync"))]
+pub(crate) fn b64url_encode(bytes: &[u8]) -> String {
     const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
@@ -212,8 +212,8 @@ fn b64url_encode(bytes: &[u8]) -> String {
 }
 
 /// Inverse of [`b64url_encode`]. `None` on any non-alphabet byte or a truncated group.
-#[cfg(any(feature = "license", feature = "license-pq"))]
-fn b64url_decode(s: &str) -> Option<Vec<u8>> {
+#[cfg(any(feature = "license", feature = "license-pq", feature = "signed-sync"))]
+pub(crate) fn b64url_decode(s: &str) -> Option<Vec<u8>> {
     let val = |c: u8| -> Option<u32> {
         Some(match c {
             b'A'..=b'Z' => (c - b'A') as u32,

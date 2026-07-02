@@ -159,6 +159,10 @@ struct PersistedTimeline {
     /// Imported foreign timelines, keyed by agent id (empty for a solo session).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     foreign: std::collections::BTreeMap<String, ForeignLog>,
+    /// TOFU-pinned signing keys (agent id → base64url ed25519 public key) —
+    /// see [`AgentSession::import_bundle`]. Absent for never-signed federations.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    known_keys: std::collections::BTreeMap<String, String>,
 }
 
 /// One foreign agent's imported timeline segment, as persisted in the sidecar:
@@ -180,7 +184,7 @@ struct ForeignLog {
 /// *extend* the already-known chain of its agent, so a mutated bundle **or an
 /// equivocating agent** (two divergent histories under one identity) is
 /// detected, not merged.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SyncBundle {
     /// Bundle format version (additive evolution).
     pub version: u32,
@@ -192,6 +196,17 @@ pub struct SyncBundle {
     pub anchor: String,
     ops: Vec<Op>,
     chain: Vec<String>,
+    /// The exporter's base64url ed25519 public key, present iff the bundle is
+    /// signed (`signed-sync` builds sign automatically when the workspace has a
+    /// key — see [`generate_workspace_key`]). Additive: unsigned bundles omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pubkey: Option<String>,
+    /// base64url ed25519 signature over the bundle's canonical payload (its own
+    /// JSON with the signature fields blanked), present iff signed. The hash
+    /// chain proves *integrity*; this proves
+    /// *authenticity* — only the key holder can speak as this agent id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sig: Option<String>,
 }
 
 impl SyncBundle {
@@ -208,6 +223,17 @@ impl SyncBundle {
     /// Serialize for transport (plain JSON — inspectable, diffable, air-gap friendly).
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string(self)
+    }
+
+    /// The canonical byte string a bundle signature covers: the bundle's own
+    /// compact JSON with the signature fields blanked. Field order is the struct's
+    /// declaration order (serde), so signer and verifier agree byte-for-byte.
+    #[cfg_attr(not(feature = "signed-sync"), allow(dead_code))]
+    fn signing_payload(&self) -> String {
+        let mut unsigned = self.clone();
+        unsigned.pubkey = None;
+        unsigned.sig = None;
+        unsigned.to_json().unwrap_or_default()
     }
 
     /// Parse a transported bundle. Verification happens at import, not here.
@@ -244,6 +270,25 @@ pub enum SyncError {
         /// First absolute step whose link disagrees.
         at: usize,
     },
+    /// The bundle's ed25519 signature does not verify over its canonical payload
+    /// (or its key/signature fields are malformed).
+    BadSignature(String),
+    /// The bundle is signed with a different key than the one TOFU-pinned for
+    /// this agent id — an identity-spoof or an unannounced key swap; both refuse.
+    KeyMismatch {
+        /// The claimed agent id.
+        agent: String,
+    },
+    /// An UNSIGNED bundle arrived from an agent whose key is pinned — a
+    /// downgrade attempt (stripping the signature must not bypass pinning).
+    UnsignedFromPinned {
+        /// The claimed agent id.
+        agent: String,
+    },
+    /// The bundle is signed but this build has no signature support — refused
+    /// rather than silently accepted unverified. Rebuild with
+    /// `--features signed-sync` to verify it.
+    SignedUnsupported,
 }
 
 impl std::fmt::Display for SyncError {
@@ -266,6 +311,21 @@ impl std::fmt::Display for SyncError {
             SyncError::Diverged { at } => write!(
                 f,
                 "agent equivocation detected: bundle disagrees with the known chain at step {at}"
+            ),
+            SyncError::BadSignature(detail) => {
+                write!(f, "bundle signature does not verify: {detail}")
+            }
+            SyncError::KeyMismatch { agent } => write!(
+                f,
+                "bundle from '{agent}' is signed with a different key than the one pinned for that agent — identity spoof or unannounced key swap"
+            ),
+            SyncError::UnsignedFromPinned { agent } => write!(
+                f,
+                "unsigned bundle from '{agent}', whose key is pinned — a stripped signature does not bypass pinning"
+            ),
+            SyncError::SignedUnsupported => write!(
+                f,
+                "bundle is signed but this build cannot verify signatures — rebuild with --features signed-sync"
             ),
         }
     }
@@ -496,6 +556,16 @@ pub struct AgentSession {
     /// agent id. Grow-only; never mixed into the own timeline — the merged
     /// knowledge is materialized on demand by [`merged_view`](Self::merged_view).
     foreign: std::collections::BTreeMap<String, ForeignLog>,
+    /// TOFU-pinned signing keys: agent id → base64url ed25519 public key, set by
+    /// the first *signed* bundle imported from that agent and immutable after —
+    /// a later bundle under the same id with a different key, or an unsigned one,
+    /// is refused. Persisted in the sidecar (additive).
+    known_keys: std::collections::BTreeMap<String, String>,
+    /// This workspace's ed25519 signing seed, loaded from the `<workspace>.ccos.key`
+    /// sidecar when the `signed-sync` build finds one (`None` otherwise — including
+    /// always on a crypto-free build, which never reads the key file). Never
+    /// persisted in the timeline sidecar.
+    signing_seed: Option<[u8; 32]>,
     /// Where the timeline sidecar lives (`<workspace>.oplog`); `None` for an
     /// in-memory [`new`](Self::new) session.
     oplog_path: Option<PathBuf>,
@@ -541,6 +611,8 @@ impl AgentSession {
             baseline_hash: baseline_commitment(None),
             agent: String::new(),
             foreign: std::collections::BTreeMap::new(),
+            known_keys: std::collections::BTreeMap::new(),
+            signing_seed: None,
             oplog_path: None,
             compressor: CausalCompressor::new(),
             licensing,
@@ -623,6 +695,8 @@ impl AgentSession {
                     baseline_hash: t.baseline_hash,
                     agent: t.agent,
                     foreign: t.foreign,
+                    known_keys: t.known_keys,
+                    signing_seed: load_signing_seed(&file),
                     oplog_path: Some(oplog_path),
                     compressor: CausalCompressor::new(),
                     licensing,
@@ -642,6 +716,8 @@ impl AgentSession {
                     baseline_hash,
                     agent: String::new(),
                     foreign: std::collections::BTreeMap::new(),
+                    known_keys: std::collections::BTreeMap::new(),
+                    signing_seed: load_signing_seed(&file),
                     oplog_path: Some(oplog_path),
                     compressor: CausalCompressor::new(),
                     licensing,
@@ -684,6 +760,7 @@ impl AgentSession {
                 baseline_hash: self.baseline_hash.clone(),
                 agent: self.agent.clone(),
                 foreign: self.foreign.clone(),
+                known_keys: self.known_keys.clone(),
             };
             crate::util::write_durable(p, serde_json::to_string(&timeline)?.as_bytes())?;
         }
@@ -833,14 +910,35 @@ impl AgentSession {
         } else {
             self.chain[start - 1].clone()
         };
-        Ok(SyncBundle {
+        #[cfg_attr(not(feature = "signed-sync"), allow(unused_mut))]
+        let mut bundle = SyncBundle {
             version: 1,
             agent: self.agent.clone(),
             first_seq: since,
             anchor,
             ops: self.ops[start..].to_vec(),
             chain: self.chain[start..].to_vec(),
-        })
+            pubkey: None,
+            sig: None,
+        };
+        // A workspace holding an identity key signs every export (signed-sync
+        // builds only — a crypto-free build never loads the key, and the
+        // receiving side's pinning is what protects against the resulting
+        // unsigned export). Signing happens over the canonical payload with the
+        // signature fields blanked, so verify recomputes the same bytes.
+        #[cfg(feature = "signed-sync")]
+        if let Some(seed) = &self.signing_seed {
+            use ed25519_dalek::Signer;
+            let sk = ed25519_dalek::SigningKey::from_bytes(seed);
+            let payload = bundle.signing_payload();
+            bundle.pubkey = Some(crate::license::b64url_encode(
+                &sk.verifying_key().to_bytes(),
+            ));
+            bundle.sig = Some(crate::license::b64url_encode(
+                &sk.sign(payload.as_bytes()).to_bytes(),
+            ));
+        }
+        Ok(bundle)
     }
 
     /// Import another agent's [`SyncBundle`], verifying before trusting:
@@ -863,6 +961,40 @@ impl AgentSession {
         if bundle.agent == self.agent {
             return Err(SyncError::SelfImport);
         }
+        // 0. Authenticity, before anything else. The chain below proves the
+        //    segment is internally consistent; only the signature proves WHO
+        //    recorded it. TOFU pinning: the first signed bundle pins the key for
+        //    that agent id; afterwards a different key (spoof / silent swap) and
+        //    an unsigned bundle (stripped-signature downgrade) both refuse.
+        //    Pinning itself happens only after the whole import succeeds — a
+        //    refused bundle changes no state, keys included.
+        let pin_after: Option<(String, String)> = match (&bundle.pubkey, &bundle.sig) {
+            (Some(pubkey), Some(sig)) => {
+                verify_bundle_signature(bundle, pubkey, sig)?;
+                match self.known_keys.get(&bundle.agent) {
+                    Some(pinned) if pinned != pubkey => {
+                        return Err(SyncError::KeyMismatch {
+                            agent: bundle.agent.clone(),
+                        });
+                    }
+                    Some(_) => None,
+                    None => Some((bundle.agent.clone(), pubkey.clone())),
+                }
+            }
+            (None, None) => {
+                if self.known_keys.contains_key(&bundle.agent) {
+                    return Err(SyncError::UnsignedFromPinned {
+                        agent: bundle.agent.clone(),
+                    });
+                }
+                None
+            }
+            _ => {
+                return Err(SyncError::BadSignature(
+                    "pubkey and sig must both be present or both absent".into(),
+                ));
+            }
+        };
         if bundle.ops.len() != bundle.chain.len() {
             return Err(SyncError::Tampered(format!(
                 "{} op(s) but {} chain link(s)",
@@ -927,7 +1059,37 @@ impl AgentSession {
         let added = bundle.ops.len() - overlap;
         known.ops.extend_from_slice(&bundle.ops[overlap..]);
         known.chain.extend_from_slice(&bundle.chain[overlap..]);
+        if let Some((agent, pubkey)) = pin_after {
+            self.known_keys.insert(agent, pubkey);
+        }
         Ok(added)
+    }
+
+    /// The base64url public key of this workspace's signing identity, when a
+    /// `signed-sync` build loaded one from `<workspace>.ccos.key` (`None`
+    /// otherwise — always on a crypto-free build).
+    pub fn signing_pubkey(&self) -> Option<String> {
+        #[cfg(feature = "signed-sync")]
+        {
+            self.signing_seed.as_ref().map(|seed| {
+                crate::license::b64url_encode(
+                    &ed25519_dalek::SigningKey::from_bytes(seed)
+                        .verifying_key()
+                        .to_bytes(),
+                )
+            })
+        }
+        #[cfg(not(feature = "signed-sync"))]
+        None
+    }
+
+    /// The TOFU-pinned signing keys (agent id → base64url public key) this
+    /// session trusts. Readable on every build — pins recorded by a
+    /// `signed-sync` build keep protecting the workspace when it is later
+    /// opened by a crypto-free build (unsigned bundles from pinned agents
+    /// still refuse there).
+    pub fn pinned_keys(&self) -> &std::collections::BTreeMap<String, String> {
+        &self.known_keys
     }
 
     /// Materialize the **shared brain**: replay every known timeline — this
@@ -1556,6 +1718,8 @@ impl AgentSession {
             baseline_hash: self.baseline_hash.clone(),
             agent: self.agent.clone(),
             foreign: self.foreign.clone(),
+            known_keys: self.known_keys.clone(),
+            signing_seed: self.signing_seed,
             oplog_path: None,
             compressor: CausalCompressor::new(),
             licensing: self.licensing.clone(),
@@ -1665,6 +1829,89 @@ fn apply_op(m: &mut CcosMemory, op: &Op, dirty: &mut bool) {
             }
         }
     }
+}
+
+/// The signing-key sidecar path for a workspace: `<path>.key` (64 hex chars —
+/// the raw 32-byte ed25519 seed). Lives NEXT to the state, never inside the
+/// timeline sidecar, so sharing an `.oplog` or a bundle can never leak it.
+fn key_sidecar(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(".key");
+    PathBuf::from(s)
+}
+
+/// Load the workspace signing seed on a `signed-sync` build: `<path>.key`
+/// holding 64 hex chars. Unreadable / malformed / absent → `None` (an export
+/// is then unsigned; the importer's pinning is the guard that notices).
+#[cfg(feature = "signed-sync")]
+fn load_signing_seed(workspace_file: &Path) -> Option<[u8; 32]> {
+    let raw = std::fs::read_to_string(key_sidecar(workspace_file)).ok()?;
+    crate::util::from_hex32(raw.trim())
+}
+
+/// A crypto-free build never reads the key file (it could not use the seed).
+#[cfg(not(feature = "signed-sync"))]
+fn load_signing_seed(_workspace_file: &Path) -> Option<[u8; 32]> {
+    None
+}
+
+/// Generate this workspace's ed25519 signing identity: writes a fresh 32-byte
+/// seed (OS entropy) as 64 hex chars to `<workspace>.ccos.key` and returns the
+/// base64url **public** key. Refuses to overwrite an existing key — key rotation
+/// is an explicit human act (delete the file first), because every peer that
+/// pinned the old key will refuse the new one until they re-pin.
+#[cfg(feature = "signed-sync")]
+pub fn generate_workspace_key(path: impl AsRef<Path>) -> Result<String, MemoryError> {
+    let file = crate::external_memory::workspace_file(path.as_ref());
+    let key_path = key_sidecar(&file);
+    if key_path.exists() {
+        return Err(MemoryError::Io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "{} already exists — key rotation must be explicit (delete it first; peers that pinned the old key will refuse the new one)",
+                key_path.display()
+            ),
+        )));
+    }
+    let mut seed = [0u8; 32];
+    getrandom::getrandom(&mut seed)
+        .map_err(|e| MemoryError::Io(std::io::Error::other(format!("entropy: {e}"))))?;
+    crate::util::write_durable(&key_path, crate::util::hex32(&seed).as_bytes())?;
+    let pk = ed25519_dalek::SigningKey::from_bytes(&seed)
+        .verifying_key()
+        .to_bytes();
+    Ok(crate::license::b64url_encode(&pk))
+}
+
+/// Verify a bundle's ed25519 signature over its canonical payload.
+#[cfg(feature = "signed-sync")]
+fn verify_bundle_signature(bundle: &SyncBundle, pubkey: &str, sig: &str) -> Result<(), SyncError> {
+    let pk_bytes: [u8; 32] = crate::license::b64url_decode(pubkey)
+        .and_then(|v| v.try_into().ok())
+        .ok_or_else(|| SyncError::BadSignature("malformed public key".into()))?;
+    let sig_bytes: [u8; 64] = crate::license::b64url_decode(sig)
+        .and_then(|v| v.try_into().ok())
+        .ok_or_else(|| SyncError::BadSignature("malformed signature".into()))?;
+    let vk = ed25519_dalek::VerifyingKey::from_bytes(&pk_bytes)
+        .map_err(|e| SyncError::BadSignature(format!("invalid public key: {e}")))?;
+    let payload = bundle.signing_payload();
+    vk.verify_strict(
+        payload.as_bytes(),
+        &ed25519_dalek::Signature::from_bytes(&sig_bytes),
+    )
+    .map_err(|_| SyncError::BadSignature("signature does not match payload".into()))
+}
+
+/// Without signature support, a signed bundle is REFUSED (never silently
+/// accepted unverified) — the crypto-free default build keeps working with
+/// unsigned federations and tells the operator how to verify signed ones.
+#[cfg(not(feature = "signed-sync"))]
+fn verify_bundle_signature(
+    _bundle: &SyncBundle,
+    _pubkey: &str,
+    _sig: &str,
+) -> Result<(), SyncError> {
+    Err(SyncError::SignedUnsupported)
 }
 
 /// The timeline sidecar path for a workspace: `<path>.oplog`.
@@ -2820,5 +3067,144 @@ mod tests {
         let parsed = SyncBundle::from_json(&json).unwrap();
         assert_eq!(parsed.agent, "agent-a");
         assert_eq!(b.import_bundle(&parsed).unwrap(), 2);
+    }
+
+    // ── Signed sync: cryptographic agent identity ────────────────────────────────
+
+    /// Half a signature pair is malformed on EVERY build (no crypto needed to
+    /// see that), and on a crypto-free build a fully-signed bundle is refused
+    /// outright rather than silently accepted unverified.
+    #[test]
+    fn signature_field_pairing_is_enforced_on_every_build() {
+        let (a, mut b) = two_agents();
+        let mut bundle = a.export_bundle(0).unwrap();
+        bundle.pubkey = Some("AAAA".into());
+        assert!(matches!(
+            b.import_bundle(&bundle),
+            Err(SyncError::BadSignature(_))
+        ));
+        bundle.sig = Some("BBBB".into());
+        // Now a "signed" bundle: crypto builds verify it (and fail — garbage),
+        // crypto-free builds refuse it as unsupported. Either way: refused.
+        assert!(b.import_bundle(&bundle).is_err());
+        // A refused bundle changed nothing: no pin, no foreign ops.
+        assert!(b.pinned_keys().is_empty());
+        assert!(b.foreign.is_empty());
+    }
+
+    #[cfg(feature = "signed-sync")]
+    mod signed {
+        use super::*;
+
+        /// A session with a generated workspace key, ingesting one file.
+        fn keyed_session(tag: &str, agent: &str, uri: &str) -> (AgentSession, std::path::PathBuf) {
+            let path = tmp(tag);
+            cleanup(&path);
+            let _ = std::fs::remove_file(super::super::key_sidecar(&path));
+            let pk = generate_workspace_key(&path).unwrap();
+            assert!(!pk.is_empty());
+            let mut s = AgentSession::open(&path).unwrap();
+            s.set_agent(agent);
+            s.ingest(uri, "pub fn f() {}\n");
+            (s, path)
+        }
+
+        fn cleanup_keyed(path: &std::path::Path) {
+            cleanup(path);
+            let _ = std::fs::remove_file(super::super::key_sidecar(path));
+        }
+
+        #[test]
+        fn signed_roundtrip_pins_the_key_and_survives_restart() {
+            let (a, pa) = keyed_session("ccos-sig-a", "agent-a", "src/a.rs");
+            let bundle = a.export_bundle(0).unwrap();
+            assert!(
+                bundle.pubkey.is_some() && bundle.sig.is_some(),
+                "keyed export signs"
+            );
+            assert_eq!(bundle.pubkey, a.signing_pubkey());
+
+            let pb = tmp("ccos-sig-b");
+            cleanup(&pb);
+            let mut b = AgentSession::open(&pb).unwrap();
+            b.set_agent("agent-b");
+            assert_eq!(b.import_bundle(&bundle).unwrap(), 1);
+            assert_eq!(
+                b.pinned_keys().get("agent-a"),
+                bundle.pubkey.as_ref(),
+                "first signed import pins the key"
+            );
+            b.checkpoint().unwrap();
+            let b2 = AgentSession::open(&pb).unwrap();
+            assert_eq!(
+                b2.pinned_keys().get("agent-a"),
+                bundle.pubkey.as_ref(),
+                "the pin survives a restart"
+            );
+            cleanup_keyed(&pa);
+            cleanup(&pb);
+        }
+
+        #[test]
+        fn tampered_signed_bundle_fails_signature_before_chain() {
+            let (a, pa) = keyed_session("ccos-sig-tamper", "agent-a", "src/a.rs");
+            let mut bundle = a.export_bundle(0).unwrap();
+            // Mutate an op AND recompute its chain link, so the chain itself is
+            // internally consistent — only the signature still tells the truth.
+            bundle.ops[0] = Op::Ingest {
+                uri: "src/evil.rs".into(),
+                source: "pub fn evil() {}\n".into(),
+            };
+            bundle.chain[0] = op_link_hash(&bundle.anchor, 0, &bundle.ops[0]);
+            let mut b = AgentSession::new();
+            b.set_agent("agent-b");
+            assert!(matches!(
+                b.import_bundle(&bundle),
+                Err(SyncError::BadSignature(_))
+            ));
+            cleanup_keyed(&pa);
+        }
+
+        #[test]
+        fn spoofed_key_and_stripped_signature_both_refuse() {
+            let (a, pa) = keyed_session("ccos-sig-spoof-a", "agent-a", "src/a.rs");
+            let genuine = a.export_bundle(0).unwrap();
+            let mut b = AgentSession::new();
+            b.set_agent("agent-b");
+            b.import_bundle(&genuine).unwrap(); // pins agent-a's real key
+
+            // An imposter with a DIFFERENT key claims to be agent-a.
+            let (imposter, pi) = keyed_session("ccos-sig-spoof-i", "agent-a", "src/a.rs");
+            let forged = imposter.export_bundle(0).unwrap();
+            assert_ne!(forged.pubkey, genuine.pubkey);
+            assert!(matches!(
+                b.import_bundle(&forged),
+                Err(SyncError::KeyMismatch { .. })
+            ));
+
+            // Stripping the signature entirely must not bypass the pin.
+            let mut stripped = genuine;
+            stripped.pubkey = None;
+            stripped.sig = None;
+            assert!(matches!(
+                b.import_bundle(&stripped),
+                Err(SyncError::UnsignedFromPinned { .. })
+            ));
+            cleanup_keyed(&pa);
+            cleanup_keyed(&pi);
+        }
+
+        #[test]
+        fn keygen_refuses_to_overwrite() {
+            let path = tmp("ccos-sig-keygen");
+            cleanup_keyed(&path);
+            let pk1 = generate_workspace_key(&path).unwrap();
+            let again = generate_workspace_key(&path);
+            assert!(again.is_err(), "rotation must be explicit");
+            // The original key is intact and still loads.
+            let s = AgentSession::open(&path).unwrap();
+            assert_eq!(s.signing_pubkey(), Some(pk1));
+            cleanup_keyed(&path);
+        }
     }
 }

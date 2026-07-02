@@ -378,6 +378,16 @@ honesty code↔docs↔paper, tests/API). **Fixed in this pass:**
   the same logs materialize **bit-identical** views (`CcosMemory::state_fingerprint`) — a
   state-based CRDT, no consensus, no network, no new dependency. Measured in
   `examples/sync_crux.rs`; contract in `docs/SYNC.md`.
+
+  ✅ **Signed bundles — cryptographic agent identity (`signed-sync`, item 4 of the paper's
+  refreshed §9)** — *done.* Per-workspace ed25519 identity (`ccos sync keygen` →
+  `<workspace>.ccos.key`), exports sign the canonical bundle payload automatically, imports
+  verify + **TOFU-pin** the key per agent id: spoofing (`KeyMismatch`), stripped-signature
+  downgrades (`UnsignedFromPinned`), bad/half signatures (`BadSignature`, every build) and
+  signed-bundles-on-crypto-free-builds (`SignedUnsupported`) all refuse; a refused bundle
+  changes no state, pins included. Zero new crates (reuses the optional `ed25519-dalek` +
+  in-tree `getrandom`); the default build stays crypto-free and unsigned federations work
+  unchanged. See `docs/SYNC.md` §"Signed bundles".
 3. **Semantic edges.** (L) — *both halves landed; deep polish underway.* Call-graph (fn→fn `Calls`:
    bare, qualified, `self`/`Self` methods — #74/#75/#76/#77; plus **renamed-import alias calls**
    `use a::b as c` and **cross-impl-block self-calls** via per-type unioned method sets) **and
