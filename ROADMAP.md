@@ -368,6 +368,16 @@ honesty code↔docs↔paper, tests/API). **Fixed in this pass:**
   staleness still self-heals. Pre-chain sidecars load and are backfilled. `ccos verify
   <workspace>` audits a sidecar without opening it. Every run is auditable by default —
   the paper's item 2 is fully landed. See `src/agent_session.rs`.
+
+  ✅ **Distributed multi-agent store (paper §9 item 5)** — *done; the paper's future-work
+  list is fully cleared.* File-based, chain-verified timeline exchange (`ccos sync
+  export|import|status|materialize`, `SyncBundle` = plain JSON over any transport incl.
+  sneakernet). Imports verify every link and refuse tampering, gaps, self-imports and
+  **equivocation** (one agent id, two histories — caught by the op-log chain). The shared
+  brain is `merged_view()`: a pure function over all known per-agent logs ⇒ agents holding
+  the same logs materialize **bit-identical** views (`CcosMemory::state_fingerprint`) — a
+  state-based CRDT, no consensus, no network, no new dependency. Measured in
+  `examples/sync_crux.rs`; contract in `docs/SYNC.md`.
 3. **Semantic edges.** (L) — *both halves landed; deep polish underway.* Call-graph (fn→fn `Calls`:
    bare, qualified, `self`/`Self` methods — #74/#75/#76/#77; plus **renamed-import alias calls**
    `use a::b as c` and **cross-impl-block self-calls** via per-type unioned method sets) **and

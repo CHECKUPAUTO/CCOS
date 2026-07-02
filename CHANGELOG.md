@@ -8,6 +8,30 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Distributed multi-agent store (`ccos sync`) — paper §9 item 5 landed; the future-work list is
+  now fully cleared.** Every agent keeps exactly one append-only, hash-chained timeline of its own
+  ops; sharing is the exchange of **chain-verified segments** (`SyncBundle`, a plain JSON file — any
+  transport including sneakernet, so the air-gappable posture survives federation). Imports
+  re-verify every link and refuse tampering (`SyncError::Tampered`), gaps (`Gap`), self-imports,
+  and **equivocation** — one agent id publishing two divergent histories is caught link-for-link
+  (`Diverged`), the distributed payoff of the op-log chain. Imported logs stay per-agent (grow-only,
+  persisted additively in the sidecar); the *shared brain* is `AgentSession::merged_view()` — a pure
+  function replaying all known timelines from empty in canonical agent order with `replay_to`'s
+  exact semantics (shared `apply_op`), so agents holding the same logs materialize **bit-identical**
+  views: a state-based CRDT of grow-only per-agent logs, no consensus protocol, no network stack,
+  no new dependency. Convergence is checked with the new `CcosMemory::state_fingerprint()` —
+  canonical SHA-256 of the replayable state (graph + sources + both chain heads; only the
+  by-design-non-deterministic audit UUIDs are excluded). CLI: `ccos sync
+  export|import|status|materialize`. `examples/sync_crux.rs` measures the four claims live
+  (isolation → verified exchange → bit-identical convergence + the cross-agent `api→db` call edge
+  neither agent had alone → tamper refusal), deterministic across runs. 7 new tests (convergence
+  incl. a third agent, tamper, equivocation+gap, incremental==full, sidecar round-trip,
+  export/self-import guards, JSON round-trip). Contract notes in `docs/SYNC.md` (compaction vs
+  federation, local baseline stays local, declarative identity). Paper §4.7/§7/§9 rewritten: all
+  five future-work items of the previous edition are delivered; §9 now lists the genuinely-next
+  items (data-flow direction, trait-object dispatch, spectral pass, cryptographic identity, belief
+  fusion).
+
 - **Richer receiver inference (Slice 4) — paper §9 item 3 landed.** The `syn` call graph now types
   **compound receivers** from the same syntactically-certain declarations Slice 3 trusts, via two
   new per-scope fact families (never persisted — they only enrich the minted `Type::method`
