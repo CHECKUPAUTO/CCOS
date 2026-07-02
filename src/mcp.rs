@@ -47,7 +47,7 @@ fn tool_specs() -> Value {
     ]);
     #[cfg(not(feature = "octasoma"))]
     let recall_strategies = json!(["around", "task", "semantic", "hybrid", "working_set"]);
-    json!([
+    let tools = json!([
         {
             "name": "ingest",
             "description": "Ingest (or update) a source file into the causal memory graph.",
@@ -191,7 +191,40 @@ fn tool_specs() -> Value {
                 "required": ["claim"]
             }
         }
-    ])
+    ]);
+    // The Pro octa-semantic feedback surface exists only in `octasoma` builds: the
+    // `octa_feedback` tool, and the `alpha` gate parameter on `recall` — same
+    // never-promise-what-this-build-cannot-execute rule as the strategy enum above.
+    #[cfg(feature = "octasoma")]
+    let tools = {
+        let mut tools = tools;
+        let list = tools.as_array_mut().expect("catalogue is an array");
+        for t in list.iter_mut() {
+            if t["name"] == "recall" {
+                t["inputSchema"]["properties"]["alpha"] = json!({
+                    "type": "number",
+                    "description": "(Pro 'octa-semantic' only) miscoverage level in (0,1) for the feedback-calibrated anchor gate (default 0.1)"
+                });
+            }
+        }
+        list.push(json!({
+            "name": "octa_feedback",
+            "description": "Label the last octa-semantic recall (or an explicit query/uri/score triple) as relevant or not. The labels calibrate the conformal anchor gate future octa-semantic recalls run through — the explicit relevance-feedback channel of the Pro semantic tier. Stateful: served by the stdio loop; the stateless embedding API refuses it visibly.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "relevant": {"type": "boolean", "description": "was the resolved anchor actually useful for the query?"},
+                    "query": {"type": "string", "description": "label an explicit observation instead of the last recall (requires uri and score too)"},
+                    "uri": {"type": "string", "description": "anchor node uri of the explicit observation"},
+                    "score": {"type": "number", "description": "similarity score in (0,1] the anchor was returned with"},
+                    "alpha": {"type": "number", "description": "miscoverage level for the floor reported back (default 0.1)"}
+                },
+                "required": ["relevant"]
+            }
+        }));
+        tools
+    };
+    tools
 }
 
 /// The read-only resources advertised by `resources/list`.
@@ -266,9 +299,18 @@ fn recall_from_args(args: &Value) -> Recall {
 /// hash — microseconds per node; a cached, persistent index behind a real embedder is
 /// the documented follow-up). On the community tier the refusal is a visible tool
 /// result, never a silent downgrade — the free strategies keep working.
+///
+/// With a [`ServerState`] whose `octa_feedback` log supports the asked `alpha`
+/// (default 0.1), the resolved anchor also runs through the **conformal gate**: score
+/// at or above the certified floor → `"octa-semantic-certified"`; below → the anchor
+/// is refused and the window comes from the lexical fallback,
+/// `"octa-semantic-below-floor-fallback-task"`. The response carries the resolution
+/// (`anchor`) and the gate's inputs (`calibration`) alongside the window, so the
+/// client can label the anchor via `octa_feedback` and see the calibration progress.
 #[cfg(feature = "octasoma")]
 fn octa_semantic_recall(
     session: &mut AgentSession,
+    state: Option<&mut ServerState>,
     args: &Value,
     budget: usize,
 ) -> Result<Value, (i64, String)> {
@@ -282,6 +324,10 @@ fn octa_semantic_recall(
     let text = str_arg(args, "text");
     if text.is_empty() {
         return Err((-32602, "octa-semantic requires 'text'".into()));
+    }
+    let alpha = args.get("alpha").and_then(Value::as_f64).unwrap_or(0.1);
+    if !(alpha > 0.0 && alpha < 1.0) {
+        return Err((-32602, "octa-semantic 'alpha' must be in (0,1)".into()));
     }
     let access = match SemanticMemoryAccess::unlock(session.licensing(), crate::license::now_unix())
     {
@@ -297,23 +343,142 @@ fn octa_semantic_recall(
         }
     };
     let idx = access.sharded_index_from_graph(HashEmbedder::new(DIM), session.memory().graph());
-    let window = match idx.semantic_anchors(&text, 1).into_iter().next() {
-        Some((anchor, _score)) => {
-            let mut w = session.recall(Recall::around(anchor), budget);
-            w.strategy = "octa-semantic".to_string();
-            w
+
+    // Conformal anchor gate, calibrated on the server-held feedback log (see
+    // `SemanticFeedback::certified_score_floor`). Stateless entry / empty log → no
+    // floor → baseline behavior, and the response's `calibration` block says so.
+    let floor = state
+        .as_ref()
+        .and_then(|st| st.octa.feedback.certified_score_floor(alpha));
+    let labels = state.as_ref().map_or(0, |st| st.octa.feedback.len());
+
+    let (window, anchor_json) = match idx.semantic_anchors(&text, 1).into_iter().next() {
+        Some((anchor, score)) => {
+            let trusted = match floor {
+                Some(f) => score >= f,
+                None => true,
+            };
+            let w = if trusted {
+                let mut w = session.recall(Recall::around(anchor.clone()), budget);
+                w.strategy = if floor.is_some() {
+                    "octa-semantic-certified".to_string()
+                } else {
+                    "octa-semantic".to_string()
+                };
+                w
+            } else {
+                // The anchor exists but scores below the certified floor: trusting it
+                // would be unwarranted, so the lexical fallback is taken *visibly*.
+                let mut w = session.recall(Recall::task(text.clone()), budget);
+                w.strategy = "octa-semantic-below-floor-fallback-task".to_string();
+                w
+            };
+            if let Some(st) = state {
+                st.octa.last = Some((text.clone(), anchor.clone(), score));
+            }
+            (w, json!({ "uri": anchor, "score": score }))
         }
         None => {
             let mut w = session.recall(Recall::task(text), budget);
             w.strategy = "octa-semantic-fallback-task".to_string();
-            w
+            (w, Value::Null)
         }
     };
-    Ok(content(serde_json::to_string(&window).unwrap_or_default()))
+    let payload = json!({
+        "window": window,
+        "anchor": anchor_json,
+        "calibration": { "alpha": alpha, "floor": floor, "labels": labels }
+    });
+    Ok(content(payload.to_string()))
+}
+
+/// The Pro **`octa_feedback`** tool — the explicit relevance channel for the
+/// octa-semantic tier: the agent loop reports whether a resolved anchor was actually
+/// useful, and the labels calibrate the conformal anchor gate the next recalls run
+/// through (octasoma's design decision, CCOS side). Stateful by nature: the label log
+/// lives in [`ServerState`] with the serve loop — the stateless [`handle`] refuses the
+/// call visibly rather than dropping labels silently.
+#[cfg(feature = "octasoma")]
+fn octa_feedback_tool(
+    session: &mut AgentSession,
+    state: Option<&mut ServerState>,
+    args: &Value,
+) -> Result<Value, (i64, String)> {
+    use crate::octa_index::SemanticMemoryAccess;
+
+    // Same Pro gate as the recalls the labels calibrate.
+    if let Err(e) = SemanticMemoryAccess::unlock(session.licensing(), crate::license::now_unix()) {
+        return Ok(json!({
+            "content": [{ "type": "text",
+                "text": format!("octa_feedback is part of the Pro octa-semantic tier — {e}.") }],
+            "isError": true
+        }));
+    }
+    let Some(st) = state else {
+        return Ok(json!({
+            "content": [{ "type": "text",
+                "text": "octa_feedback needs the stateful server loop (`serve`): this \
+                 entry point is stateless, so the label would be dropped on return — \
+                 refusing instead of forgetting silently." }],
+            "isError": true
+        }));
+    };
+    let Some(relevant) = args.get("relevant").and_then(Value::as_bool) else {
+        return Err((-32602, "octa_feedback requires boolean 'relevant'".into()));
+    };
+    let alpha = args.get("alpha").and_then(Value::as_f64).unwrap_or(0.1);
+    if !(alpha > 0.0 && alpha < 1.0) {
+        return Err((-32602, "octa_feedback 'alpha' must be in (0,1)".into()));
+    }
+    // Label an explicit `(query, uri, score)` triple, or — the common loop — the last
+    // octa-semantic resolution this server performed.
+    let explicit = match (
+        args.get("query").and_then(Value::as_str),
+        args.get("uri").and_then(Value::as_str),
+        args.get("score").and_then(Value::as_f64),
+    ) {
+        (Some(q), Some(u), Some(s)) => Some((q.to_string(), u.to_string(), s)),
+        (None, None, None) => None,
+        _ => {
+            return Err((
+                -32602,
+                "octa_feedback takes either all of 'query'/'uri'/'score' or none of \
+                 them (none = label the last octa-semantic recall)"
+                    .into(),
+            ))
+        }
+    };
+    let Some((query, uri, score)) = explicit.or_else(|| st.octa.last.clone()) else {
+        return Ok(json!({
+            "content": [{ "type": "text",
+                "text": "no octa-semantic recall to label yet — call `recall` with \
+                 strategy 'octa-semantic' first, or pass 'query'/'uri'/'score' \
+                 explicitly." }],
+            "isError": true
+        }));
+    };
+    if !(score > 0.0 && score <= 1.0) {
+        return Err((-32602, "octa_feedback 'score' must be in (0,1]".into()));
+    }
+    st.octa.feedback.record(&query, &uri, score, relevant);
+    let payload = json!({
+        "recorded": { "query": query, "uri": uri, "score": score, "relevant": relevant },
+        "labels": st.octa.feedback.len(),
+        "relevant_labels": st.octa.feedback.relevant_count(),
+        "calibration": { "alpha": alpha, "floor": st.octa.feedback.certified_score_floor(alpha) }
+    });
+    Ok(content(payload.to_string()))
 }
 
 /// Execute a `tools/call`.
-fn call_tool(session: &mut AgentSession, params: &Value) -> Result<Value, (i64, String)> {
+fn call_tool(
+    session: &mut AgentSession,
+    state: Option<&mut ServerState>,
+    params: &Value,
+) -> Result<Value, (i64, String)> {
+    // The only stateful tools today are octasoma-gated.
+    #[cfg(not(feature = "octasoma"))]
+    let _ = state;
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
     let args = params
         .get("arguments")
@@ -345,11 +510,13 @@ fn call_tool(session: &mut AgentSession, params: &Value) -> Result<Value, (i64, 
         "recall" => {
             #[cfg(feature = "octasoma")]
             if args.get("strategy").and_then(Value::as_str) == Some("octa-semantic") {
-                return octa_semantic_recall(session, &args, budget);
+                return octa_semantic_recall(session, state, &args, budget);
             }
             serde_json::to_string(&session.recall(recall_from_args(&args), budget))
                 .unwrap_or_default()
         }
+        #[cfg(feature = "octasoma")]
+        "octa_feedback" => return octa_feedback_tool(session, state, &args),
         "page_fault" => {
             serde_json::to_string(&session.page_fault(&str_arg(&args, "output"), budget))
                 .unwrap_or_default()
@@ -555,9 +722,56 @@ fn read_resource(session: &mut AgentSession, params: &Value) -> Result<Value, (i
     Ok(json!({ "contents": [{ "uri": uri, "mimeType": "text/plain", "text": text }] }))
 }
 
-/// Handle one JSON-RPC message. Returns `Some(response)` for a request, `None`
-/// for a notification (which gets no reply).
+/// Cross-call server state for **stateful** tools — today only the Pro octa-semantic
+/// relevance-feedback log (`octasoma` feature); empty otherwise. Held by the serve loop
+/// and deliberately NOT by [`AgentSession`]: feedback is calibration state describing the
+/// *workload*, not causal history, so the event-sourced core (and `replay == live`) is
+/// untouched — recalls still land in the timeline with their resolved anchor. It is also
+/// not persisted with the workspace: stale labels silently void the guarantees they
+/// exist to support (same stance as octasoma's `feedback` module).
+#[derive(Default)]
+pub struct ServerState {
+    #[cfg(feature = "octasoma")]
+    octa: OctaFeedbackState,
+}
+
+/// The octa-semantic feedback channel: the label log plus the last resolved anchor
+/// (what a bare `octa_feedback {relevant}` refers to).
+#[cfg(feature = "octasoma")]
+#[derive(Default)]
+struct OctaFeedbackState {
+    feedback: crate::octa_index::SemanticFeedback,
+    /// `(query, anchor_uri, score)` of the most recent octa-semantic resolution —
+    /// recorded even when the anchor was refused by the floor, so a mistaken
+    /// rejection can be labelled relevant and widen the gate back.
+    last: Option<(String, String, f64)>,
+}
+
+/// Handle one JSON-RPC message **statelessly**. Returns `Some(response)` for a request,
+/// `None` for a notification (which gets no reply). Stateful tools (the Pro
+/// `octa_feedback`) are *refused visibly* here — labels this entry point accepted would
+/// be dropped on return, and forgetting silently is exactly what the feedback channel
+/// exists to avoid. Servers that keep state across calls use [`handle_with`], as the
+/// stdio loop behind [`serve`]/[`serve_workspace`] does.
 pub fn handle(session: &mut AgentSession, msg: &Value) -> Option<Value> {
+    dispatch(session, None, msg)
+}
+
+/// [`handle`] with cross-call [`ServerState`] — the entry point the serve loop runs, and
+/// the one that makes the stateful tools (octa-semantic feedback calibration) work.
+pub fn handle_with(
+    session: &mut AgentSession,
+    state: &mut ServerState,
+    msg: &Value,
+) -> Option<Value> {
+    dispatch(session, Some(state), msg)
+}
+
+fn dispatch(
+    session: &mut AgentSession,
+    state: Option<&mut ServerState>,
+    msg: &Value,
+) -> Option<Value> {
     let id = msg.get("id").cloned();
     let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
     // Notifications carry no id and expect no response.
@@ -579,7 +793,7 @@ pub fn handle(session: &mut AgentSession, msg: &Value) -> Option<Value> {
             }))
         }
         "tools/list" => Ok(json!({ "tools": tool_specs() })),
-        "tools/call" => call_tool(session, msg.get("params").unwrap_or(&Value::Null)),
+        "tools/call" => call_tool(session, state, msg.get("params").unwrap_or(&Value::Null)),
         "resources/list" => Ok(json!({ "resources": resource_specs() })),
         "resources/read" => read_resource(session, msg.get("params").unwrap_or(&Value::Null)),
         "ping" => Ok(json!({})),
@@ -621,6 +835,9 @@ fn serve_session(mut session: AgentSession) {
     use std::io::{BufRead, Write};
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
+    // Cross-call tool state (octa-semantic feedback log). Lives and dies with the
+    // process, never with the workspace checkpoint — see `ServerState`.
+    let mut state = ServerState::default();
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
         let line = line.trim();
@@ -630,7 +847,7 @@ fn serve_session(mut session: AgentSession) {
         let reply = match serde_json::from_str::<Value>(line) {
             Ok(msg) => {
                 let mutated = is_mutating_call(&msg);
-                let resp = handle(&mut session, &msg);
+                let resp = handle_with(&mut session, &mut state, &msg);
                 if mutated {
                     persist(&mut session);
                 }
@@ -827,6 +1044,145 @@ mod tests {
         assert!(tools["result"]["tools"]
             .to_string()
             .contains("octa-semantic"));
+    }
+
+    /// The explicit feedback channel over MCP: labels accumulate in the server-held
+    /// state, certify a conformal floor, and the floor gates the next octa-semantic
+    /// anchors — certified when the anchor clears it, visible lexical fallback when
+    /// it does not.
+    #[cfg(feature = "octasoma")]
+    #[test]
+    fn octa_feedback_calibrates_the_conformal_anchor_gate() {
+        use crate::license::{License, Licensing};
+
+        let mut s = AgentSession::new();
+        s.ingest(
+            "src/db.rs",
+            "pub fn query() -> i64 { 1 }\npub fn pool() -> i64 { 2 }\n",
+        );
+        s.set_licensing(Licensing::licensed(License {
+            licensee: "acme".into(),
+            expires_at: None,
+        }));
+        let mut st = ServerState::default();
+        let exact = "pub fn query() -> i64 { 1 }";
+
+        let recall = |s: &mut AgentSession, st: &mut ServerState, id: i64, text: &str| {
+            let r = handle_with(
+                s,
+                st,
+                &req(
+                    id,
+                    "tools/call",
+                    json!({ "name": "recall",
+                        "arguments": { "strategy": "octa-semantic", "text": text,
+                                       "budget": 512, "alpha": 0.25 } }),
+                ),
+            )
+            .unwrap();
+            let text = r["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            serde_json::from_str::<Value>(&text).expect("payload is JSON")
+        };
+
+        // Before any label: baseline strategy, and the calibration block says why the
+        // gate is inactive (no floor, zero labels) — visible, not silent.
+        let p = recall(&mut s, &mut st, 1, exact);
+        assert_eq!(p["window"]["strategy"], "octa-semantic");
+        assert_eq!(p["calibration"]["floor"], Value::Null);
+        assert_eq!(p["calibration"]["labels"], 0);
+        // The resolution is reported so the client can label it: an exact-content
+        // query anchors at distance 0 → score 1.0.
+        assert!(p["anchor"]["uri"].as_str().unwrap().contains("db.rs"));
+        assert!((p["anchor"]["score"].as_f64().unwrap() - 1.0).abs() < 1e-12);
+
+        // Three positive labels on the last resolution (score 1.0) → nonconformities
+        // all 0 → the floor certifies at 1.0 for alpha = 0.25 (k = ⌈4·0.75⌉ = 3 ≤ n).
+        for id in 2..5 {
+            let r = handle_with(
+                &mut s,
+                &mut st,
+                &req(
+                    id,
+                    "tools/call",
+                    json!({ "name": "octa_feedback",
+                        "arguments": { "relevant": true, "alpha": 0.25 } }),
+                ),
+            )
+            .unwrap();
+            let text = r["result"]["content"][0]["text"].as_str().unwrap();
+            let p: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(p["labels"], id - 1);
+        }
+
+        // Anchor at the floor → certified.
+        let p = recall(&mut s, &mut st, 5, exact);
+        assert_eq!(p["window"]["strategy"], "octa-semantic-certified");
+        assert!((p["calibration"]["floor"].as_f64().unwrap() - 1.0).abs() < 1e-9);
+        assert_eq!(p["calibration"]["labels"], 3);
+
+        // A non-matching query still resolves *some* nearest anchor, but below the
+        // certified floor → the anchor is refused and the fallback is visible.
+        let p = recall(&mut s, &mut st, 6, "unrelated gibberish");
+        assert_eq!(
+            p["window"]["strategy"],
+            "octa-semantic-below-floor-fallback-task"
+        );
+
+        // The catalogue advertises the feedback surface in this build.
+        let tools = handle(&mut s, &req(7, "tools/list", Value::Null)).unwrap();
+        let ts = tools["result"]["tools"].to_string();
+        assert!(ts.contains("octa_feedback") && ts.contains("alpha"));
+    }
+
+    /// `octa_feedback` never forgets silently and never downgrades silently: the
+    /// stateless entry refuses it, the community tier gets the Pro refusal, and a
+    /// label with nothing to refer to is an explicit error.
+    #[cfg(feature = "octasoma")]
+    #[test]
+    fn octa_feedback_refuses_stateless_unlicensed_and_unanchored_calls() {
+        use crate::license::{License, Licensing};
+
+        let fb_req = |id: i64| {
+            req(
+                id,
+                "tools/call",
+                json!({ "name": "octa_feedback", "arguments": { "relevant": true } }),
+            )
+        };
+
+        // Community tier → the Pro refusal (isError, tool-level), like octa-semantic.
+        let mut s = AgentSession::new();
+        let r = handle(&mut s, &fb_req(1)).unwrap();
+        assert_eq!(r["result"]["isError"], true);
+        assert!(r["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Pro"));
+
+        // Pro but stateless `handle` → the label would be dropped on return, so the
+        // call is refused with the reason — never accepted-and-forgotten.
+        s.set_licensing(Licensing::licensed(License {
+            licensee: "acme".into(),
+            expires_at: None,
+        }));
+        let r = handle(&mut s, &fb_req(2)).unwrap();
+        assert_eq!(r["result"]["isError"], true);
+        assert!(r["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("stateless"));
+
+        // Stateful but nothing recalled yet → explicit error, not a fabricated label.
+        let mut st = ServerState::default();
+        let r = handle_with(&mut s, &mut st, &fb_req(3)).unwrap();
+        assert_eq!(r["result"]["isError"], true);
+        assert!(r["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("no octa-semantic recall"));
     }
 
     /// A session with the import chain api → repo → db (each depends on the next).

@@ -12,7 +12,9 @@
 
 use ccos::external_memory::{CcosMemory, ExternalMemory};
 use ccos::license::{License, Licensing};
-use ccos::octa_index::{recall_semantic, SemanticMemoryAccess};
+use ccos::octa_index::{
+    recall_semantic, recall_semantic_calibrated, SemanticFeedback, SemanticMemoryAccess,
+};
 use octasoma::HashEmbedder;
 
 fn main() {
@@ -77,4 +79,42 @@ fn main() {
     for item in window.items.iter().take(3) {
         println!("[pro]   {} ({})", item.uri, item.kind);
     }
+
+    // 6. The explicit feedback channel closes the loop: the agent reports which
+    //    anchors actually helped, and the labels certify a conformal score floor —
+    //    anchors clearing it contain the relevant one with probability ≥ 1 − α
+    //    (for workloads exchangeable with the labels). Anchors below the floor are
+    //    refused *visibly* and the window falls back to the free lexical entry.
+    let mut fb = SemanticFeedback::new();
+    let alpha = 0.25;
+    println!(
+        "[pro] feedback: 0 labels → certified floor at alpha={alpha}: {:?} (no fake threshold)",
+        fb.certified_score_floor(alpha)
+    );
+    for query in [
+        "find the row query",
+        "where is the sql query",
+        "query the db",
+    ] {
+        fb.record(query, "sym:src/db.rs:query", 1.0, true);
+    }
+    let floor = fb
+        .certified_score_floor(alpha)
+        .expect("3 labels support alpha=0.25");
+    println!(
+        "[pro] feedback: {} labels → certified floor {floor:.3}",
+        fb.len()
+    );
+
+    let w = recall_semantic_calibrated(
+        &mem,
+        &graph_idx,
+        &fb,
+        "pub fn query() -> i64 { 1 }",
+        512,
+        alpha,
+    );
+    println!("[pro] exact query      → '{}'", w.strategy);
+    let w = recall_semantic_calibrated(&mem, &graph_idx, &fb, "unrelated gibberish", 512, alpha);
+    println!("[pro] off-corpus query → '{}'", w.strategy);
 }
