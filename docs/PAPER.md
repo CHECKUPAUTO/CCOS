@@ -188,17 +188,37 @@ step by step, so a cross-run behavioural drift can be localized to the first
 diverging operation — regression hunting over cognitive histories, not just text
 diffs.
 
-### 4.7 Tamper-evident distributed log
+### 4.7 Tamper-evidence everywhere, and the distributed store
 
-In parallel, a `DistributedEventLog` chains each event to its predecessor:
+All three logs are hash-chained. The `DistributedEventLog` chains each event to
+its predecessor:
 
 ```
 hashᵢ = SHA256( idᵢ ‖ payloadᵢ ‖ tsᵢ ‖ hashᵢ₋₁ ),   hash₋₁ = "GENESIS"
 ```
 
-Any mutation to a past event invalidates every subsequent link, which
-`verify_integrity()` detects. This gives an auditable, append-only history
-suitable for multi-agent or untrusted-transport settings.
+the primary `EventLog` chains every append over its *replayable* content
+(sequence + type + payload, excluding the non-deterministic `id`/`timestamp`,
+so the chain itself is bit-reproducible), and — closing the loop — the
+**session op-log** (§4.6's `replay == live` timeline) chains every recorded
+`Op`, pins its replay *baseline* with a commitment, and keeps one head across
+compaction (the folded prefix's head becomes the chain anchor). Enforcement has
+teeth: opening a workspace whose sidecar fails the check is **refused** (the
+sidecar is left intact as forensic evidence), while chain-valid staleness still
+self-heals; `ccos verify <workspace>` audits a sidecar without opening it.
+
+The same chain is what makes the **multi-agent store** sound. Sharing is the
+exchange of chain-verified timeline segments (`ccos sync export|import`) — a
+plain JSON file over any transport, including sneakernet, so the air-gapped
+posture survives federation. Imports re-verify every link, refuse gaps, and
+refuse **equivocation** (one agent id publishing two divergent histories — the
+overlap must agree link-for-link). Imported logs stay per-agent; the *shared
+brain* is a pure function (`merged_view`) that replays all known timelines from
+empty in canonical agent order, so agents holding the same logs materialize
+**bit-identical** views (`state_fingerprint`, measured live in
+`examples/sync_crux.rs`) — a state-based CRDT of grow-only per-agent logs, with
+no consensus protocol, no network stack, and no new dependency. See
+`docs/SYNC.md`.
 
 ### 4.8 Multi-model consensus
 
@@ -383,19 +403,22 @@ cannot offer. See `docs/MEASUREMENT_pure_retrieval.md`.
 
 The structural edges that everything above walks are only as good as the resolver
 that mints them. `examples/resolution_coverage.rs` measures it two ways. On
-crafted single-shape fixtures, **10/10** common Rust path shapes resolve —
+crafted single-shape fixtures, **14/14** common Rust path shapes resolve —
 crate-rooted, imported fn/module, bare local submodule paths (`mod m; m::f()`,
 `a::b::f()`), typed receivers including references (`fn r(x: &T) { x.bar() }`),
-`Self` methods, and bare/imported/renamed consts — while **3/3** deliberately
-skipped shapes hold (bare `extern_crate::f()` without `use` — a local `mod`
-shadows a same-named crate, so linking would contradict Rust name resolution;
-global ambiguity; unknown modules). On CCOS's own `src/` (48 files), 2,474 parsed
-call references yield **963** fn→fn `Calls` edges and 80 const/static references
-yield **43** `DataFlow` edges — every edge minted under resolve-uniquely-or-skip,
-so the remainder (calls into `std`/external crates, method chains on
-non-inferable receivers, macro paths) is *correctly* unresolved rather than
-guessed. The reference-receiver peel alone moved the corpus 903 → 963 edges
-(≈ +7 %). The candidate design for bare-module-path resolution was adversarially
+`Self` methods, bare/imported/renamed consts, and (Slice 4) field receivers
+(`self.db.q()`), fn-return receivers (`make().q()`), assoc `-> Self` chains and
+method chains (`x.b().q()`) — while **4/4** deliberately skipped shapes hold
+(bare `extern_crate::f()` without `use` — a local `mod` shadows a same-named
+crate, so linking would contradict Rust name resolution; global ambiguity;
+unknown modules; wrapper-typed fields). On CCOS's own `src/` (51 files), 2,801
+parsed call references yield **1,114** fn→fn `Calls` edges and 87 const/static
+references yield **45** `DataFlow` edges — every edge minted under
+resolve-uniquely-or-skip, so the remainder (calls into `std`/external crates,
+receivers typed outside the scope's declarations, macro paths) is *correctly*
+unresolved rather than guessed. The reference-receiver peel moved its corpus
+903 → 963 edges (≈ +7 %); Slice 4's field/chain receivers moved the current
+corpus 1,007 → **1,114** (+107, ≈ +10.6 % — the arc's largest recall gain). The candidate design for bare-module-path resolution was adversarially
 reviewed before landing; the review *empirically confirmed* two false-edge modes
 in the external-crate interpretation, which was excluded — both are regression
 tests now. Details: `docs/MEASUREMENT_resolution_coverage.md`.
@@ -417,17 +440,25 @@ run in CI-friendly time.
   structure, belief, time, and auditability (§6.7 measures where the LSA encoder
   does and does not close the gap).
 - **Method-call resolution is precision-first.** The `syn` call graph resolves
-  `x.bar()` receiver types only from syntactically-certain idioms (typed params —
-  including `&T`/`&mut T` references — annotations, `T::new()`-style constructors,
-  struct literals), skipping the rest (method chains, field receivers, trait
-  objects, generics) rather than guessing — high precision, bounded recall on
-  macro/generic-heavy code (§6.8 quantifies the trade on CCOS's own source).
+  receiver types only from syntactically-certain declarations: typed params
+  (including `&T`/`&mut T`), annotations, constructors and struct literals, and —
+  since Slice 4 — declared **field types** (`self.field.bar()`) and declared
+  **return types** (`f().bar()`, method chains, `-> Self`). What remains skipped
+  is skipped *by design*: trait objects and generics have no statically-certain
+  concrete type, and an in-scope definition that contradicts the
+  `new()`-returns-`Self` convention refutes it (evidence beats convention) —
+  high precision, bounded recall on macro/generic-heavy code (§6.8 quantifies
+  the trade on CCOS's own source).
 - **Consensus / adversarial / distributed-log** are wired into the CLI but the LLM
   path is only exercised against an Ollama-style endpoint; offline runs fall back
   deterministically.
-- **Single-node working memory.** Persistence is explicit (`--out` / `verify` /
-  checkpoint); there is no distributed store — a design choice for an auditable,
-  air-gappable kernel, not a horizontally-scaled vector database.
+- **Single-node by default, federated by exchange.** Persistence is explicit
+  (`--out` / `verify` / checkpoint), and the working memory remains a local,
+  auditable, air-gappable kernel — not a horizontally-scaled vector database.
+  Multi-agent sharing exists (§4.7) but deliberately as *file-based, chain-verified
+  log exchange with deterministic convergence*: no server, no consensus
+  round, and agent identity is declarative (no PKI — the chain enforces
+  *consistency* of a claimed identity, not its ownership).
 
 ## 8. Related work
 
@@ -443,16 +474,32 @@ replayable end-to-end. A dedicated comparison of CCOS against the RAG families
 
 ## 9. Future work
 
-In priority order (tracked in `ROADMAP.md`): (1) an optional neural embedder behind
-a feature flag, quarantined so the default build stays deterministic and
-dependency-free; (2) folding tamper-evidence into the primary log so every run is
-auditable by default; (3) richer receiver inference for the call graph — method
-chains (`f().bar()`), field receivers (`self.field.bar()`) and dynamic
-trait-object dispatch (import-mediated cross-crate and cross-file trait-impl
-methods already resolve; bare `extern_crate::f()` without a `use` is skipped *by
-design*, §6.8); (4) scaling the retrieval benchmark to a standard IR corpus
-(BEIR-style) beyond the code-dependency and synonym cruxes; (5) an optional
-distributed store for multi-agent settings.
+The previous edition of this paper listed five items here; all five have since
+landed, each under the moat constraints this paper argues for: **(1)** the
+quarantined neural embedder (`neural-embed`, off by default — no new crate,
+local endpoint only, explicitly not replay-exact, which is the point of the
+flag; `docs/NEURAL_EMBED.md`); **(2)** tamper-evidence folded into the primary
+log — all three logs are now chained, including the `replay == live` op-log
+itself, with refusal-on-tamper and forensic preservation (§4.7); **(3)** richer
+receiver inference — field receivers and return-type chains, +10.6 % call-graph
+recall at unchanged precision (§6.8); **(4)** the BEIR-style standard-IR
+benchmark — zero-dependency BM25 within 0.003 nDCG@10 of published Anserini on
+SciFact (`docs/MEASUREMENT_beir.md`); and **(5)** the distributed multi-agent
+store — chain-verified log exchange with bit-identical convergence (§4.7,
+`docs/SYNC.md`).
+
+What remains, in priority order (tracked in `ROADMAP.md`): (1) **data-flow
+direction** — distinguishing writes from reads on `DataFlow` edges, so causal
+walks can separate producers from consumers; (2) **dynamic trait-object
+dispatch** in the call graph, currently skipped *by design* (a `dyn Trait`
+receiver has no statically-certain concrete type — any sound treatment needs
+trait-impl sets and points-to reasoning); (3) the **spectral design pass** —
+region clustering and the temporal tensor over eigenvector centrality;
+(4) optional **cryptographic agent identity** for the multi-agent store (the
+chain today enforces consistency of a claimed identity, not its ownership —
+signatures would add the latter at the cost of key management); (5) **belief
+fusion semantics** — Q-Page merge policies beyond union when federated agents
+assert contradictory evidence about the same claim.
 
 ## 10. Conclusion
 

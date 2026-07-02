@@ -126,6 +126,7 @@ async fn main() {
         }
         "postmortem" => run_postmortem(rest),
         "sanitize" => run_sanitize(rest),
+        "sync" => run_sync(rest),
         // ── CCOS v0.3 — Autonomous Context Runtime ──────────────────
         "scan" => from_code(commands_runtime::run_scan(rest).await),
         "agents" => from_code(commands_runtime::run_agents(rest).await),
@@ -876,6 +877,127 @@ fn run_analyze(opts: &AnalyzeOpts) -> CliResult {
         return Err(CliError::status(1));
     }
     Ok(())
+}
+
+/// `ccos sync <export|import|status|materialize>` — the file-based multi-agent
+/// store: exchange chain-verified timeline bundles between agent workspaces and
+/// materialize the convergent merged view. No network, no new dependency — a
+/// bundle is a plain JSON file, so any transport (including sneakernet) works
+/// and the air-gappable posture survives federation.
+fn run_sync(rest: &[String]) -> CliResult {
+    let usage = "usage: ccos sync export <workspace> --agent <id> --out <bundle.json> [--since N]\n       ccos sync import <workspace> <bundle.json>\n       ccos sync status <workspace>\n       ccos sync materialize <workspace> --out <merged.ccos>";
+    let sub = rest.first().map(String::as_str);
+    let arg = |flag: &str| -> Option<String> {
+        rest.iter()
+            .position(|a| a == flag)
+            .and_then(|i| rest.get(i + 1))
+            .cloned()
+    };
+    let open = |ws: &str| {
+        AgentSession::open(ws)
+            .map_err(|e| CliError::fail(format!("ccos sync: cannot open workspace '{ws}': {e}")))
+    };
+    match sub {
+        Some("export") => {
+            let Some(ws) = rest.get(1).filter(|a| !a.starts_with("--")) else {
+                return Err(CliError::usage(usage));
+            };
+            let Some(out) = arg("--out") else {
+                return Err(CliError::usage(usage));
+            };
+            let since = arg("--since")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0);
+            let mut s = open(ws)?;
+            if let Some(id) = arg("--agent") {
+                s.set_agent(id);
+                s.checkpoint()
+                    .map_err(|e| CliError::fail(format!("ccos sync: {e}")))?;
+            }
+            let bundle = s
+                .export_bundle(since)
+                .map_err(|e| CliError::fail(format!("ccos sync export: {e}")))?;
+            let json = bundle
+                .to_json()
+                .map_err(|e| CliError::fail(format!("ccos sync export: {e}")))?;
+            std::fs::write(&out, &json)
+                .map_err(|e| CliError::fail(format!("ccos sync export: write '{out}': {e}")))?;
+            println!(
+                "✓ exported {} op(s) of agent '{}' (from step {}) → {}",
+                bundle.len(),
+                bundle.agent,
+                bundle.first_seq,
+                out
+            );
+            Ok(())
+        }
+        Some("import") => {
+            let (Some(ws), Some(file)) = (rest.get(1), rest.get(2)) else {
+                return Err(CliError::usage(usage));
+            };
+            let raw = std::fs::read_to_string(file)
+                .map_err(|e| CliError::fail(format!("ccos sync import: read '{file}': {e}")))?;
+            let bundle = ccos::agent_session::SyncBundle::from_json(&raw)
+                .map_err(|e| CliError::fail(format!("ccos sync import: parse '{file}': {e}")))?;
+            let mut s = open(ws)?;
+            let added = s
+                .import_bundle(&bundle)
+                .map_err(|e| CliError::fail(format!("ccos sync import: {e}")))?;
+            s.checkpoint()
+                .map_err(|e| CliError::fail(format!("ccos sync import: {e}")))?;
+            println!(
+                "✓ imported {added} new op(s) from agent '{}' (verified chain)",
+                bundle.agent
+            );
+            Ok(())
+        }
+        Some("status") => {
+            let Some(ws) = rest.get(1) else {
+                return Err(CliError::usage(usage));
+            };
+            let s = open(ws)?;
+            let own = if s.agent().is_empty() {
+                "(unset — pass --agent on export)".to_string()
+            } else {
+                s.agent().to_string()
+            };
+            println!("agent:   {own}");
+            println!(
+                "own ops: {} (chain head {})",
+                s.len(),
+                truncate(&s.timeline_head(), 16)
+            );
+            for (id, ops, head) in s.foreign_agents() {
+                println!("foreign: {id} — {ops} op(s), head {}", truncate(&head, 16));
+            }
+            let v = s.merged_view();
+            let st = v.stats();
+            println!(
+                "merged view: {} nodes / {} edges / {} files",
+                st.nodes, st.edges, st.files
+            );
+            Ok(())
+        }
+        Some("materialize") => {
+            let Some(ws) = rest.get(1).filter(|a| !a.starts_with("--")) else {
+                return Err(CliError::usage(usage));
+            };
+            let Some(out) = arg("--out") else {
+                return Err(CliError::usage(usage));
+            };
+            let s = open(ws)?;
+            let mut v = s.merged_view();
+            v.checkpoint_to(&out)
+                .map_err(|e| CliError::fail(format!("ccos sync materialize: {e}")))?;
+            let st = v.stats();
+            println!(
+                "✓ merged view materialized → {out} ({} nodes / {} edges / {} files)",
+                st.nodes, st.edges, st.files
+            );
+            Ok(())
+        }
+        _ => Err(CliError::usage(usage)),
+    }
 }
 
 /// `ccos verify <snapshot.json | workspace>` — re-check a saved snapshot's
@@ -2765,8 +2887,11 @@ COMMANDS:\n\
         --out <file>           Save a full kernel snapshot (graph + logs) to <file>\n\
         --max-nodes <N>        Paging cap (default 5000)\n\
         --budget <N>           Context-window token budget (default 2048)\n\
-    verify <snapshot.json>     Re-check a saved snapshot's hash chain & integrity\n\
+    verify <snap | workspace>  Re-check a snapshot's hash chains & integrity, or\n\
+    \x20                          audit a workspace op-log's tamper-evident chain\n\
     replay <snapshot.json>     Deterministically replay a saved event log\n\
+    sync <sub> <workspace>     Multi-agent store: export/import chain-verified\n\
+    \x20                          timeline bundles, status, materialize merged view\n\
     diff <a.json> <b.json>     Structural diff between two snapshots (+ score drift)\n\
     failure <snap> <node-id>   Inject a fault at a node and propagate it (--depth N,\n\
     \x20                          --max-nodes K, --bidirectional, --json)\n\

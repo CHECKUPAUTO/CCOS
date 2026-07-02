@@ -153,7 +153,125 @@ struct PersistedTimeline {
     /// does, so a baseline edit is as detectable as an op edit.
     #[serde(default)]
     baseline_hash: String,
+    /// This session's agent identity for multi-agent sync (empty = unset).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    agent: String,
+    /// Imported foreign timelines, keyed by agent id (empty for a solo session).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    foreign: std::collections::BTreeMap<String, ForeignLog>,
 }
+
+/// One foreign agent's imported timeline segment, as persisted in the sidecar:
+/// its ops from genesis, their chain links, and nothing else — the chain *is*
+/// the provenance. Grow-only: imports may only extend it (see
+/// [`AgentSession::import_bundle`]).
+#[derive(Clone, Serialize, Deserialize)]
+struct ForeignLog {
+    ops: Vec<Op>,
+    chain: Vec<String>,
+}
+
+/// A portable, chain-verified segment of one agent's timeline — the transport
+/// unit of the **distributed multi-agent store** (paper §9 item 5). Produced by
+/// [`AgentSession::export_bundle`], consumed by [`AgentSession::import_bundle`];
+/// a plain JSON file, so the exchange works over any medium — including none at
+/// all (sneakernet), preserving the air-gappable posture. The receiver trusts
+/// nothing: every link is re-verified against the ops, and a segment must
+/// *extend* the already-known chain of its agent, so a mutated bundle **or an
+/// equivocating agent** (two divergent histories under one identity) is
+/// detected, not merged.
+#[derive(Serialize, Deserialize)]
+pub struct SyncBundle {
+    /// Bundle format version (additive evolution).
+    pub version: u32,
+    /// The exporting agent's identity (must be non-empty and unique per agent).
+    pub agent: String,
+    /// Absolute step of `ops[0]` in the exporter's timeline (0 = from genesis).
+    pub first_seq: usize,
+    /// Chain predecessor of `ops[0]` — the genesis marker when `first_seq == 0`.
+    pub anchor: String,
+    ops: Vec<Op>,
+    chain: Vec<String>,
+}
+
+impl SyncBundle {
+    /// Ops carried by this bundle.
+    pub fn len(&self) -> usize {
+        self.ops.len()
+    }
+
+    /// Whether the bundle carries no ops.
+    pub fn is_empty(&self) -> bool {
+        self.ops.is_empty()
+    }
+
+    /// Serialize for transport (plain JSON — inspectable, diffable, air-gap friendly).
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+
+    /// Parse a transported bundle. Verification happens at import, not here.
+    pub fn from_json(s: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(s)
+    }
+}
+
+/// Why a sync export/import was refused. Every refusal is a *detected* condition —
+/// the sync layer never silently drops or merges questionable history.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SyncError {
+    /// The session has no agent identity (see [`AgentSession::set_agent`]).
+    NoAgentId,
+    /// A bundle authored by this session's own agent id cannot be imported.
+    SelfImport,
+    /// The requested range reaches into compacted history — no longer separable
+    /// into ops. Export earlier, or run federated agents with compaction off
+    /// (`CCOS_OPLOG_MAX=0`).
+    CompactedHistory,
+    /// The bundle starts past the locally-known end of that agent's log.
+    Gap {
+        /// Ops of this agent known locally.
+        known: usize,
+        /// Where the bundle starts instead.
+        bundle_start: usize,
+    },
+    /// A link in the bundle fails verification: the bundle was mutated in transit.
+    Tampered(String),
+    /// The bundle's overlap disagrees with the locally-known chain: the agent
+    /// published two different histories under one identity (equivocation) —
+    /// exactly what the per-agent hash chain exists to catch.
+    Diverged {
+        /// First absolute step whose link disagrees.
+        at: usize,
+    },
+}
+
+impl std::fmt::Display for SyncError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SyncError::NoAgentId => write!(f, "session has no agent id (set one first)"),
+            SyncError::SelfImport => write!(f, "bundle was authored by this agent"),
+            SyncError::CompactedHistory => write!(
+                f,
+                "range reaches into compacted history (export earlier or set CCOS_OPLOG_MAX=0)"
+            ),
+            SyncError::Gap {
+                known,
+                bundle_start,
+            } => write!(
+                f,
+                "bundle starts at step {bundle_start} but only {known} op(s) are known — missing intermediate bundle"
+            ),
+            SyncError::Tampered(detail) => write!(f, "bundle failed verification: {detail}"),
+            SyncError::Diverged { at } => write!(
+                f,
+                "agent equivocation detected: bundle disagrees with the known chain at step {at}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SyncError {}
 
 /// Genesis predecessor for the first link of an uncompacted timeline chain.
 const TIMELINE_GENESIS: &str = "GENESIS";
@@ -372,6 +490,12 @@ pub struct AgentSession {
     /// Commitment to `baseline`, so the state the tail replays on top of is as
     /// tamper-evident as the ops themselves.
     baseline_hash: String,
+    /// Agent identity for multi-agent sync (empty until [`set_agent`](Self::set_agent)).
+    agent: String,
+    /// Chain-verified foreign timelines imported from other agents, keyed by
+    /// agent id. Grow-only; never mixed into the own timeline — the merged
+    /// knowledge is materialized on demand by [`merged_view`](Self::merged_view).
+    foreign: std::collections::BTreeMap<String, ForeignLog>,
     /// Where the timeline sidecar lives (`<workspace>.oplog`); `None` for an
     /// in-memory [`new`](Self::new) session.
     oplog_path: Option<PathBuf>,
@@ -415,6 +539,8 @@ impl AgentSession {
             chain: Vec::new(),
             anchor: TIMELINE_GENESIS.to_string(),
             baseline_hash: baseline_commitment(None),
+            agent: String::new(),
+            foreign: std::collections::BTreeMap::new(),
             oplog_path: None,
             compressor: CausalCompressor::new(),
             licensing,
@@ -495,6 +621,8 @@ impl AgentSession {
                     chain: t.chain,
                     anchor: t.anchor,
                     baseline_hash: t.baseline_hash,
+                    agent: t.agent,
+                    foreign: t.foreign,
                     oplog_path: Some(oplog_path),
                     compressor: CausalCompressor::new(),
                     licensing,
@@ -512,6 +640,8 @@ impl AgentSession {
                     chain: Vec::new(),
                     anchor: TIMELINE_GENESIS.to_string(),
                     baseline_hash,
+                    agent: String::new(),
+                    foreign: std::collections::BTreeMap::new(),
                     oplog_path: Some(oplog_path),
                     compressor: CausalCompressor::new(),
                     licensing,
@@ -552,6 +682,8 @@ impl AgentSession {
                 chain: self.chain.clone(),
                 anchor: self.anchor.clone(),
                 baseline_hash: self.baseline_hash.clone(),
+                agent: self.agent.clone(),
+                foreign: self.foreign.clone(),
             };
             crate::util::write_durable(p, serde_json::to_string(&timeline)?.as_bytes())?;
         }
@@ -642,6 +774,193 @@ impl AgentSession {
             .last()
             .cloned()
             .unwrap_or_else(|| self.anchor.clone())
+    }
+
+    // ── Distributed multi-agent store (paper §9 item 5) ──────────────────────────
+    //
+    // Design: every agent keeps exactly one append-only, hash-chained timeline of
+    // its OWN ops. Sharing is the exchange of chain-verified segments (SyncBundle,
+    // a plain JSON file — any transport, including sneakernet, so the air-gappable
+    // posture survives federation). Imports are stored per agent and NEVER mixed
+    // into the own timeline: the shared brain is a pure function, `merged_view`,
+    // that replays every known timeline in canonical agent order from empty. Two
+    // agents holding the same set of timelines therefore materialize bit-identical
+    // views — convergence by construction, no consensus protocol, no network, no
+    // new dependency, and `replay == live` untouched.
+
+    /// Set this session's **agent identity** for multi-agent sync (persisted in
+    /// the sidecar). Must be non-empty and unique among the exchanging agents.
+    pub fn set_agent(&mut self, id: impl Into<String>) {
+        self.agent = id.into();
+    }
+
+    /// This session's agent identity (empty until [`set_agent`](Self::set_agent)).
+    pub fn agent(&self) -> &str {
+        &self.agent
+    }
+
+    /// Imported foreign agents, each with how many of their ops are known and
+    /// their chain head, in canonical (sorted) order.
+    pub fn foreign_agents(&self) -> Vec<(String, usize, String)> {
+        self.foreign
+            .iter()
+            .map(|(id, log)| {
+                let head = log
+                    .chain
+                    .last()
+                    .cloned()
+                    .unwrap_or_else(|| TIMELINE_GENESIS.to_string());
+                (id.clone(), log.ops.len(), head)
+            })
+            .collect()
+    }
+
+    /// Export this agent's ops from absolute step `since` onward as a
+    /// chain-verified [`SyncBundle`]. Requires an agent id, and refuses a range
+    /// reaching into compacted history — folded ops are no longer separable, so
+    /// a receiver could not re-verify them (federated agents should run with
+    /// compaction off: `CCOS_OPLOG_MAX=0`).
+    pub fn export_bundle(&self, since: usize) -> Result<SyncBundle, SyncError> {
+        if self.agent.is_empty() {
+            return Err(SyncError::NoAgentId);
+        }
+        if since < self.folded {
+            return Err(SyncError::CompactedHistory);
+        }
+        let start = (since - self.folded).min(self.ops.len());
+        let anchor = if start == 0 {
+            self.anchor.clone()
+        } else {
+            self.chain[start - 1].clone()
+        };
+        Ok(SyncBundle {
+            version: 1,
+            agent: self.agent.clone(),
+            first_seq: since,
+            anchor,
+            ops: self.ops[start..].to_vec(),
+            chain: self.chain[start..].to_vec(),
+        })
+    }
+
+    /// Import another agent's [`SyncBundle`], verifying before trusting:
+    ///
+    /// 1. every link recomputes from the bundle's anchor — a mutated bundle is
+    ///    [`SyncError::Tampered`];
+    /// 2. the segment must **extend** this agent's locally-known chain — a first
+    ///    import starts at genesis, a later one at or before the known end, and
+    ///    every overlapping link must be identical, so one agent publishing two
+    ///    histories under one identity is caught as [`SyncError::Diverged`]
+    ///    (equivocation) and a skipped segment as [`SyncError::Gap`].
+    ///
+    /// Returns how many **new** ops were appended (0 for a pure overlap). The own
+    /// timeline is never touched; [`merged_view`](Self::merged_view) materializes
+    /// the combined knowledge, [`checkpoint`](Self::checkpoint) persists the import.
+    pub fn import_bundle(&mut self, bundle: &SyncBundle) -> Result<usize, SyncError> {
+        if bundle.agent.is_empty() {
+            return Err(SyncError::Tampered("bundle has no agent id".into()));
+        }
+        if bundle.agent == self.agent {
+            return Err(SyncError::SelfImport);
+        }
+        if bundle.ops.len() != bundle.chain.len() {
+            return Err(SyncError::Tampered(format!(
+                "{} op(s) but {} chain link(s)",
+                bundle.ops.len(),
+                bundle.chain.len()
+            )));
+        }
+        if bundle.first_seq == 0 && bundle.anchor != TIMELINE_GENESIS {
+            return Err(SyncError::Tampered(
+                "a genesis bundle must anchor at GENESIS".into(),
+            ));
+        }
+        // 1. Internal verification: every link recomputes from the anchor.
+        let mut prev = bundle.anchor.clone();
+        for (i, (op, link)) in bundle.ops.iter().zip(bundle.chain.iter()).enumerate() {
+            let seq = bundle.first_seq + i;
+            if op_link_hash(&prev, seq, op) != *link {
+                return Err(SyncError::Tampered(format!(
+                    "link t={} does not verify",
+                    seq + 1
+                )));
+            }
+            prev = link.clone();
+        }
+        // 2. Continuity against what is already known of this agent. Checked
+        //    before mutating anything, so a refused bundle changes no state.
+        let known_len = self.foreign.get(&bundle.agent).map_or(0, |l| l.ops.len());
+        if bundle.first_seq > known_len {
+            return Err(SyncError::Gap {
+                known: known_len,
+                bundle_start: bundle.first_seq,
+            });
+        }
+        if let Some(known) = self.foreign.get(&bundle.agent) {
+            // The anchor must equal the known link just before the bundle's start…
+            if bundle.first_seq > 0 && bundle.anchor != known.chain[bundle.first_seq - 1] {
+                return Err(SyncError::Diverged {
+                    at: bundle.first_seq,
+                });
+            }
+            // …and every overlapping link must agree.
+            for (i, link) in bundle.chain.iter().enumerate() {
+                let seq = bundle.first_seq + i;
+                match known.chain.get(seq) {
+                    Some(existing) if existing != link => {
+                        return Err(SyncError::Diverged { at: seq + 1 });
+                    }
+                    Some(_) => {}
+                    None => break,
+                }
+            }
+        }
+        // Append the genuinely-new suffix.
+        let known = self
+            .foreign
+            .entry(bundle.agent.clone())
+            .or_insert(ForeignLog {
+                ops: Vec::new(),
+                chain: Vec::new(),
+            });
+        let overlap = (known_len - bundle.first_seq).min(bundle.ops.len());
+        let added = bundle.ops.len() - overlap;
+        known.ops.extend_from_slice(&bundle.ops[overlap..]);
+        known.chain.extend_from_slice(&bundle.chain[overlap..]);
+        Ok(added)
+    }
+
+    /// Materialize the **shared brain**: replay every known timeline — this
+    /// agent's own recorded tail and every imported foreign log — from empty, in
+    /// canonical (sorted-agent-id) order, with the exact same deferred-resolve
+    /// semantics as [`replay_to`](Self::replay_to) (one shared op-applier). A pure
+    /// function of the known timelines: any two agents holding the same set
+    /// materialize **bit-identical** views — the store's convergence guarantee
+    /// (tested). A seeded or compacted local baseline is deliberately not part
+    /// of the exchanged history: the log is the shared truth.
+    pub fn merged_view(&self) -> CcosMemory {
+        let own_id = if self.agent.is_empty() {
+            "local"
+        } else {
+            self.agent.as_str()
+        };
+        let mut streams: std::collections::BTreeMap<&str, &[Op]> =
+            std::collections::BTreeMap::new();
+        streams.insert(own_id, &self.ops);
+        for (id, log) in &self.foreign {
+            streams.insert(id.as_str(), &log.ops);
+        }
+        let mut m = CcosMemory::new();
+        let mut dirty = false;
+        for ops in streams.values() {
+            for op in ops.iter() {
+                apply_op(&mut m, op, &mut dirty);
+            }
+        }
+        if dirty {
+            m.resolve();
+        }
+        m
     }
 
     /// Record and apply an ingest.
@@ -928,63 +1247,7 @@ impl AgentSession {
         // cannot reorder paging.
         let mut dirty = false;
         for op in self.ops.iter().take(tail) {
-            match op {
-                Op::Ingest { uri, source } => {
-                    m.ingest_deferred(uri, source);
-                    dirty = true;
-                }
-                Op::Failure { node, depth } => {
-                    if dirty {
-                        m.resolve();
-                        dirty = false;
-                    }
-                    let _ = m.signal_failure(node, *depth);
-                }
-                Op::PageFault { files, depth } => {
-                    if dirty {
-                        m.resolve();
-                        dirty = false;
-                    }
-                    for f in files {
-                        let _ = m.signal_failure(&format!("file:{f}"), *depth);
-                    }
-                }
-                Op::Recall { recall, .. } => {
-                    // A recall is read-only for *selection*, but a recall *around*
-                    // a demoted node pages it (and its cold neighbours) back from
-                    // the COLD tier — a side effect on the resident/cold partition
-                    // that reads edges. Resolve first so the page-in sees the same
-                    // graph live did (deterministic page-in, replay == live).
-                    if dirty {
-                        m.resolve();
-                        dirty = false;
-                    }
-                    if let Recall::Around(uri) = recall {
-                        m.ensure_resident(uri);
-                    }
-                }
-                Op::Retune { weights } => {
-                    // Reproduce the learned-weights change so replay == live. No edge
-                    // read, so it does not force a resolve of the deferred ingests.
-                    m.set_scoring_weights(*weights);
-                }
-                Op::Assert {
-                    evidence,
-                    claim,
-                    supports,
-                    weight,
-                } => {
-                    // Re-apply the dual-evidence assertion so the belief surfaces (and the
-                    // QBelief derived from them) reconstruct identically — replay == live.
-                    // Belief edges are not resolution-owned (a later `resolve` never prunes
-                    // them) and the assert reads no cross-file edge, so it forces no resolve.
-                    if *supports {
-                        m.assert_support(evidence, claim, *weight);
-                    } else {
-                        m.assert_contradiction(evidence, claim, *weight);
-                    }
-                }
-            }
+            apply_op(&mut m, op, &mut dirty);
         }
         // Resolve the trailing deferred ingests so the returned memory is fully resolved:
         // every `&self` reader of it — `recall_what_if`, `stats`, `graph()`, and `compact`'s
@@ -1291,6 +1554,8 @@ impl AgentSession {
             chain: self.chain[..tail].to_vec(),
             anchor: self.anchor.clone(),
             baseline_hash: self.baseline_hash.clone(),
+            agent: self.agent.clone(),
+            foreign: self.foreign.clone(),
             oplog_path: None,
             compressor: CausalCompressor::new(),
             licensing: self.licensing.clone(),
@@ -1335,6 +1600,70 @@ impl AgentSession {
             }
         }));
         out
+    }
+}
+
+/// Apply one recorded op to a memory with replay's deferred-resolve discipline
+/// (`dirty` tracks pending deferred ingests; ops that read cross-file edges resolve
+/// first). Shared by [`AgentSession::replay_to`] and [`AgentSession::merged_view`],
+/// so both reconstruct with byte-identical semantics.
+fn apply_op(m: &mut CcosMemory, op: &Op, dirty: &mut bool) {
+    match op {
+        Op::Ingest { uri, source } => {
+            m.ingest_deferred(uri, source);
+            *dirty = true;
+        }
+        Op::Failure { node, depth } => {
+            if *dirty {
+                m.resolve();
+                *dirty = false;
+            }
+            let _ = m.signal_failure(node, *depth);
+        }
+        Op::PageFault { files, depth } => {
+            if *dirty {
+                m.resolve();
+                *dirty = false;
+            }
+            for f in files {
+                let _ = m.signal_failure(&format!("file:{f}"), *depth);
+            }
+        }
+        Op::Recall { recall, .. } => {
+            // A recall is read-only for *selection*, but a recall *around*
+            // a demoted node pages it (and its cold neighbours) back from
+            // the COLD tier — a side effect on the resident/cold partition
+            // that reads edges. Resolve first so the page-in sees the same
+            // graph live did (deterministic page-in, replay == live).
+            if *dirty {
+                m.resolve();
+                *dirty = false;
+            }
+            if let Recall::Around(uri) = recall {
+                m.ensure_resident(uri);
+            }
+        }
+        Op::Retune { weights } => {
+            // Reproduce the learned-weights change so replay == live. No edge
+            // read, so it does not force a resolve of the deferred ingests.
+            m.set_scoring_weights(*weights);
+        }
+        Op::Assert {
+            evidence,
+            claim,
+            supports,
+            weight,
+        } => {
+            // Re-apply the dual-evidence assertion so the belief surfaces (and the
+            // QBelief derived from them) reconstruct identically — replay == live.
+            // Belief edges are not resolution-owned (a later `resolve` never prunes
+            // them) and the assert reads no cross-file edge, so it forces no resolve.
+            if *supports {
+                m.assert_support(evidence, claim, *weight);
+            } else {
+                m.assert_contradiction(evidence, claim, *weight);
+            }
+        }
     }
 }
 
@@ -2321,5 +2650,175 @@ mod tests {
             s.timeline_head()
         };
         assert_eq!(build(), build(), "the chain is bit-reproducible");
+    }
+
+    // ── Distributed multi-agent store (paper §9 item 5) ─────────────────────────
+
+    /// Bit-exact convergence fingerprint — the store's official one
+    /// ([`CcosMemory::state_fingerprint`]: graph + sources + both chain heads,
+    /// excluding only the non-deterministic audit ids).
+    fn view_hash(m: &CcosMemory) -> String {
+        m.state_fingerprint().unwrap()
+    }
+
+    /// Two agents with disjoint knowledge; B's api.rs calls into A's db.rs.
+    fn two_agents() -> (AgentSession, AgentSession) {
+        let mut a = AgentSession::new();
+        a.set_agent("agent-a");
+        a.ingest("src/db.rs", "pub fn timeout() -> i64 { 30 }\n");
+        a.assert_support("src/db.rs", "claim:db-tested", 0.9);
+        let mut b = AgentSession::new();
+        b.set_agent("agent-b");
+        b.ingest(
+            "src/api.rs",
+            "use crate::db;\npub fn handle() -> i64 { db::timeout() }\n",
+        );
+        (a, b)
+    }
+
+    #[test]
+    fn two_agents_exchange_and_converge_bit_identically() {
+        let (mut a, mut b) = two_agents();
+        let (ba, bb) = (a.export_bundle(0).unwrap(), b.export_bundle(0).unwrap());
+        assert_eq!(a.import_bundle(&bb).unwrap(), 1, "B's ingest arrives");
+        assert_eq!(
+            b.import_bundle(&ba).unwrap(),
+            2,
+            "A's ingest + assert arrive"
+        );
+
+        let (va, vb) = (a.merged_view(), b.merged_view());
+        assert_eq!(view_hash(&va), view_hash(&vb), "views are bit-identical");
+        // The merged view holds knowledge neither agent had alone: the cross-file
+        // Calls edge from B's api.rs into A's db.rs. Call edges need the syn
+        // parser — the line-heuristic fallback build (`--no-default-features`)
+        // converges identically (the hash assertion above) but mints no fn→fn
+        // edges, so the edge claim is syn-only.
+        if cfg!(feature = "syn-parser") {
+            assert!(va.graph().edges.iter().any(|e| {
+                e.edge_type == crate::memory::EdgeType::Calls
+                    && e.source.0.contains("api.rs")
+                    && e.target.0.contains("db.rs")
+            }));
+        }
+        // And a third agent importing both bundles materializes the same view.
+        let mut c = AgentSession::new();
+        c.set_agent("agent-c");
+        c.import_bundle(&a.export_bundle(0).unwrap()).unwrap();
+        c.import_bundle(&b.export_bundle(0).unwrap()).unwrap();
+        assert_eq!(view_hash(&c.merged_view()), view_hash(&va));
+    }
+
+    #[test]
+    fn import_verifies_the_bundle_chain() {
+        let (a, mut b) = two_agents();
+        let mut tampered = a.export_bundle(0).unwrap();
+        tampered.ops[0] = Op::Ingest {
+            uri: "src/evil.rs".into(),
+            source: "pub fn pwn() {}\n".into(),
+        };
+        assert!(matches!(
+            b.import_bundle(&tampered),
+            Err(SyncError::Tampered(_))
+        ));
+        assert!(
+            b.foreign_agents().is_empty(),
+            "refused import changes nothing"
+        );
+    }
+
+    #[test]
+    fn import_detects_equivocation_and_gaps() {
+        let (mut a, mut b) = two_agents();
+        b.import_bundle(&a.export_bundle(0).unwrap()).unwrap();
+        // A "rewrites history": an alternative timeline of the same length under
+        // the same identity — the overlap disagrees ⇒ equivocation.
+        let mut a2 = AgentSession::new();
+        a2.set_agent("agent-a");
+        a2.ingest("src/db.rs", "pub fn timeout() -> i64 { 9999 }\n");
+        a2.assert_support("src/db.rs", "claim:db-tested", 0.9);
+        assert!(matches!(
+            b.import_bundle(&a2.export_bundle(0).unwrap()),
+            Err(SyncError::Diverged { at: 1 })
+        ));
+        // A gap: A advances by two ops but exports only from step 3.
+        a.ingest("src/x.rs", "pub fn x() {}\n");
+        a.ingest("src/y.rs", "pub fn y() {}\n");
+        assert!(matches!(
+            b.import_bundle(&a.export_bundle(3).unwrap()),
+            Err(SyncError::Gap {
+                known: 2,
+                bundle_start: 3
+            })
+        ));
+    }
+
+    #[test]
+    fn incremental_import_equals_full_import() {
+        let (mut a, mut b) = two_agents();
+        b.import_bundle(&a.export_bundle(0).unwrap()).unwrap();
+        a.ingest("src/extra.rs", "pub fn extra() -> i64 { 1 }\n");
+        // Incremental: only the new suffix travels; overlap re-import is a no-op.
+        assert_eq!(b.import_bundle(&a.export_bundle(2).unwrap()).unwrap(), 1);
+        assert_eq!(b.import_bundle(&a.export_bundle(0).unwrap()).unwrap(), 0);
+        // A fresh receiver of one full bundle sees the identical view.
+        let mut c = AgentSession::new();
+        c.set_agent("agent-c");
+        c.import_bundle(&a.export_bundle(0).unwrap()).unwrap();
+        c.import_bundle(&b.export_bundle(0).unwrap()).unwrap();
+        assert_eq!(view_hash(&b.merged_view()), view_hash(&c.merged_view()));
+    }
+
+    #[test]
+    fn sync_state_survives_checkpoint_and_reopen() {
+        let path = tmp("ccos-sync-persist");
+        cleanup(&path);
+        let (a, _) = two_agents();
+        let before = {
+            let mut s = AgentSession::open(&path).unwrap();
+            s.set_agent("agent-b");
+            s.ingest(
+                "src/api.rs",
+                "use crate::db;\npub fn handle() -> i64 { db::timeout() }\n",
+            );
+            s.import_bundle(&a.export_bundle(0).unwrap()).unwrap();
+            s.checkpoint().unwrap();
+            view_hash(&s.merged_view())
+        };
+        let s2 = AgentSession::open(&path).unwrap();
+        assert_eq!(s2.agent(), "agent-b", "identity persisted");
+        assert_eq!(s2.foreign_agents().len(), 1, "foreign log persisted");
+        assert_eq!(view_hash(&s2.merged_view()), before, "view reconstructs");
+        assert!(s2.verify_timeline().valid, "own chain still valid");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn export_requires_identity_and_uncompacted_history_and_rejects_self_import() {
+        let mut s = AgentSession::new();
+        s.ingest("src/a.rs", "pub fn a() {}\n");
+        assert!(matches!(s.export_bundle(0), Err(SyncError::NoAgentId)));
+        s.set_agent("agent-a");
+        let own = s.export_bundle(0).unwrap();
+        assert!(matches!(s.import_bundle(&own), Err(SyncError::SelfImport)));
+        for i in 0..8 {
+            s.ingest(&format!("src/f{i}.rs"), &format!("pub fn f{i}() {{}}\n"));
+        }
+        s.compact(2);
+        assert!(matches!(
+            s.export_bundle(0),
+            Err(SyncError::CompactedHistory)
+        ));
+        // The still-separable tail exports fine.
+        assert!(s.export_bundle(s.floor()).is_ok());
+    }
+
+    #[test]
+    fn bundles_roundtrip_as_json() {
+        let (a, mut b) = two_agents();
+        let json = a.export_bundle(0).unwrap().to_json().unwrap();
+        let parsed = SyncBundle::from_json(&json).unwrap();
+        assert_eq!(parsed.agent, "agent-a");
+        assert_eq!(b.import_bundle(&parsed).unwrap(), 2);
     }
 }

@@ -544,6 +544,33 @@ impl CcosMemory {
         Ok(serde_json::to_string(&persisted)?)
     }
 
+    /// A canonical SHA-256 fingerprint of the memory's **replayable state**: the
+    /// graph's deterministic serialization, the retained sources, and both logs'
+    /// chain heads — which, by construction, commit to the full replayable
+    /// content while excluding the non-deterministic audit `id`s/timestamps that
+    /// make raw [`to_json`](Self::to_json) outputs differ between two otherwise
+    /// identical reconstructions. Two memories with equal fingerprints hold
+    /// byte-identical knowledge; this is the convergence check of the
+    /// multi-agent store (see [`AgentSession::merged_view`](crate::agent_session::AgentSession::merged_view)).
+    pub fn state_fingerprint(&self) -> Result<String, MemoryError> {
+        debug_assert!(
+            !self.needs_resolution,
+            "state_fingerprint on a graph with deferred resolution pending"
+        );
+        let graph_json = serde_json::to_string(&self.graph)?;
+        let sources_json = serde_json::to_string(&self.sources)?;
+        let dist_head = self
+            .dist_log
+            .export_chain()
+            .last()
+            .map(|l| l.hash.clone())
+            .unwrap_or_default();
+        Ok(crate::util::sha256_hex(&format!(
+            "{graph_json}|{sources_json}|{}|{dist_head}",
+            self.event_log.chain_head()
+        )))
+    }
+
     /// Reconstruct a memory from a JSON snapshot string. No checkpoint path is
     /// bound and a fresh incremental engine is created (mirroring [`open`](Self::open)).
     pub fn from_json(s: &str) -> Result<Self, MemoryError> {
