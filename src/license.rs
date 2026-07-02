@@ -45,6 +45,13 @@ pub enum Feature {
     /// climbs). The *core* retrieval (dense / BM25 / hybrid + metrics) is free and fully functional,
     /// exactly like the rest of CCOS's core; only the continuous-improvement tier is gated.
     AdaptiveRetrieval,
+    /// **OctaSoma semantic memory** — the region-sharded, embedding-based semantic-anchor
+    /// backend (`ccos::octa_index`, compiled behind the `octasoma` cargo feature): true-embedding
+    /// recall resolved *within* a causal region and expanded through the causal graph — the
+    /// validated scope→rerank cascade. The free core recall strategies (working-set / around /
+    /// task / the INT4 TF-IDF `Semantic`/`Hybrid` entries) are untouched; only the
+    /// OctaSoma-backed index is Pro, exactly like [`Feature::AdaptiveRetrieval`].
+    OctaSomaMemory,
 }
 
 impl Feature {
@@ -56,16 +63,18 @@ impl Feature {
             Feature::AuditReports => "audit-reports",
             Feature::SlhAv2Embeddings => "slhav2-embeddings",
             Feature::AdaptiveRetrieval => "adaptive-retrieval",
+            Feature::OctaSomaMemory => "octasoma-memory",
         }
     }
 
     /// Every Pro feature — for enumerating the gate.
-    pub const ALL: [Feature; 5] = [
+    pub const ALL: [Feature; 6] = [
         Feature::CustomAuthorityWeights,
         Feature::TensionVisualization,
         Feature::AuditReports,
         Feature::SlhAv2Embeddings,
         Feature::AdaptiveRetrieval,
+        Feature::OctaSomaMemory,
     ];
 }
 

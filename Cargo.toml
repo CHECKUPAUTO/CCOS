@@ -58,6 +58,18 @@ lattice-slh-dsa = { version = "0.3", default-features = false, optional = true }
 # (and its INTEGRATION.md) and the `[workspace]` block at the bottom.
 ccos-memory-runtime = { path = "crates/ccos-memory-runtime", optional = true }
 
+# Opt-in **OctaSoma semantic-memory backend** (the Pro `octasoma-memory` runtime
+# feature): the org's 3-D fractal semantic memory engine, used **region-sharded** —
+# one small index per causal region — because that is the deployment the real-scale
+# benchmark validated (a single global 3-D index is a coarse router; the 99 %-hit
+# cascade is CCOS narrowing causally first, then an exact rerank inside the region).
+# The crate is `#![forbid(unsafe_code)]` with one dependency (`lz4_flex`);
+# replay-exactness then depends only on the chosen embedder — `HashEmbedder` is
+# bit-replayable, a neural embedder is not (the same quarantine boundary as
+# `neural-embed`). Pinned to a reviewed rev; behind the `octasoma` feature so the
+# default build is byte-identical. See `src/octa_index.rs`.
+octasoma = { git = "https://github.com/CHECKUPAUTO/octasoma", rev = "fe2d8b965a0ff33b554eccbdb3ae242e43b8700c", optional = true }
+
 [features]
 # Default = the **sync core** (causal memory, hash-chained event log, recall) plus
 # the real `syn` **AST parser**, now the default ingestion path: it is 36.5% more
@@ -101,6 +113,14 @@ slhav2 = ["dep:ccos-memory-runtime"]
 # quarantine. Pulls **no new crate**: only the blocking client of the `reqwest`
 # already in the tree for `llm`. Local server ⇒ nothing leaves the host.
 neural-embed = ["dep:reqwest", "reqwest/blocking"]
+# Opt-in **OctaSoma semantic memory** (Pro): region-sharded, embedding-based
+# semantic anchors backed by the `octasoma` engine, expanded through the causal
+# graph — the validated scope→rerank cascade. Compiling it is this cargo feature;
+# *using* it is gated at runtime by the offline license
+# (`Feature::OctaSomaMemory`), like every Pro capability. The free core recall
+# strategies (working-set / around / task / INT4 TF-IDF semantic / hybrid) are
+# untouched. Off by default → the default build is byte-identical.
+octasoma = ["dep:octasoma"]
 
 [dev-dependencies]
 proptest = "1"
@@ -137,6 +157,13 @@ required-features = ["license-pq"]
 [[example]]
 name = "neural_vs_lsa"
 required-features = ["neural-embed"]
+
+# Pro OctaSoma semantic-memory walkthrough — requires the `octasoma` feature.
+# Fully offline and deterministic (HashEmbedder); shows the community-tier
+# refusal, the Pro unlock, and region-scoped semantic anchors.
+[[example]]
+name = "octasoma_semantic"
+required-features = ["octasoma"]
 
 # ── Cargo workspace ─────────────────────────────────────────────────
 # CCOS is the root package; the opt-in SLHAv2 memory backend lives in its own

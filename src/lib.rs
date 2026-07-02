@@ -130,6 +130,13 @@ pub mod memory;
 // that is the quarantine. See the module docs and docs/NEURAL_EMBED.md.
 #[cfg(feature = "neural-embed")]
 pub mod neural_embed;
+// Pro OctaSoma semantic memory (off-by-default `octasoma` feature): region-sharded,
+// embedding-based semantic anchors expanded through the causal graph — the
+// validated scope→rerank cascade. Compiling it is the cargo feature; *using* it is
+// gated by the offline license (`Feature::OctaSomaMemory`). The default build
+// compiles none of it and stays deterministic + replay-exact. See the module docs.
+#[cfg(feature = "octasoma")]
+pub mod octa_index;
 pub mod parser;
 pub mod persist;
 pub mod postmortem;

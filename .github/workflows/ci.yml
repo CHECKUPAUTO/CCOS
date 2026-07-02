@@ -90,6 +90,11 @@ jobs:
       - name: Test (license + license-pq — both verifiers compose, cross-scheme isolation)
         run: cargo test --features license,license-pq --locked
 
+      - name: Test (octasoma feature — Pro semantic-memory backend + example)
+        run: |
+          cargo test --features octasoma --locked
+          cargo run --locked --features octasoma --example octasoma_semantic
+
       - name: Docs
         env:
           RUSTDOCFLAGS: "-D warnings"
