@@ -28,6 +28,15 @@
 //!   [`RetrievalAccess`](crate::retrieval::RetrievalAccess); on the community tier it returns
 //!   the standard no-silent-downgrade refusal and the free core recall strategies
 //!   (working-set / around / task / INT4 TF-IDF semantic / hybrid) remain fully functional.
+//!
+//! Persistence design decision: the index is **derived state**. The default pattern is
+//! rebuild-from-graph ([`ShardedOctaIndex::index_graph`], sorted-id order → bit-identical
+//! with a deterministic embedder), which needs no invalidation logic and can never drift
+//! from the graph — the MCP `octa-semantic` strategy does exactly this per call.
+//! [`ShardedOctaIndex::save`]/[`ShardedOctaIndex::open`] exist for the case that actually
+//! needs them — a large graph behind a *real* (slow, non-replayable) embedder — where the
+//! sidecar directory is persisted next to `workspace.ccos` at checkpoint time and staleness
+//! is accepted explicitly by the caller.
 
 use crate::external_memory::{ExternalMemory, Recall, RecallWindow};
 use crate::memory::MemoryGraph;

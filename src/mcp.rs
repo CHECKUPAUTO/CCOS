@@ -32,6 +32,21 @@ pub const PROTOCOL_VERSION: &str = "2024-11-05";
 
 /// The tool catalogue advertised by `tools/list`, with JSON-Schema inputs.
 fn tool_specs() -> Value {
+    // The Pro `octa-semantic` strategy is advertised only when it is compiled in
+    // (the `octasoma` feature) — the catalogue never promises a strategy this
+    // build cannot execute. Whether a *call* is allowed is then the runtime
+    // license gate (see `octa_semantic_recall`).
+    #[cfg(feature = "octasoma")]
+    let recall_strategies = json!([
+        "around",
+        "task",
+        "semantic",
+        "hybrid",
+        "working_set",
+        "octa-semantic"
+    ]);
+    #[cfg(not(feature = "octasoma"))]
+    let recall_strategies = json!(["around", "task", "semantic", "hybrid", "working_set"]);
     json!([
         {
             "name": "ingest",
@@ -51,9 +66,9 @@ fn tool_specs() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "strategy": {"type": "string", "enum": ["around", "task", "semantic", "hybrid", "working_set"]},
+                    "strategy": {"type": "string", "enum": recall_strategies},
                     "anchor": {"type": "string", "description": "node id / file uri for 'around'"},
-                    "text": {"type": "string", "description": "free-text task for 'task' / 'semantic'"},
+                    "text": {"type": "string", "description": "free-text task for 'task' / 'semantic' (and the Pro 'octa-semantic')"},
                     "budget": {"type": "integer", "description": "token budget (default 2048)"}
                 }
             }
@@ -242,6 +257,61 @@ fn recall_from_args(args: &Value) -> Recall {
     }
 }
 
+/// The Pro **`octa-semantic`** recall strategy (`octasoma` feature): OctaSoma resolves
+/// the entry node semantically, then the recall goes through the **session** as
+/// `Recall::Around(anchor)` — so the op recorded in the event-sourced timeline carries
+/// the *resolved* anchor, and `replay == live` holds by construction even if a future
+/// embedder is not replay-exact. The index is **derived state**, rebuilt
+/// deterministically from the live graph on every call (octasoma's `HashEmbedder` is a
+/// hash — microseconds per node; a cached, persistent index behind a real embedder is
+/// the documented follow-up). On the community tier the refusal is a visible tool
+/// result, never a silent downgrade — the free strategies keep working.
+#[cfg(feature = "octasoma")]
+fn octa_semantic_recall(
+    session: &mut AgentSession,
+    args: &Value,
+    budget: usize,
+) -> Result<Value, (i64, String)> {
+    use crate::octa_index::SemanticMemoryAccess;
+    use octasoma::HashEmbedder;
+
+    // Embedding width of the derived index (any fixed width works for the exact-text
+    // `HashEmbedder`; matches the `octasoma_semantic` example).
+    const DIM: usize = 128;
+
+    let text = str_arg(args, "text");
+    if text.is_empty() {
+        return Err((-32602, "octa-semantic requires 'text'".into()));
+    }
+    let access = match SemanticMemoryAccess::unlock(session.licensing(), crate::license::now_unix())
+    {
+        Ok(a) => a,
+        Err(e) => {
+            return Ok(json!({
+                "content": [{ "type": "text",
+                    "text": format!("octa-semantic is a Pro strategy — {e}. The free \
+                     strategies (around/task/semantic/hybrid/working_set) remain fully \
+                     functional.") }],
+                "isError": true
+            }))
+        }
+    };
+    let idx = access.sharded_index_from_graph(HashEmbedder::new(DIM), session.memory().graph());
+    let window = match idx.semantic_anchors(&text, 1).into_iter().next() {
+        Some((anchor, _score)) => {
+            let mut w = session.recall(Recall::around(anchor), budget);
+            w.strategy = "octa-semantic".to_string();
+            w
+        }
+        None => {
+            let mut w = session.recall(Recall::task(text), budget);
+            w.strategy = "octa-semantic-fallback-task".to_string();
+            w
+        }
+    };
+    Ok(content(serde_json::to_string(&window).unwrap_or_default()))
+}
+
 /// Execute a `tools/call`.
 fn call_tool(session: &mut AgentSession, params: &Value) -> Result<Value, (i64, String)> {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
@@ -272,8 +342,14 @@ fn call_tool(session: &mut AgentSession, params: &Value) -> Result<Value, (i64, 
                 }
             }
         }
-        "recall" => serde_json::to_string(&session.recall(recall_from_args(&args), budget))
-            .unwrap_or_default(),
+        "recall" => {
+            #[cfg(feature = "octasoma")]
+            if args.get("strategy").and_then(Value::as_str) == Some("octa-semantic") {
+                return octa_semantic_recall(session, &args, budget);
+            }
+            serde_json::to_string(&session.recall(recall_from_args(&args), budget))
+                .unwrap_or_default()
+        }
         "page_fault" => {
             serde_json::to_string(&session.page_fault(&str_arg(&args, "output"), budget))
                 .unwrap_or_default()
@@ -693,6 +769,64 @@ mod tests {
         let mut s = AgentSession::new();
         let r = handle(&mut s, &req(9, "frobnicate", Value::Null)).unwrap();
         assert_eq!(r["error"]["code"], -32601);
+    }
+
+    /// The Pro `octa-semantic` strategy: visible refusal on the community tier, and on
+    /// the Pro tier an anchor-first window recalled *through the session* (the op lands
+    /// in the timeline like every other recall).
+    #[cfg(feature = "octasoma")]
+    #[test]
+    fn octa_semantic_is_pro_gated_and_anchors_the_window() {
+        use crate::license::{License, Licensing};
+
+        let mut s = AgentSession::new();
+        s.ingest(
+            "src/db.rs",
+            "pub fn query() -> i64 { 1 }\npub fn pool() -> i64 { 2 }\n",
+        );
+        let call = |s: &mut AgentSession, id: i64| {
+            handle(
+                s,
+                &req(
+                    id,
+                    "tools/call",
+                    json!({
+                        "name": "recall",
+                        "arguments": { "strategy": "octa-semantic", "text": "pub fn query() -> i64 { 1 }", "budget": 512 }
+                    }),
+                ),
+            )
+            .unwrap()
+        };
+
+        // Community tier → a visible tool-level refusal (isError), not a protocol error,
+        // and not a silent fallback.
+        let refused = call(&mut s, 1);
+        assert_eq!(refused["result"]["isError"], true);
+        let msg = refused["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(msg.contains("Pro"), "the refusal explains the tier: {msg}");
+
+        // Pro tier → the anchor-first window, strategy visible in the payload.
+        s.set_licensing(Licensing::licensed(License {
+            licensee: "acme".into(),
+            expires_at: None,
+        }));
+        let ok = call(&mut s, 2);
+        let text = ok["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("\"strategy\":\"octa-semantic\""),
+            "strategy is visible: {text}"
+        );
+        assert!(
+            text.contains("db.rs"),
+            "the anchor's region is recalled: {text}"
+        );
+
+        // The catalogue advertises the strategy in this build.
+        let tools = handle(&mut s, &req(3, "tools/list", Value::Null)).unwrap();
+        assert!(tools["result"]["tools"]
+            .to_string()
+            .contains("octa-semantic"));
     }
 
     /// A session with the import chain api → repo → db (each depends on the next).
