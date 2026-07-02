@@ -1100,7 +1100,7 @@ dependencies = [
 [[package]]
 name = "octasoma"
 version = "0.4.0"
-source = "git+https://github.com/CHECKUPAUTO/octasoma?rev=96a39d1fe515fbcda0f80d7e4764751aad939969#96a39d1fe515fbcda0f80d7e4764751aad939969"
+source = "git+https://github.com/CHECKUPAUTO/octasoma?tag=v0.4.0#96a39d1fe515fbcda0f80d7e4764751aad939969"
 dependencies = [
  "lz4_flex",
 ]
