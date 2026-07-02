@@ -2690,12 +2690,17 @@ mod tests {
         let (va, vb) = (a.merged_view(), b.merged_view());
         assert_eq!(view_hash(&va), view_hash(&vb), "views are bit-identical");
         // The merged view holds knowledge neither agent had alone: the cross-file
-        // Calls edge from B's api.rs into A's db.rs.
-        assert!(va.graph().edges.iter().any(|e| {
-            e.edge_type == crate::memory::EdgeType::Calls
-                && e.source.0.contains("api.rs")
-                && e.target.0.contains("db.rs")
-        }));
+        // Calls edge from B's api.rs into A's db.rs. Call edges need the syn
+        // parser — the line-heuristic fallback build (`--no-default-features`)
+        // converges identically (the hash assertion above) but mints no fn→fn
+        // edges, so the edge claim is syn-only.
+        if cfg!(feature = "syn-parser") {
+            assert!(va.graph().edges.iter().any(|e| {
+                e.edge_type == crate::memory::EdgeType::Calls
+                    && e.source.0.contains("api.rs")
+                    && e.target.0.contains("db.rs")
+            }));
+        }
         // And a third agent importing both bundles materializes the same view.
         let mut c = AgentSession::new();
         c.set_agent("agent-c");
